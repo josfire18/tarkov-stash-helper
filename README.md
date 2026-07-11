@@ -42,14 +42,28 @@ python app.py
 ## Building the exe yourself
 
 ```
-pip install -r requirements.txt
-pip install pyinstaller
 build.bat
 ```
 
-Produces `dist/TarkovStashHelper.exe`. The `data/` folder (icon cache,
-settings, price cache) is generated at runtime next to wherever the exe is
-run from — it isn't bundled into the build.
+This creates an isolated `.buildvenv/` (only this project's dependencies —
+important, since a system Python with unrelated heavy packages installed can
+bloat the build) and produces `dist/TarkovStashHelper.exe`. The `data/`
+folder (icon cache, settings, price cache) is generated at runtime next to
+wherever the exe is run from — it isn't bundled into the build.
+
+## Cutting a release
+
+Push a `v*` tag and GitHub Actions (`.github/workflows/build.yml`) builds the
+exe on a clean Windows runner and attaches it to a new GitHub Release
+automatically:
+
+```
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+You can also trigger a build without releasing via the Actions tab
+("Run workflow") — it uploads the exe as a build artifact either way.
 
 ## How it works
 
