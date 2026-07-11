@@ -188,7 +188,7 @@
   }
   .item-num.flea   { background: #1e8c28; }
   .item-num.trader { background: #9c6a0a; }
-  .item-num.keep   { background: #404040; }
+  .item-num.keep   { background: #0a7c9c; }
 
   .item-name { font-size: 13px; color: #e0d8c8; font-weight: 500; }
 
@@ -205,7 +205,7 @@
   }
   .rec-flea   { background: #1e3a14; border: 1px solid #3a7a20; color: #7acc40; }
   .rec-trader { background: #2a2010; border: 1px solid #6a5010; color: #c4a040; }
-  .rec-keep   { background: #1e1e1e; border: 1px solid #404040; color: #888; }
+  .rec-keep   { background: #0a2830; border: 1px solid #0a7c9c; color: #4ad4f0; }
 
   .price-line {
     font-size: 11px;
@@ -301,6 +301,7 @@
   <a class="nav-logo" href="/">&#x2302; Tarkov</a>
   <nav class="nav-tabs">
     <a class="nav-tab" href="/">Keep List</a>
+    <a class="nav-tab" href="/tasks">Tasks &amp; Hideout</a>
     <a class="nav-tab active" href="/sell">Sell Advisor</a>
   </nav>
   <div class="spacer"></div>
@@ -324,13 +325,13 @@
   <div class="screenshot-panel">
     <div class="screenshot-toolbar">
       <button id="btn-scan" class="primary" disabled title="Set stash region first">&#x1F4F7; Scan Stash</button>
-      <span id="scan-status" title="F9 triggers scan when this browser window is focused. The stash region is captured from its saved position — no need to alt-tab.">Ready — click Scan Stash or press F9</span>
+      <span id="scan-status" title="The scan hotkey works globally (even with the game focused). The stash region is captured from its saved position — no need to alt-tab.">Ready — click Scan Stash or press the scan hotkey</span>
     </div>
     <div class="screenshot-container">
       <div class="no-scan" id="no-scan">
         <div style="font-size:48px;opacity:.15">&#x1F4B0;</div>
         <div>No scan yet</div>
-        <div class="hint">Green = sell on flea &nbsp;|&nbsp; Gold = sell to trader &nbsp;|&nbsp; Grey = keep</div>
+        <div class="hint">Green = sell on flea &nbsp;|&nbsp; Gold = sell to trader &nbsp;|&nbsp; <span style="color:#4ad4f0">Cyan = KEEP — needed for tasks/kappa, do not sell</span></div>
       </div>
       <img id="stash-image" alt="Stash scan">
     </div>
@@ -514,6 +515,7 @@ let _currentSettings = {};
 async function loadRegionState() {
   try {
     _currentSettings = await api('GET', '/api/settings');
+    hotkeyCombo = parseHotkey(_currentSettings.hotkey);
     regionSet = !!_currentSettings.region;
     const banner = document.getElementById('region-banner');
     if (regionSet) {
@@ -635,14 +637,30 @@ async function captureAndShowRegion(canvas, countdown, hint) {
   }
 }
 
-// Keyboard shortcuts
+// Keyboard shortcuts — the scan combo mirrors the configured global hotkey
+let hotkeyCombo = null;   // {ctrl, alt, shift, key} parsed from settings
+
+function parseHotkey(pynputStr) {
+  if (!pynputStr) return null;
+  const combo = { ctrl: false, alt: false, shift: false, key: null };
+  for (const part of pynputStr.split('+')) {
+    const p = part.replace(/[<>]/g, '');
+    if (p === 'ctrl') combo.ctrl = true;
+    else if (p === 'alt') combo.alt = true;
+    else if (p === 'shift') combo.shift = true;
+    else combo.key = p;
+  }
+  return combo.key ? combo : null;
+}
+
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     document.getElementById('region-modal').classList.remove('show');
     return;
   }
-  // F9 triggers scan when browser is focused and modal is not open
-  if (e.key === 'F9' && !document.getElementById('region-modal').classList.contains('show')) {
+  if (!hotkeyCombo || document.getElementById('region-modal').classList.contains('show')) return;
+  if (e.ctrlKey === hotkeyCombo.ctrl && e.altKey === hotkeyCombo.alt &&
+      e.shiftKey === hotkeyCombo.shift && e.key.toLowerCase() === hotkeyCombo.key) {
     e.preventDefault();
     runScan();
   }
@@ -706,7 +724,7 @@ function renderResults(results) {
     let badgeClass, badgeText, priceLine;
     if (r.recommend === 'keep') {
       badgeClass = 'rec-keep'; badgeText = 'KEEP';
-      priceLine  = `<span style="color:#555">On keep list — do not sell</span>`;
+      priceLine  = `<span style="color:#3a9ab4">${r.reason || 'On keep list'} — do not sell</span>`;
     } else if (r.recommend === 'flea') {
       badgeClass = 'rec-flea'; badgeText = 'FLEA';
       priceLine  = `
@@ -770,16 +788,40 @@ function applyScan(res) {
     `${allResults.length} items found` + (parts.length ? ` — ${parts.join(', ')}` : '');
 }
 
+let _scanProgressPoll = null;
+function startScanProgress() {
+  const status = document.getElementById('scan-status');
+  stopScanProgress();
+  _scanProgressPoll = setInterval(async () => {
+    try {
+      const s = await api('GET', '/api/scan-status');
+      if (!s.running) return;
+      if (s.phase === 'match' && s.total) {
+        status.textContent = `Matching cells ${s.done}/${s.total}…`;
+      } else if (s.phase) {
+        status.textContent = `Scanning — ${s.phase}…`;
+      }
+    } catch(_) {}
+  }, 500);
+}
+function stopScanProgress() {
+  if (_scanProgressPoll) { clearInterval(_scanProgressPoll); _scanProgressPoll = null; }
+}
+
 async function runScan() {
   const btn = document.getElementById('btn-scan');
   if (btn.disabled) return;
   btn.disabled = true;
   btn.textContent = 'Scanning…';
   document.getElementById('scan-status').textContent = 'Scanning stash…';
+  startScanProgress();
   try {
     const res = await api('POST', '/api/sell-scan');
+    stopScanProgress();
     applyScan(res);
+    if (res.warnings && res.warnings.length) toast('⚠ ' + res.warnings[0], 4000);
   } catch(e) {
+    stopScanProgress();
     document.getElementById('scan-status').textContent = 'Error: ' + e.message;
   }
   btn.disabled = false;

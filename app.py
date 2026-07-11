@@ -20,10 +20,6 @@ from pynput import keyboard
 import cv2
 import numpy as np
 
-# The CNN classifier (classifier.py) is retired — the masked-NCC icon DB fully
-# replaces it.  Its routes now return "deprecated"; torch is no longer imported
-# at startup.
-
 FROZEN = getattr(sys, 'frozen', False)
 
 # When run from source, data/ lives next to app.py. When packaged with
@@ -45,6 +41,9 @@ DATA = os.path.join(BASE, 'data')
 SETTINGS_PATH  = os.path.join(DATA, 'settings.json')
 KEEPLIST_PATH  = os.path.join(DATA, 'keep_list.json')
 PRICES_PATH    = os.path.join(DATA, 'prices_cache.json')
+KAPPA_WIKI_PATH  = os.path.join(DATA, 'kappa_wiki.json')   # cached Collector item names from the wiki
+TASKS_CACHE_PATH = os.path.join(DATA, 'tasks_cache.json')  # cached tasks + hideout requirements (tarkov.dev)
+PROGRESS_PATH    = os.path.join(DATA, 'progress.json')     # user task/hideout completion + have-counts
 ICONS_DIR      = os.path.join(DATA, 'icons')          # legacy 64×64 iconLink thumbnails (UI only)
 TMPL_SRC_DIR   = os.path.join(DATA, 'tmpl_src')        # transparent per-slot base images (BGRA PNG)
 os.makedirs(DATA, exist_ok=True)
@@ -63,8 +62,16 @@ if not shutil.which(pytesseract.pytesseract.tesseract_cmd):
 OCR_THRESHOLD        = 65    # fuzzy match score cutoff
 OCR_SCALE            = 2     # scale factor applied to image before OCR (larger = better accuracy)
 PRICE_CACHE_TTL      = 1800  # seconds (30 min)
+KAPPA_WIKI_TTL       = 86400 # seconds (24 h) — Collector list changes rarely
+TASKS_CACHE_TTL      = 86400 # seconds (24 h) — task/hideout requirements change per patch
 FLEA_MIN_PROFIT      = 10000 # recommend flea only if net > trader by this much
 TARKOV_API           = 'https://api.tarkov.dev/graphql'
+# The raw wiki page (escapefromtarkov.fandom.com/wiki/Collector) sits behind a
+# Cloudflare bot challenge and returns "Just a moment..." to plain HTTP clients.
+# The MediaWiki API serves the identical rendered HTML unchallenged — always
+# fetch through it, never the page URL.
+COLLECTOR_WIKI_API   = ('https://escapefromtarkov.fandom.com/api.php'
+                        '?action=parse&page=Collector&prop=text&format=json&formatversion=2')
 ICON_MATCH_THRESHOLD = 0.68  # cv2.TM_CCOEFF_NORMED score cutoff for icon matching
 CANONICAL_PER_SLOT   = 64    # px per 1×1 slot in the canonical-size template
 ICON_MATCH_MIN_SCORE = 0.40  # NCC threshold to accept an icon match
@@ -113,9 +120,33 @@ PRICE_QUERY = '''{
   }
 }'''
 
+TASKS_QUERY = '''{
+  tasks {
+    id name minPlayerLevel kappaRequired
+    trader { name }
+    objectives {
+      id type
+      ... on TaskObjectiveItem { count foundInRaid item { id name shortName } }
+    }
+  }
+  hideoutStations {
+    id name
+    levels { id level itemRequirements { count item { id name shortName } } }
+  }
+}'''
+
+
+class ScanError(Exception):
+    """User-actionable scan failure (no region set, capture failed, ...)."""
+
+
 # Shared state for hotkey-triggered scans
-_last_scan = {'image': None, 'detections': [], 'ts': 0}
+_last_scan = {'image': None, 'detections': [], 'ts': 0,
+              'error': None, 'warnings': [], 'checklist_matches': []}
 _scan_lock = threading.Lock()
+
+# Live progress of the currently running scan, polled by the frontend.
+_scan_state = {'running': False, 'phase': None, 'done': 0, 'total': 0, 'ts': 0}
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +193,96 @@ def build_price_index(cache):
         idx[item['name'].lower()] = item
         idx[item['shortName'].lower()] = item
     return idx
+
+
+# ---------------------------------------------------------------------------
+# Shared scan helpers
+# ---------------------------------------------------------------------------
+
+_tesseract_ok = None
+
+def tesseract_available():
+    """True if the Tesseract binary is installed and runnable (cached)."""
+    global _tesseract_ok
+    if _tesseract_ok is None:
+        try:
+            pytesseract.get_tesseract_version()
+            _tesseract_ok = True
+        except Exception:
+            _tesseract_ok = False
+    return _tesseract_ok
+
+
+def capture_stash_image(settings, require_region=False):
+    """
+    Grab the configured monitor/region and return (img_pil, img_bgr).
+    Raises ScanError when require_region is set but no region is configured.
+    """
+    region = settings.get('region')
+    if require_region and not region:
+        raise ScanError('No stash region set. Click "📐 Set Stash Region" first.')
+    with mss.mss() as sct:
+        monitors = sct.monitors
+        if len(monitors) < 2:
+            raise ScanError('No monitor available for capture.')
+        monitor_idx = settings.get('monitor', 0)
+        monitor = monitors[monitor_idx + 1] if monitor_idx + 1 < len(monitors) else monitors[1]
+        if region:
+            capture_region = {
+                'left':   monitor['left'] + region['x'],
+                'top':    monitor['top']  + region['y'],
+                'width':  region['w'],
+                'height': region['h'],
+            }
+        else:
+            capture_region = monitor
+        raw = sct.grab(capture_region)
+        img = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX')
+    img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    return img, img_bgr
+
+
+def map_keep_entries_to_ids(keep_list, price_idx):
+    """
+    Map every keep-list entry to its tarkov.dev item, conservatively.
+    Returns ({tdev_id: entry}, [unmapped_names]).
+
+    Order of trust: exact full-name match > persisted tdev_id > unambiguous
+    alias hits (≥4 chars, all agreeing on one item) > tight fuzzy fallback.
+    The old first-alias-wins logic let generic aliases like "Beer" or "Water"
+    claim the wrong item entirely.
+    """
+    id_ok = set()
+    for it_key, it in price_idx.items():
+        id_ok.add(it['id'])
+
+    mapped, unmapped = {}, []
+    for cat in keep_list['categories']:
+        for entry in cat['items']:
+            data = price_idx.get(entry['name'].lower())
+            if data is None and entry.get('tdev_id') in id_ok:
+                mapped[entry['tdev_id']] = entry
+                continue
+            if data is None:
+                hits = {}
+                for alias in entry.get('aliases', []):
+                    if len(alias) < 4:
+                        continue
+                    hit = price_idx.get(alias.lower())
+                    if hit:
+                        hits[hit['id']] = hit
+                if len(hits) == 1:
+                    data = next(iter(hits.values()))
+            if data is None:
+                names = [k for k in price_idx]
+                r = rfuzz.extractOne(entry['name'].lower(), names, score_cutoff=93)
+                if r:
+                    data = price_idx[r[0]]
+            if data is not None:
+                mapped[data['id']] = entry
+            else:
+                unmapped.append(entry['name'])
+    return mapped, unmapped
 
 # ---------------------------------------------------------------------------
 # Icon download + template matching helpers
@@ -600,12 +721,15 @@ def load_icon_db():
             }
         return _finalize_db(by_size_raw)
     except Exception as e:
+        global _icon_db_error
+        _icon_db_error = f'Icon DB load failed: {e}'
         print(f"[icon_db] load failed: {e}")
         return None
 
 
 # Global in-memory DB (populated on first use)
 _icon_db = None
+_icon_db_error = None
 _icon_db_lock = threading.Lock()
 
 def get_icon_db():
@@ -698,6 +822,8 @@ def _ocr_cell_label(img_bgr, col, row, W, grid):
     x1, y1 = max(0, x), max(0, y)
     x2, y2 = min(sw, x + w), min(sh, y + lh)
     if x2 - x1 < 8 or y2 - y1 < 6:
+        return ''
+    if not tesseract_available():
         return ''
     strip = cv2.cvtColor(img_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
     strip = cv2.resize(strip, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
@@ -880,7 +1006,7 @@ def _masked_ncc_scores(cell_vec, bucket):
 
 
 def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCORE,
-                           label_matcher=None):
+                           label_matcher=None, progress_cb=None):
     """
     Footprint-first identification, with optional OCR-label fusion.
 
@@ -919,11 +1045,17 @@ def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCOR
 
     detections = []
     n_ambig = 0
+    occ_total = int(occ.sum())
+    # Row-major cumulative count of occupied cells — monotonic progress even
+    # when multi-cell claims let the walk skip ahead.
+    occ_cum = np.cumsum(occ.reshape(-1))
 
     for row in range(n_rows):
         for col in range(n_cols):
             if claimed[row, col] or not occ[row, col]:
                 continue
+            if progress_cb:
+                progress_cb(int(occ_cum[row * n_cols + col]), occ_total)
 
             best = None   # (adj, sc, margin, i, W, H)
             for (W, H) in sizes:
@@ -1122,9 +1254,14 @@ def sell_recommendation(item_data):
 # Default data
 # ---------------------------------------------------------------------------
 
+# F9 conflicts with EFT's own binds and popular overlay tools, so the default
+# is a modifier combo nothing else claims.
+DEFAULT_HOTKEY = '<ctrl>+<shift>+s'
+
 def default_settings():
     return {
-        'region': None, 'monitor': 0, 'hotkey': '<f9>', 'prestige': 3,
+        'region': None, 'monitor': 0, 'hotkey': DEFAULT_HOTKEY, 'prestige': 3,
+        'scan_countdown': 3,   # seconds before the manual Scan button captures (0 = instant)
         'cell_size': 64,    # fallback: pixels per slot when grid auto-detect fails
         'icon_scale': 2.0,  # scale applied to tarkov.dev icons for template matching
         'ui_scale': 1.0,    # EFT UI scale — expected grid pitch = 63 * ui_scale px/slot
@@ -1188,7 +1325,7 @@ def default_keep_list():
             },
             {
                 'id': 'tasks',
-                'label': 'Task Items',
+                'label': 'Task Items (manual)',
                 'items': [
                     {'id': 'fleece',       'name': 'Fleece fabric',                'aliases': ['Fleece'],           'count': 10, 'task': 'Ragman - Textile Part 2',    'acquired': False},
                     {'id': 'cordura',      'name': 'Cordura polyamide fabric',     'aliases': ['Cordura'],          'count': 10, 'task': 'Ragman - Textile Part 2',    'acquired': False},
@@ -1217,6 +1354,359 @@ def default_keep_list():
             }
         ]
     }
+
+
+# ---------------------------------------------------------------------------
+# Kappa (Collector) list — synced from the wiki
+# ---------------------------------------------------------------------------
+
+from html.parser import HTMLParser
+
+class _WikiTableParser(HTMLParser):
+    """Collect each top-level <table> as a list of rows of stripped cell text.
+    Nested tables are parsed but discarded so their text can't pollute cells."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tables = []
+        self._stack = []   # one dict per open <table>
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'table':
+            self._stack.append({'rows': [], 'row': None, 'cell': None})
+        elif self._stack:
+            t = self._stack[-1]
+            if tag == 'tr':
+                t['row'] = []
+                t['cell'] = None
+            elif tag in ('td', 'th') and t['row'] is not None:
+                t['cell'] = []
+            elif tag == 'br' and t['cell'] is not None:
+                t['cell'].append(' ')
+
+    def handle_endtag(self, tag):
+        if not self._stack:
+            return
+        t = self._stack[-1]
+        if tag == 'table':
+            done = self._stack.pop()
+            if done['cell'] is not None and done['row'] is not None:
+                done['row'].append(' '.join(''.join(done['cell']).split()))
+            if done['row']:
+                done['rows'].append(done['row'])
+            if not self._stack:          # nested tables are dropped
+                self.tables.append(done['rows'])
+        elif tag == 'tr' and t['row'] is not None:
+            if t['cell'] is not None:
+                t['row'].append(' '.join(''.join(t['cell']).split()))
+                t['cell'] = None
+            t['rows'].append(t['row'])
+            t['row'] = None
+        elif tag in ('td', 'th') and t['cell'] is not None:
+            t['row'].append(' '.join(''.join(t['cell']).split()))
+            t['cell'] = None
+
+    def handle_data(self, data):
+        if self._stack and self._stack[-1]['cell'] is not None:
+            self._stack[-1]['cell'].append(data)
+
+
+def _extract_kappa_names(html):
+    """Pull the "Item name" column out of the Collector page's item table.
+    Locates the column by header text (not position) and right-aligns data
+    rows against the header row, since the wiki uses rowspan/colspan cells."""
+    p = _WikiTableParser()
+    p.feed(html)
+    for table in p.tables:
+        header_i = col = None
+        for i, row in enumerate(table):
+            low = [c.strip().lower() for c in row]
+            if 'item name' in low:
+                header_i, col = i, low.index('item name')
+                break
+        if header_i is None:
+            continue
+        header_len = len(table[header_i])
+        names = []
+        for row in table[header_i + 1:]:
+            if len(row) < 2:
+                continue
+            j = col + (len(row) - header_len)   # right-edge alignment
+            if 0 <= j < len(row):
+                name = row[j].strip()
+                if name:
+                    names.append(name)
+        if len(names) >= 20:
+            return names
+    raise ValueError('Collector item table not found (or suspiciously small) — '
+                     'wiki layout may have changed')
+
+
+def fetch_kappa_names(force=False):
+    """Return the current Collector item names from the wiki, cached 24 h."""
+    if not force and os.path.exists(KAPPA_WIKI_PATH):
+        cache = load_json(KAPPA_WIKI_PATH, lambda: None)
+        if cache and time.time() - cache.get('timestamp', 0) < KAPPA_WIKI_TTL:
+            return cache['names']
+    r = http_requests.get(COLLECTOR_WIKI_API, timeout=30, headers={
+        'User-Agent': 'TarkovStashHelper/1.0 (github.com/josfire18/tarkov-stash-helper)',
+    })
+    r.raise_for_status()
+    names = _extract_kappa_names(r.json()['parse']['text'])
+    save_json(KAPPA_WIKI_PATH, {'timestamp': time.time(), 'names': names})
+    return names
+
+
+def merge_kappa_into_keep_list(keep_list, names, price_idx=None):
+    """
+    Merge fresh wiki names into the kappa category, preserving user state.
+      - name already present (exact or fuzzy ≥90) → keep the entry (acquired,
+        aliases, id survive); fuzzy hits are renamed to the wiki spelling with
+        the old name kept as an alias.
+      - new wiki name → appended unchecked.
+      - entry no longer on the wiki (and not user-added) → flagged stale, never
+        deleted.
+    Idempotent. Returns {'added', 'stale', 'total'}.
+    """
+    cat = next((c for c in keep_list['categories'] if c['id'] == 'kappa'), None)
+    if cat is None:
+        cat = {'id': 'kappa', 'label': 'Kappa (Collector)', 'items': []}
+        keep_list['categories'].insert(0, cat)
+
+    by_name = {it['name'].casefold(): it for it in cat['items']}
+    claimed = set()   # entry ids already matched to a wiki name
+    added = []
+
+    for n in names:
+        entry = by_name.get(n.casefold())
+        if entry is None:
+            # Fuzzy rescue for wiki renames ('Press pass (NoiceGuy)' →
+            # 'Press pass (issued for NoiceGuy)') so check-state survives.
+            # Token-set + punctuation stripping scores real renames at 100
+            # while unrelated kappa items stay under ~45.
+            from rapidfuzz import fuzz as _fuzz, utils as _futils
+            cands = {it['name']: it for it in cat['items']
+                     if it['id'] not in claimed and it.get('source') != 'custom'}
+            if cands:
+                hit = rfuzz.extractOne(n, list(cands.keys()),
+                                       scorer=_fuzz.token_set_ratio,
+                                       processor=_futils.default_process,
+                                       score_cutoff=95)
+                if hit:
+                    entry = cands[hit[0]]
+                    old = entry['name']
+                    if old.casefold() != n.casefold():
+                        entry['name'] = n
+                        if old not in entry.get('aliases', []):
+                            entry.setdefault('aliases', []).append(old)
+        if entry is not None:
+            claimed.add(entry['id'])
+            entry['source'] = 'wiki'
+            entry.pop('stale', None)
+        else:
+            new = {'id': str(uuid.uuid4())[:8], 'name': n, 'aliases': [],
+                   'acquired': False, 'source': 'wiki'}
+            cat['items'].append(new)
+            claimed.add(new['id'])
+            added.append(n)
+
+    stale = []
+    for it in cat['items']:
+        if it['id'] in claimed or it.get('source') == 'custom':
+            continue
+        it['stale'] = True
+        stale.append(it['name'])
+
+    # Persist tarkov.dev ids so scans can map entries without alias guessing.
+    if price_idx:
+        keys = list(price_idx.keys())
+        for it in cat['items']:
+            if it.get('tdev_id'):
+                continue
+            data = price_idx.get(it['name'].lower())
+            if data is None:
+                hit = rfuzz.extractOne(it['name'].lower(), keys, score_cutoff=93)
+                if hit:
+                    data = price_idx[hit[0]]
+            if data:
+                it['tdev_id'] = data['id']
+
+    return {'added': added, 'stale': stale, 'total': len(cat['items'])}
+
+
+def kappa_sync(force=False):
+    """Fetch + merge + save. Returns the merge summary. Raises on failure
+    (keep_list.json is never touched when the fetch/parse fails)."""
+    names = fetch_kappa_names(force=force)
+    keep_list = load_json(KEEPLIST_PATH, default_keep_list)
+    price_idx = None
+    try:
+        price_idx = build_price_index(get_prices())
+    except Exception as e:
+        print(f"[kappa] price index unavailable during sync: {e}")
+    summary = merge_kappa_into_keep_list(keep_list, names, price_idx)
+    save_json(KEEPLIST_PATH, keep_list)
+    print(f"[kappa] synced {len(names)} wiki items — "
+          f"{len(summary['added'])} added, {len(summary['stale'])} stale")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Task & hideout requirements — from tarkov.dev
+# ---------------------------------------------------------------------------
+
+def default_progress():
+    return {'completed_tasks': [], 'completed_hideout': [], 'have': {}}
+
+
+def fetch_tasks():
+    """Fetch task + hideout item requirements from tarkov.dev, cache 24 h."""
+    r = http_requests.post(TARKOV_API, json={'query': TASKS_QUERY}, timeout=60)
+    payload = r.json()
+    if payload.get('errors'):
+        raise RuntimeError(f"tarkov.dev tasks query failed: {payload['errors']}")
+    data = payload.get('data') or {}
+    cache = {
+        'timestamp':       time.time(),
+        'tasks':           data.get('tasks') or [],
+        'hideoutStations': data.get('hideoutStations') or [],
+    }
+    save_json(TASKS_CACHE_PATH, cache)
+    return cache
+
+
+def get_tasks(allow_fetch=True):
+    """Cached task data, refreshed when stale. With allow_fetch=False, returns
+    whatever cache exists (or None) without touching the network — used inside
+    scans so a scan can never block on tarkov.dev."""
+    if os.path.exists(TASKS_CACHE_PATH):
+        cache = load_json(TASKS_CACHE_PATH, lambda: None)
+        if cache and (not allow_fetch
+                      or time.time() - cache.get('timestamp', 0) < TASKS_CACHE_TTL):
+            return cache
+    return fetch_tasks() if allow_fetch else None
+
+
+# Money hand-ins (e.g. "Compensation for Damage" wants 1M roubles) aren't
+# stash items worth tracking — they'd bury real requirements in the aggregate.
+CURRENCY_NAMES = {'roubles', 'dollars', 'euros'}
+
+def compute_tasks_view(cache, progress):
+    """
+    Server-side merged view of what the player still needs.
+    Only 'giveItem' objectives count as hand-ins; objectives with a null item
+    are skipped (tarkov.dev is migrating TaskObjectiveItem.item → items).
+    """
+    done_tasks  = set(progress.get('completed_tasks', []))
+    done_levels = set(progress.get('completed_hideout', []))
+    have        = progress.get('have', {})
+
+    agg = {}
+    def _acc(item, count, fir, src_type, src_name, active):
+        rec = agg.setdefault(item['id'], {
+            'item_id': item['id'], 'name': item.get('name') or '?',
+            'shortName': item.get('shortName') or '',
+            'total_needed': 0, 'fir_needed': 0, 'sources': [],
+        })
+        if active:
+            rec['total_needed'] += count
+            if fir:
+                rec['fir_needed'] += count
+            rec['sources'].append({'type': src_type, 'name': src_name,
+                                   'count': count, 'fir': bool(fir)})
+
+    tasks_out = []
+    for t in cache.get('tasks', []):
+        items = []
+        for o in (t.get('objectives') or []):
+            if o.get('type') != 'giveItem':
+                continue
+            it, cnt = o.get('item'), o.get('count') or 0
+            if not it or not it.get('id') or cnt <= 0:
+                continue
+            if (it.get('name') or '').lower() in CURRENCY_NAMES:
+                continue
+            fir = bool(o.get('foundInRaid'))
+            items.append({'item_id': it['id'], 'name': it.get('name') or '?',
+                          'count': cnt, 'fir': fir})
+            _acc(it, cnt, fir, 'task',
+                 f"{(t.get('trader') or {}).get('name', '?')} — {t['name']}",
+                 active=t['id'] not in done_tasks)
+        if not items:
+            continue   # only hand-in tasks are interesting here
+        tasks_out.append({
+            'id': t['id'], 'name': t['name'],
+            'trader': (t.get('trader') or {}).get('name', '?'),
+            'minPlayerLevel': t.get('minPlayerLevel') or 0,
+            'kappaRequired': bool(t.get('kappaRequired')),
+            'completed': t['id'] in done_tasks,
+            'items': items,
+        })
+
+    stations_out = []
+    for s in cache.get('hideoutStations', []):
+        levels = []
+        for lv in (s.get('levels') or []):
+            items = []
+            for req in (lv.get('itemRequirements') or []):
+                it, cnt = req.get('item'), req.get('count') or 0
+                if not it or not it.get('id') or cnt <= 0:
+                    continue
+                if (it.get('name') or '').lower() in CURRENCY_NAMES:
+                    continue
+                items.append({'item_id': it['id'], 'name': it.get('name') or '?',
+                              'count': cnt})
+                _acc(it, cnt, False, 'hideout', f"{s['name']} L{lv['level']}",
+                     active=lv['id'] not in done_levels)
+            levels.append({'id': lv['id'], 'level': lv['level'],
+                           'completed': lv['id'] in done_levels, 'items': items})
+        if levels:
+            stations_out.append({'id': s['id'], 'name': s['name'], 'levels': levels})
+
+    aggregate = []
+    for rec in agg.values():
+        if rec['total_needed'] <= 0:
+            continue
+        rec['have'] = int(have.get(rec['item_id'], 0))
+        aggregate.append(rec)
+    aggregate.sort(key=lambda r: -(r['total_needed'] - min(r['have'], r['total_needed'])))
+
+    return {
+        'aggregate': aggregate,
+        'tasks':     tasks_out,
+        'stations':  stations_out,
+        'cache_age_minutes': round((time.time() - cache.get('timestamp', 0)) / 60, 1),
+    }
+
+
+def get_protected_ids(keep_list, price_idx):
+    """
+    {tarkov.dev item id: reason} for everything the player should NOT sell:
+    unacquired keep-list entries + task/hideout items still short of their
+    required count.  Task data is cache-only here — a scan never waits on
+    the network for it.
+    """
+    protected = {}
+    mapped, _unmapped = map_keep_entries_to_ids(keep_list, price_idx)
+    for tid, entry in mapped.items():
+        if not entry.get('acquired'):
+            protected[tid] = 'On keep list'
+    try:
+        cache = get_tasks(allow_fetch=False)
+        if cache:
+            progress = load_json(PROGRESS_PATH, default_progress)
+            view = compute_tasks_view(cache, progress)
+            for rec in view['aggregate']:
+                if rec['have'] >= rec['total_needed']:
+                    continue
+                srcs = rec['sources']
+                first = srcs[0]['name'] if srcs else 'tasks'
+                more = f' +{len(srcs) - 1} more' if len(srcs) > 1 else ''
+                protected.setdefault(
+                    rec['item_id'],
+                    f"Needed: {first} (×{rec['total_needed']}){more}")
+    except Exception as e:
+        print(f"[tasks] protected-id pass skipped: {e}")
+    return protected
 
 
 # ---------------------------------------------------------------------------
@@ -1418,6 +1908,8 @@ def ocr_stash(img: Image.Image, alias_map, grid=None, cell_size=64):
     highlights snap precisely to cell boundaries with correct multi-slot sizing.
     Returns (annotated_image, detections).
     """
+    if not tesseract_available():
+        return img, []
     data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT,
                                      config='--psm 11 --oem 3')
     draw = ImageDraw.Draw(img, 'RGBA')
@@ -1466,65 +1958,179 @@ def ocr_stash(img: Image.Image, alias_map, grid=None, cell_size=64):
 
 
 # ---------------------------------------------------------------------------
-# Background scan (called by hotkey while Tarkov is focused)
+# Keep-list scan — one pipeline shared by the hotkey and the Scan button
 # ---------------------------------------------------------------------------
 
+def _persist_grid(g):
+    s = load_json(SETTINGS_PATH, default_settings)
+    s['grid'] = g
+    save_json(SETTINGS_PATH, s)
+
+
+def run_keep_scan():
+    """
+    Capture → grid → OCR pass → icon-DB pass, annotated for the keep list.
+    Returns {image, detections, grid_src, warnings, checklist_matches}.
+    Raises ScanError/Exception — callers decide how to surface it.
+    """
+    _scan_state.update({'running': True, 'phase': 'capture',
+                        'done': 0, 'total': 0, 'ts': time.time()})
+    try:
+        settings   = load_json(SETTINGS_PATH, default_settings)
+        keep_list  = load_json(KEEPLIST_PATH, default_keep_list)
+        alias_map  = build_alias_map(keep_list)
+        cell_size  = settings.get('cell_size', 64)
+        warnings   = []
+
+        if not tesseract_available():
+            warnings.append('Tesseract OCR not installed — name reading disabled '
+                            '(winget install UB-Mannheim.TesseractOCR)')
+
+        img, img_bgr = capture_stash_image(settings)
+
+        _scan_state['phase'] = 'grid'
+        grid, grid_src = resolve_grid(img_bgr, settings, persist_fn=_persist_grid)
+        print(f"Grid[{grid_src}]: cell={grid['cell_w']}×{grid['cell_h']} "
+              f"origin=({grid['origin_x']},{grid['origin_y']})")
+
+        # OCR pass — grid-snapped highlights for keep-list aliases
+        img, detections = ocr_stash(img, alias_map, grid=grid, cell_size=cell_size)
+
+        # Icon-DB pass (finds keep-list items OCR missed)
+        _scan_state['phase'] = 'match'
+        found_entries = {}   # entry_id -> entry, for the confirm-to-check bar
+        for d in detections:
+            for alias, entry in alias_map:
+                if entry['name'] == d['matched']:
+                    found_entries[entry['id']] = entry
+                    break
+
+        prices    = get_prices()
+        price_idx = build_price_index(prices)
+        keepid_to_entry, unmapped = map_keep_entries_to_ids(keep_list, price_idx)
+        if unmapped:
+            warnings.append(f"{len(unmapped)} keep-list item(s) not in the item "
+                            f"catalog: {', '.join(unmapped[:3])}"
+                            + ('…' if len(unmapped) > 3 else ''))
+
+        icon_db = get_icon_db()
+        if not icon_db:
+            warnings.append('Icon DB not built — icon matching skipped '
+                            '(build it from the Sell Advisor page)')
+        if icon_db and keepid_to_entry:
+            draw = ImageDraw.Draw(img, 'RGBA')
+            label_matcher = build_label_matcher(prices)
+            def _cb(done, total):
+                _scan_state['done'], _scan_state['total'] = done, total
+            ocr_positions = {(d['x'] // 20, d['y'] // 20) for d in detections}
+            for d in identify_items_by_icon(img_bgr, grid, icon_db,
+                                            label_matcher=label_matcher,
+                                            progress_cb=_cb):
+                entry = keepid_to_entry.get(d['item_id'])
+                if not entry:
+                    continue
+                x = grid['origin_x'] + d['col'] * grid['cell_w']
+                y = grid['origin_y'] + d['row'] * grid['cell_h']
+                w = d['W'] * grid['cell_w']
+                h = d['H'] * grid['cell_h']
+                pos_key = (x // 20, y // 20)
+                if pos_key in ocr_positions:
+                    continue
+                ocr_positions.add(pos_key)
+                found_entries[entry['id']] = entry
+                color  = (80, 160, 80, 130) if entry['acquired'] else (180, 50, 50, 150)
+                border = (80, 200, 80, 255) if entry['acquired'] else (220, 60, 60, 255)
+                draw.rectangle([x, y, x + w, y + h], fill=color, outline=border, width=2)
+                detections.append({
+                    'text': f'[icon] {entry["name"]}', 'matched': entry['name'],
+                    'score': d['score'], 'acquired': entry['acquired'],
+                    'x': x, 'y': y, 'w': w, 'h': h,
+                })
+
+        checklist_matches = [
+            {'entry_id': e['id'], 'name': e['name']}
+            for e in found_entries.values() if not e.get('acquired')
+        ]
+
+        buf = BytesIO()
+        img.save(buf, format='PNG')
+        encoded = base64.b64encode(buf.getvalue()).decode()
+        return {'image': encoded, 'detections': detections, 'grid_src': grid_src,
+                'warnings': warnings, 'checklist_matches': checklist_matches}
+    finally:
+        _scan_state.update({'running': False, 'phase': None, 'ts': time.time()})
+
+
 def do_scan():
-    settings  = load_json(SETTINGS_PATH, default_settings)
-    keep_list = load_json(KEEPLIST_PATH, default_keep_list)
-    alias_map = build_alias_map(keep_list)
-    cell_size = settings.get('cell_size', 64)
+    """Hotkey-triggered scan: same pipeline as the Scan button, results (or the
+    error) parked in _last_scan for the frontend poller."""
+    try:
+        result = run_keep_scan()
+        with _scan_lock:
+            _last_scan.update(result, error=None, ts=time.time())
+    except Exception as e:
+        import traceback
+        print(f"[hotkey scan] ERROR:\n{traceback.format_exc()}")
+        with _scan_lock:
+            _last_scan.update({'image': None, 'detections': [], 'warnings': [],
+                               'checklist_matches': [], 'error': str(e),
+                               'ts': time.time()})
 
-    with mss.mss() as sct:
-        monitor_idx = settings.get('monitor', 0)
-        monitors = sct.monitors
-        monitor = monitors[monitor_idx + 1] if monitor_idx + 1 < len(monitors) else monitors[1]
-        region = settings.get('region')
-        if region:
-            capture_region = {
-                'left': monitor['left'] + region['x'],
-                'top': monitor['top'] + region['y'],
-                'width': region['w'],
-                'height': region['h']
-            }
-        else:
-            capture_region = monitor
-        raw = sct.grab(capture_region)
-        img = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX')
 
-    img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-    grid = detect_stash_grid(img_bgr)
-    if grid:
-        print(f"Grid detected: cell={grid['cell_w']}×{grid['cell_h']} origin=({grid['origin_x']},{grid['origin_y']})")
-    img, detections = ocr_stash(img, alias_map, grid=grid, cell_size=cell_size)
-    buf = BytesIO()
-    img.save(buf, format='PNG')
-    encoded = base64.b64encode(buf.getvalue()).decode()
+# ---------------------------------------------------------------------------
+# Global hotkey
+# ---------------------------------------------------------------------------
 
-    with _scan_lock:
-        _last_scan['image'] = encoded
-        _last_scan['detections'] = detections
-        _last_scan['ts'] = time.time()
+class HotkeyManager:
+    """Owns the pynput GlobalHotKeys listener; supports live rebinding."""
+    def __init__(self):
+        self._listener = None
+        self._lock = threading.Lock()
+        self.current = None
+
+    @staticmethod
+    def validate(hotkey_str):
+        """Raises ValueError if pynput can't parse the combo."""
+        keyboard.HotKey.parse(hotkey_str)
+
+    def _on_activate(self):
+        print(f"Hotkey {self.current} triggered — scanning...")
+        threading.Thread(target=do_scan, daemon=True).start()
+
+    def register(self, hotkey_str):
+        self.validate(hotkey_str)
+        with self._lock:
+            if self._listener is not None:
+                try:
+                    self._listener.stop()
+                except Exception:
+                    pass
+                self._listener = None
+            listener = keyboard.GlobalHotKeys({hotkey_str: self._on_activate})
+            listener.daemon = True
+            listener.start()
+            self._listener = listener
+            self.current = hotkey_str
+        print(f"Hotkey listener active — press {hotkey_str} in-game to scan")
+
+
+hotkey_manager = HotkeyManager()
 
 
 def start_hotkey_listener():
     settings = load_json(SETTINGS_PATH, default_settings)
-    hotkey_str = settings.get('hotkey', '<f9>')
-
-    def on_activate():
-        print(f"Hotkey {hotkey_str} triggered — scanning...")
-        threading.Thread(target=do_scan, daemon=True).start()
-
-    def listener_thread():
-        try:
-            with keyboard.GlobalHotKeys({hotkey_str: on_activate}) as h:
-                print(f"Hotkey listener active — press {hotkey_str} in-game to scan")
-                h.join()  # blocks, keeping listener alive for the lifetime of the thread
-        except Exception as e:
-            print(f"Hotkey listener failed: {e}")
-
-    t = threading.Thread(target=listener_thread, daemon=True)
-    t.start()
+    hotkey_str = settings.get('hotkey', DEFAULT_HOTKEY)
+    # Migrate the old F9 default: EFT and common overlays grab function keys,
+    # so plain F9 frequently never reaches this app.
+    if hotkey_str == '<f9>':
+        hotkey_str = DEFAULT_HOTKEY
+        settings['hotkey'] = hotkey_str
+        save_json(SETTINGS_PATH, settings)
+        print(f"Hotkey migrated F9 → {hotkey_str} (F9 conflicts with EFT itself)")
+    try:
+        hotkey_manager.register(hotkey_str)
+    except Exception as e:
+        print(f"Hotkey listener failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1539,91 +2145,47 @@ def index():
 def last_scan():
     since = float(request.args.get('since', 0))
     with _scan_lock:
-        if _last_scan['ts'] > since and _last_scan['image']:
+        if _last_scan['ts'] > since and (_last_scan['image'] or _last_scan.get('error')):
             return jsonify({'ready': True, **_last_scan})
     return jsonify({'ready': False})
 
+@app.route('/api/scan-status', methods=['GET'])
+def scan_status():
+    return jsonify(dict(_scan_state))
+
+@app.route('/api/health', methods=['GET'])
+def health():
+    return jsonify({
+        'tesseract':      tesseract_available(),
+        'tesseract_cmd':  pytesseract.pytesseract.tesseract_cmd,
+        'icon_db_ready':  get_icon_db() is not None,
+        'icon_db_error':  _index_build_state.get('error') or _icon_db_error,
+        'prices_cached':  os.path.exists(PRICES_PATH),
+        'hotkey':         hotkey_manager.current,
+    })
+
+@app.route('/api/hotkey', methods=['POST'])
+def set_hotkey():
+    hotkey_str = (request.json or {}).get('hotkey', '').strip()
+    try:
+        hotkey_manager.register(hotkey_str)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Invalid hotkey: {e}'}), 400
+    settings = load_json(SETTINGS_PATH, default_settings)
+    settings['hotkey'] = hotkey_str
+    save_json(SETTINGS_PATH, settings)
+    return jsonify({'ok': True, 'hotkey': hotkey_str})
+
 @app.route('/api/screenshot', methods=['POST'])
 def take_screenshot():
-    settings   = load_json(SETTINGS_PATH, default_settings)
-    keep_list  = load_json(KEEPLIST_PATH, default_keep_list)
-    alias_map  = build_alias_map(keep_list)
-    cell_size  = settings.get('cell_size', 64)
-
-    with mss.mss() as sct:
-        monitor_idx = settings.get('monitor', 0)
-        monitors = sct.monitors
-        monitor = monitors[monitor_idx + 1] if monitor_idx + 1 < len(monitors) else monitors[1]
-
-        region = settings.get('region')
-        if region:
-            capture_region = {
-                'left': monitor['left'] + region['x'],
-                'top': monitor['top'] + region['y'],
-                'width': region['w'],
-                'height': region['h']
-            }
-        else:
-            capture_region = monitor
-
-        raw = sct.grab(capture_region)
-        img = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX')
-
-    img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-    grid, _grid_src = resolve_grid(img_bgr, settings)
-
-    # OCR pass — grid-snapped if detected
-    img, detections = ocr_stash(img, alias_map, grid=grid, cell_size=cell_size)
-
-    # Icon-matching pass (finds keep-list items OCR missed) — now uses the same
-    # masked-NCC icon DB as the sell scanner, not the retired 64×64 thumbnails.
-    prices    = get_prices()
-    price_idx = build_price_index(prices)
-    draw = ImageDraw.Draw(img, 'RGBA')
-
-    # Map every keep-list entry to its tarkov.dev item ID (+ acquired flag).
-    keepid_to_entry = {}
-    for cat in keep_list['categories']:
-        for item in cat['items']:
-            item_data = price_idx.get(item['name'].lower())
-            if not item_data:
-                for alias in item.get('aliases', []):
-                    item_data = price_idx.get(alias.lower())
-                    if item_data:
-                        break
-            if item_data:
-                keepid_to_entry[item_data['id']] = item
-
-    icon_db = get_icon_db()
-    if icon_db and keepid_to_entry:
-        label_matcher = build_label_matcher(prices)
-        ocr_positions = {(d['x'] // 20, d['y'] // 20) for d in detections}
-        for d in identify_items_by_icon(img_bgr, grid, icon_db, label_matcher=label_matcher):
-            entry = keepid_to_entry.get(d['item_id'])
-            if not entry:
-                continue
-            x = grid['origin_x'] + d['col'] * grid['cell_w']
-            y = grid['origin_y'] + d['row'] * grid['cell_h']
-            w = d['W'] * grid['cell_w']
-            h = d['H'] * grid['cell_h']
-            pos_key = (x // 20, y // 20)
-            if pos_key in ocr_positions:
-                continue
-            ocr_positions.add(pos_key)
-            color  = (80, 160, 80, 130) if entry['acquired'] else (180, 50, 50, 150)
-            border = (80, 200, 80, 255) if entry['acquired'] else (220, 60, 60, 255)
-            draw.rectangle([x, y, x + w, y + h], fill=color, outline=border, width=2)
-            detections.append({
-                'text': f'[icon] {entry["name"]}', 'matched': entry['name'],
-                'score': d['score'], 'acquired': entry['acquired'],
-                'x': x, 'y': y, 'w': w, 'h': h,
-            })
-
-    buf = BytesIO()
-    img.save(buf, format='PNG')
-    encoded = base64.b64encode(buf.getvalue()).decode()
-
-    return jsonify({'image': encoded, 'detections': detections})
+    try:
+        return jsonify(run_keep_scan())
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[screenshot] ERROR:\n{tb}")
+        return jsonify({'error': str(e), 'image': None, 'detections': [],
+                        'warnings': [], 'checklist_matches': []})
 
 @app.route('/api/keep-list', methods=['GET'])
 def get_keep_list():
@@ -1653,7 +2215,8 @@ def add_item():
                 'id': str(uuid.uuid4())[:8],
                 'name': data['name'],
                 'aliases': data.get('aliases', []),
-                'acquired': False
+                'acquired': False,
+                'source': 'custom',   # wiki sync must never flag user items stale
             }
             if 'task' in data:
                 new_item['task'] = data['task']
@@ -1671,6 +2234,30 @@ def remove_item(item_id):
         cat['items'] = [i for i in cat['items'] if i['id'] != item_id]
     save_json(KEEPLIST_PATH, keep_list)
     return jsonify({'ok': True})
+
+@app.route('/api/keep-list/acquire', methods=['POST'])
+def acquire_items():
+    """Batch-mark entries acquired — the scan confirm bar's one-click action."""
+    ids = set((request.json or {}).get('ids') or [])
+    keep_list = load_json(KEEPLIST_PATH, default_keep_list)
+    updated = 0
+    for cat in keep_list['categories']:
+        for item in cat['items']:
+            if item['id'] in ids and not item['acquired']:
+                item['acquired'] = True
+                updated += 1
+    if updated:
+        save_json(KEEPLIST_PATH, keep_list)
+    return jsonify({'ok': True, 'updated': updated})
+
+@app.route('/api/kappa/refresh', methods=['POST'])
+def kappa_refresh():
+    """Force a wiki sync. keep_list.json is untouched when fetch/parse fails."""
+    try:
+        summary = kappa_sync(force=True)
+        return jsonify({'ok': True, **summary})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 502
 
 @app.route('/api/calibration-screenshot', methods=['GET'])
 def calibration_screenshot():
@@ -1700,7 +2287,70 @@ def save_settings():
 @app.route('/api/reset', methods=['POST'])
 def reset_keep_list():
     save_json(KEEPLIST_PATH, default_keep_list())
+    # Land on current wiki data when online; the hardcoded defaults are only
+    # the offline fallback.
+    try:
+        kappa_sync()
+    except Exception as e:
+        print(f"[kappa] post-reset sync skipped: {e}")
     return jsonify({'ok': True})
+
+# ---------------------------------------------------------------------------
+# Tasks & hideout page
+# ---------------------------------------------------------------------------
+
+@app.route('/tasks')
+def tasks_page():
+    return render_template('tasks.html')
+
+@app.route('/api/tasks', methods=['GET'])
+def api_tasks():
+    try:
+        cache = get_tasks()
+    except Exception as e:
+        return jsonify({'error': str(e)}), 502
+    progress = load_json(PROGRESS_PATH, default_progress)
+    return jsonify(compute_tasks_view(cache, progress))
+
+@app.route('/api/tasks/refresh', methods=['POST'])
+def api_tasks_refresh():
+    try:
+        cache = fetch_tasks()
+        return jsonify({'ok': True, 'tasks': len(cache['tasks']),
+                        'stations': len(cache['hideoutStations'])})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 502
+
+@app.route('/api/tasks/complete', methods=['POST'])
+def api_tasks_complete():
+    data = request.json or {}
+    typ, tid, done = data.get('type'), data.get('id'), bool(data.get('done'))
+    if typ not in ('task', 'hideout') or not tid:
+        return jsonify({'ok': False, 'error': 'type must be task|hideout, id required'}), 400
+    progress = load_json(PROGRESS_PATH, default_progress)
+    key = 'completed_tasks' if typ == 'task' else 'completed_hideout'
+    ids = set(progress.get(key, []))
+    (ids.add if done else ids.discard)(tid)
+    progress[key] = sorted(ids)
+    save_json(PROGRESS_PATH, progress)
+    return jsonify({'ok': True})
+
+@app.route('/api/tasks/have', methods=['POST'])
+def api_tasks_have():
+    data = request.json or {}
+    item_id = data.get('item_id')
+    if not item_id:
+        return jsonify({'ok': False, 'error': 'item_id required'}), 400
+    try:
+        delta = int(data.get('delta') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'error': 'delta must be an integer'}), 400
+    progress = load_json(PROGRESS_PATH, default_progress)
+    have = progress.setdefault('have', {})
+    have[item_id] = max(0, int(have.get(item_id, 0)) + delta)
+    save_json(PROGRESS_PATH, progress)
+    return jsonify({'ok': True, 'have': have[item_id]})
+
 
 # ---------------------------------------------------------------------------
 # Sell page
@@ -1730,18 +2380,7 @@ def prices_refresh():
 def debug_grid():
     """Capture the configured region and return detected grid parameters."""
     settings = load_json(SETTINGS_PATH, default_settings)
-    with mss.mss() as sct:
-        monitor_idx = settings.get('monitor', 0)
-        monitors = sct.monitors
-        monitor  = monitors[monitor_idx + 1] if monitor_idx + 1 < len(monitors) else monitors[1]
-        region   = settings.get('region')
-        cap = {
-            'left':  monitor['left'] + region['x'], 'top':   monitor['top']  + region['y'],
-            'width': region['w'],                   'height': region['h'],
-        } if region else monitor
-        raw = sct.grab(cap)
-        img = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX')
-    img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    img, img_bgr = capture_stash_image(settings)
     grid = detect_stash_grid(img_bgr)
     return jsonify({'grid': grid, 'img_size': [img.width, img.height]})
 
@@ -1759,7 +2398,7 @@ def icons_prefetch():
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({'ok': True, 'message': 'Icon prefetch started in background'})
 
-_index_build_state = {'running': False, 'done': 0, 'total': 0, 'ts': 0}
+_index_build_state = {'running': False, 'done': 0, 'total': 0, 'ts': 0, 'error': None}
 
 @app.route('/api/icons/build-index', methods=['POST'])
 def icons_build_index():
@@ -1769,7 +2408,8 @@ def icons_build_index():
 
     def _run():
         global _icon_db
-        _index_build_state.update({'running': True, 'done': 0, 'total': 0, 'ts': time.time()})
+        _index_build_state.update({'running': True, 'done': 0, 'total': 0,
+                                   'ts': time.time(), 'error': None})
         try:
             prices = get_prices()
             _index_build_state['total'] = len(prices.get('items', []))
@@ -1782,29 +2422,14 @@ def icons_build_index():
             _index_build_state['done'] = _index_build_state['total']
             print(f"[icon_db] built: {sum(len(b['ids']) for b in db.values())} items")
         except Exception as e:
+            _index_build_state['error'] = str(e)
             print(f"[icon_db] build failed: {e}")
             return
         finally:
             _index_build_state['running'] = False
 
-        # CNN auto-train intentionally skipped — sell scan now uses NCC icon DB directly
-
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({'ok': True, 'message': 'Icon DB build started'})
-
-
-@app.route('/api/icons/train', methods=['POST'])
-def icons_train():
-    """Deprecated — the CNN classifier is retired; identification uses the NCC icon DB."""
-    return jsonify({'ok': False, 'deprecated': True,
-                    'message': 'CNN classifier retired — use Build Icon DB (NCC).'}), 410
-
-
-@app.route('/api/icons/train-status', methods=['GET'])
-def icons_train_status():
-    """Deprecated — kept only so old frontends polling this don't error."""
-    return jsonify({'deprecated': True, 'train': {'running': False, 'done': False},
-                    'model': None})
 
 
 @app.route('/api/icons/index-status', methods=['GET'])
@@ -1828,7 +2453,7 @@ def icons_matcher_status():
         'running':    _index_build_state['running'],
         'done_count': _index_build_state.get('done', 0),
         'total':      _index_build_state.get('total', 0),
-        'error':      None,
+        'error':      _index_build_state.get('error') or _icon_db_error,
         'ready':      db is not None,
         'item_count': item_count,
     })
@@ -1846,15 +2471,6 @@ def sell_scan():
 
 def _sell_scan_inner():
     settings = load_json(SETTINGS_PATH, default_settings)
-    cell_size_fallback = settings.get('cell_size', 64)
-
-    # --- Region required -----------------------------------------------------
-    region = settings.get('region')
-    if not region:
-        return jsonify({
-            'image': None, 'results': [], 'grid': None,
-            'error': 'No stash region set. Click "📐 Set Stash Region" first.',
-        })
 
     # --- Icon DB required ----------------------------------------------------
     icon_db = get_icon_db()
@@ -1864,110 +2480,114 @@ def _sell_scan_inner():
             'error': 'Icon index not built yet. Click "Build Icon DB" first.',
         })
 
-    # --- Screenshot ----------------------------------------------------------
-    with mss.mss() as sct:
-        monitor_idx = settings.get('monitor', 0)
-        monitors    = sct.monitors
-        monitor     = monitors[monitor_idx + 1] if monitor_idx + 1 < len(monitors) else monitors[1]
-        capture_region = {
-            'left':   monitor['left'] + region['x'],
-            'top':    monitor['top']  + region['y'],
-            'width':  region['w'],
-            'height': region['h'],
-        }
-        raw = sct.grab(capture_region)
-        img = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX')
+    _scan_state.update({'running': True, 'phase': 'capture',
+                        'done': 0, 'total': 0, 'ts': time.time()})
+    try:
+        # --- Screenshot (region required for sell scans) ----------------------
+        try:
+            img, img_bgr = capture_stash_image(settings, require_region=True)
+        except ScanError as e:
+            return jsonify({'image': None, 'results': [], 'grid': None,
+                            'error': str(e)})
 
-    # --- Grid detection (constrained to the 63px pitch, persisted) -----------
-    img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        # --- Grid detection (constrained to the 63px pitch, persisted) -------
+        _scan_state['phase'] = 'grid'
+        grid, grid_src = resolve_grid(img_bgr, settings, persist_fn=_persist_grid)
+        print(f"Grid[{grid_src}]: cell={grid['cell_w']}×{grid['cell_h']} "
+              f"origin=({grid['origin_x']},{grid['origin_y']})")
 
-    def _persist_grid(g):
-        s = load_json(SETTINGS_PATH, default_settings)
-        s['grid'] = g
-        save_json(SETTINGS_PATH, s)
+        prices     = get_prices()
+        price_idx  = build_price_index(prices)
+        id_to_item = {it['id']: it for it in prices.get('items', [])}
 
-    grid, grid_src = resolve_grid(img_bgr, settings, persist_fn=_persist_grid)
-    print(f"Grid[{grid_src}]: cell={grid['cell_w']}×{grid['cell_h']} "
-          f"origin=({grid['origin_x']},{grid['origin_y']})")
+        # Everything the player shouldn't sell: unacquired keep-list entries +
+        # task/hideout items still short of their required count.
+        keep_list = load_json(KEEPLIST_PATH, default_keep_list)
+        protected = get_protected_ids(keep_list, price_idx)
 
-    prices     = get_prices()
-    price_idx  = build_price_index(prices)
-    id_to_item = {it['id']: it for it in prices.get('items', [])}
+        warnings = []
+        if not tesseract_available():
+            warnings.append('Tesseract OCR not installed — name reading disabled '
+                            '(winget install UB-Mannheim.TesseractOCR)')
 
-    # Keep-list → item ID set
-    keep_list = load_json(KEEPLIST_PATH, default_keep_list)
-    keep_ids  = set()
-    for cat in keep_list['categories']:
-        for kitem in cat['items']:
-            for alias in [kitem['name']] + kitem.get('aliases', []):
-                data = price_idx.get(alias.lower())
-                if data:
-                    keep_ids.add(data['id'])
-                    break
+        # --- NCC + OCR-label identification (uses existing icon DB) ----------
+        _scan_state['phase'] = 'match'
+        def _cb(done, total):
+            _scan_state['done'], _scan_state['total'] = done, total
+        label_matcher = build_label_matcher(prices)
+        raw_detections = identify_items_by_icon(img_bgr, grid, icon_db,
+                                                label_matcher=label_matcher,
+                                                progress_cb=_cb)
+        print(f"[sell_scan] matches: {len(raw_detections)}")
 
-    # --- NCC + OCR-label identification (uses existing icon DB) --------------
-    label_matcher = build_label_matcher(prices)
-    raw_detections = identify_items_by_icon(img_bgr, grid, icon_db,
-                                            label_matcher=label_matcher)
-    print(f"[sell_scan] matches: {len(raw_detections)}")
+        # --- Number items in row-major order, KEEP items highlighted cyan ----
+        draw    = ImageDraw.Draw(img, 'RGBA')
+        results = []
+        num     = 1
 
-    # --- Number items in row-major order, skipping keep-list items ----------
-    draw    = ImageDraw.Draw(img, 'RGBA')
-    results = []
-    num     = 1
+        keep_results = []   # KEEP items — appended after numbered items
+        for d in sorted(raw_detections, key=lambda r: (r['row'], r['col'])):
+            bx = grid['origin_x'] + d['col'] * grid['cell_w'] + 2
+            by = grid['origin_y'] + d['row'] * grid['cell_h'] + 2
 
-    keep_results = []   # K items — appended after numbered items
-    for d in sorted(raw_detections, key=lambda r: (r['row'], r['col'])):
-        bx = grid['origin_x'] + d['col'] * grid['cell_w'] + 2
-        by = grid['origin_y'] + d['row'] * grid['cell_h'] + 2
+            item_data = id_to_item.get(d['item_id'])
+            if not item_data:
+                continue
 
-        item_data = id_to_item.get(d['item_id'])
-        if not item_data:
-            continue
+            if d['item_id'] in protected:
+                # Cyan = KEEP: unmistakably different from flea-green and
+                # trader-gold so "do not sell" reads at a glance.
+                fx1 = grid['origin_x'] + d['col'] * grid['cell_w']
+                fy1 = grid['origin_y'] + d['row'] * grid['cell_h']
+                fx2 = fx1 + d['W'] * grid['cell_w']
+                fy2 = fy1 + d['H'] * grid['cell_h']
+                draw.rectangle([fx1, fy1, fx2, fy2],
+                               fill=(0, 180, 220, 60), outline=(0, 220, 255, 255), width=3)
+                draw_badge(draw, bx, by, 'KEEP', bg=(0, 140, 180, 230))
+                keep_results.append({
+                    'num':          'K',
+                    'matched_name': item_data['name'],
+                    'score':        d['score'],
+                    'col':          d['col'], 'row': d['row'],
+                    'W':            d['W'],   'H':   d['H'],
+                    'rotated':      d.get('rotated', False),
+                    'x': bx, 'y': by,
+                    'recommend':    'keep',
+                    'trader_name':  None, 'trader_price': None,
+                    'flea_list':    None, 'flea_net':     None,
+                    'reason':       protected[d['item_id']],
+                })
+                continue
 
-        if d['item_id'] in keep_ids:
-            draw_badge(draw, bx, by, 'K', bg=(80, 80, 80, 210))
-            keep_results.append({
-                'num':          'K',
+            rec = sell_recommendation(item_data)
+            bg  = (30, 150, 30, 230) if rec['recommend'] == 'flea' else (180, 120, 20, 230)
+            draw_badge(draw, bx, by, str(num), bg=bg)
+
+            results.append({
+                'num':          num,
                 'matched_name': item_data['name'],
                 'score':        d['score'],
                 'col':          d['col'], 'row': d['row'],
                 'W':            d['W'],   'H':   d['H'],
                 'rotated':      d.get('rotated', False),
                 'x': bx, 'y': by,
-                'recommend':    'keep',
-                'trader_name':  None, 'trader_price': None,
-                'flea_list':    None, 'flea_net':     None,
-                'reason':       'On keep list',
+                **rec,
             })
-            continue
+            num += 1
 
-        rec = sell_recommendation(item_data)
-        bg  = (30, 150, 30, 230) if rec['recommend'] == 'flea' else (180, 120, 20, 230)
-        draw_badge(draw, bx, by, str(num), bg=bg)
+        results.extend(keep_results)   # KEEP items always at the end
 
-        results.append({
-            'num':          num,
-            'matched_name': item_data['name'],
-            'score':        d['score'],
-            'col':          d['col'], 'row': d['row'],
-            'W':            d['W'],   'H':   d['H'],
-            'rotated':      d.get('rotated', False),
-            'x': bx, 'y': by,
-            **rec,
+        buf = BytesIO()
+        img.save(buf, format='PNG')
+        encoded = base64.b64encode(buf.getvalue()).decode()
+        return jsonify({
+            'image':    encoded,
+            'results':  results,
+            'grid':     grid,
+            'warnings': warnings,
         })
-        num += 1
-
-    results.extend(keep_results)   # K items always at the end
-
-    buf = BytesIO()
-    img.save(buf, format='PNG')
-    encoded = base64.b64encode(buf.getvalue()).decode()
-    return jsonify({
-        'image':   encoded,
-        'results': results,
-        'grid':    grid,
-    })
+    finally:
+        _scan_state.update({'running': False, 'phase': None, 'ts': time.time()})
 
 
 HOST = '127.0.0.1'
@@ -1984,6 +2604,25 @@ def run_server():
     serve(app, host=HOST, port=PORT, _quiet=True)
 
 
+def _startup_maintenance():
+    """One-shot background housekeeping: purge retired CNN model files from
+    user machines and freshen the kappa list from the wiki when stale."""
+    for fn in ('icon_model.pt', 'icon_model_meta.json', 'icon_index.json'):
+        p = os.path.join(DATA, fn)
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+                print(f"[cleanup] removed retired file {fn}")
+            except Exception as e:
+                print(f"[cleanup] could not remove {fn}: {e}")
+    try:
+        cache = load_json(KAPPA_WIKI_PATH, lambda: None) if os.path.exists(KAPPA_WIKI_PATH) else None
+        if not cache or time.time() - cache.get('timestamp', 0) > KAPPA_WIKI_TTL:
+            kappa_sync()
+    except Exception as e:
+        print(f"[kappa] startup sync skipped (offline?): {e}")
+
+
 def _run_app():
     """Hosts the local Flask UI in a native window (pywebview) instead of a
     browser tab, so there's no URL for the user to see or navigate to — it
@@ -1994,6 +2633,7 @@ def _run_app():
     from icon_asset import load_tray_image
 
     threading.Thread(target=run_server, daemon=True).start()
+    threading.Thread(target=_startup_maintenance, daemon=True).start()
     start_hotkey_listener()
 
     window = webview.create_window(

@@ -39,3 +39,6 @@ env/
 
 # Claude Code internal state
 .claude/
+data/kappa_wiki.json
+data/tasks_cache.json
+data/progress.json

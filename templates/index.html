@@ -300,6 +300,45 @@
   .progress-label { font-size: 10px; color: #666; margin-bottom: 4px; display: flex; justify-content: space-between; }
   .progress-bar { height: 4px; background: #1e1e1e; border-radius: 2px; overflow: hidden; }
   .progress-fill { height: 100%; background: linear-gradient(90deg, #2a5a1e, #5aaa2a); border-radius: 2px; transition: width .4s; }
+
+  /* ── Stale wiki rows ── */
+  .item-row.stale { opacity: 0.4; }
+  .stale-badge { font-size: 9px; font-weight: 700; color: #888; background: #1e1e1e; border: 1px solid #3a3a3a; padding: 1px 5px; border-radius: 2px; flex-shrink: 0; letter-spacing: 0.5px; }
+
+  /* ── Health banner ── */
+  #health-banner {
+    background: #2a1e00; border-bottom: 1px solid #6a5010;
+    padding: 7px 16px; font-size: 12px; color: #e0a030;
+    display: none; align-items: center; gap: 12px;
+  }
+  #health-banner.show { display: flex; }
+  #health-banner code { background: #0d0f10; padding: 1px 6px; border-radius: 2px; }
+
+  /* ── Scan confirm bar ── */
+  #confirm-bar {
+    border-top: 1px solid #1a3a44;
+    background: #0e1c20;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: #6ad4ee;
+    display: none;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+  #confirm-bar.show { display: flex; }
+  #confirm-bar .names { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #9adfef; }
+
+  /* ── Settings modal fields ── */
+  .settings-row { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .settings-row label { width: 130px; font-size: 12px; color: #b0a898; flex-shrink: 0; }
+  .settings-row input {
+    background: #0d0f10; border: 1px solid #2a2a2a; color: #c8c0b0;
+    padding: 6px 10px; font-size: 12px; border-radius: 3px; outline: none;
+  }
+  .settings-row input:focus { border-color: #c4a040; }
+  #hotkey-input { width: 180px; cursor: pointer; }
+  #settings-error { color: #f87171; font-size: 11px; min-height: 15px; }
 </style>
 </head>
 <body>
@@ -308,6 +347,7 @@
   <a href="/" style="color:#c4a040;font-size:14px;font-weight:700;letter-spacing:1px;text-transform:uppercase;text-decoration:none;display:flex;align-items:center;padding-right:20px;border-right:1px solid #2a2a2a;flex-shrink:0">&#x2302; Tarkov</a>
   <nav style="display:flex;align-items:stretch;padding:0 12px">
     <a href="/" style="display:flex;align-items:center;padding:0 16px;font-size:12px;color:#c4a040;text-decoration:none;border-bottom:2px solid #c4a040">Keep List</a>
+    <a href="/tasks" style="display:flex;align-items:center;padding:0 16px;font-size:12px;color:#666;text-decoration:none;border-bottom:2px solid transparent">Tasks &amp; Hideout</a>
     <a href="/sell" style="display:flex;align-items:center;padding:0 16px;font-size:12px;color:#666;text-decoration:none;border-bottom:2px solid transparent">Sell Advisor</a>
   </nav>
   <div class="spacer"></div>
@@ -323,12 +363,17 @@
   </select>
   <div style="width:1px;height:20px;background:#2a2a2a;margin:0 8px"></div>
   <span id="hotkey-badge" style="font-size:11px;color:#555;background:#131618;border:1px solid #2a2a2a;padding:4px 10px;border-radius:3px">
-    Hotkey: <span style="color:#c4a040">F9</span> — press in-game to scan
+    Hotkey: <span id="hotkey-label" style="color:#c4a040">…</span> — press in-game to scan
   </span>
   <button id="btn-calibrate" class="active">Set Stash Region</button>
+  <button id="btn-settings" title="Settings">&#9881; Settings</button>
   <button id="btn-help">? Help</button>
   <button id="btn-reset" class="danger">Reset List</button>
 </header>
+
+<div id="health-banner">
+  <span id="health-banner-text"></span>
+</div>
 
 <!-- Help modal -->
 <div id="help-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:3000;align-items:center;justify-content:center">
@@ -352,10 +397,12 @@
         <div style="color:#c4a040;font-weight:600;margin-bottom:6px">2 — Scanning your stash</div>
         <ol style="padding-left:18px;display:flex;flex-direction:column;gap:4px">
           <li>Open your stash in Tarkov <em>(keep the game focused so lossless scaling is active)</em>.</li>
-          <li>Press <b style="color:#c4a040">F9</b> — the screenshot fires instantly while the game is still in the foreground.</li>
-          <li>Tab to this browser — the scan result is already loaded.</li>
-          <li><b style="color:#8fcc5a">Green highlight</b> = item is on your keep list (acquired or still needed).<br>
-              <b style="color:#cc5a5a">Red highlight</b> = not on the keep list → safe to sell.</li>
+          <li>Press <b style="color:#c4a040" class="hotkey-mention">…</b> — the screenshot fires instantly while the game is still in the foreground. You can change the hotkey in <b>⚙ Settings</b>.</li>
+          <li>Tab to this window — the scan result is already loaded.</li>
+          <li>On this page: <b style="color:#8fcc5a">green highlight</b> = keep-list item you've already acquired,
+              <b style="color:#cc5a5a">red highlight</b> = keep-list item still needed.
+              On the Sell Advisor: <b style="color:#4ad4f0">cyan = KEEP</b> (needed for kappa/tasks — don't sell), green = flea, gold = trader.</li>
+          <li>If a scan finds keep-list items you haven't checked off, a cyan bar appears — click <b>Mark acquired</b> to check them all at once.</li>
           <li>Alternatively, click <b>Scan Stash</b> manually (will capture at 720p if game isn't focused).</li>
         </ol>
       </section>
@@ -394,6 +441,31 @@
   </div>
 </div>
 
+<!-- Settings modal -->
+<div id="settings-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:3000;align-items:center;justify-content:center">
+  <div style="background:#161a1b;border:1px solid #3a3a3a;border-radius:6px;width:420px;padding:24px;position:relative">
+    <button id="btn-settings-close" style="position:absolute;top:12px;right:12px;background:none;border:none;color:#666;font-size:18px;cursor:pointer;padding:0">&times;</button>
+    <h2 style="color:#c4a040;font-size:14px;letter-spacing:1px;text-transform:uppercase;margin-bottom:18px">&#9881; Settings</h2>
+
+    <div class="settings-row">
+      <label for="hotkey-input">Scan hotkey</label>
+      <input type="text" id="hotkey-input" readonly placeholder="Click, then press keys">
+      <button id="btn-hotkey-save" class="primary" style="padding:5px 12px">Save</button>
+    </div>
+    <div style="font-size:10px;color:#555;margin:-8px 0 14px 140px">
+      Use a modifier combo (Ctrl/Alt/Shift + key). Tarkov and overlay tools grab bare function keys like F9.
+    </div>
+
+    <div class="settings-row">
+      <label for="countdown-input">Scan countdown (s)</label>
+      <input type="number" id="countdown-input" min="0" max="10" style="width:70px">
+      <span style="font-size:10px;color:#555">0 = capture instantly</span>
+    </div>
+
+    <div id="settings-error"></div>
+  </div>
+</div>
+
 <div class="main">
   <!-- Screenshot panel -->
   <div class="screenshot-panel">
@@ -409,6 +481,12 @@
       </div>
       <img id="stash-image" style="display:none" alt="Stash scan">
     </div>
+    <div id="confirm-bar">
+      <span>Found on your list:</span>
+      <span class="names" id="confirm-names"></span>
+      <button id="btn-confirm-acquire" class="primary" style="flex-shrink:0">✓ Mark acquired</button>
+      <button id="btn-confirm-dismiss" style="flex-shrink:0">Dismiss</button>
+    </div>
     <div class="detections-bar" id="detections-bar">Ready.</div>
   </div>
 
@@ -416,6 +494,7 @@
   <div class="keeplist-panel">
     <div class="keeplist-toolbar">
       <input type="text" id="search-box" placeholder="Filter items…">
+      <button id="btn-sync-wiki" title="Pull the latest Collector item list from the wiki">&#8635; Sync Wiki</button>
     </div>
 
     <div class="keeplist-scroll" id="keeplist-scroll">
@@ -525,7 +604,7 @@ function renderKeepList() {
 
     for (const item of items) {
       const row = document.createElement('div');
-      row.className = 'item-row' + (item.acquired ? ' acquired' : '');
+      row.className = 'item-row' + (item.acquired ? ' acquired' : '') + (item.stale ? ' stale' : '');
       row.dataset.id = item.id;
 
       const check = document.createElement('div');
@@ -534,7 +613,9 @@ function renderKeepList() {
 
       const info = document.createElement('div');
       info.className = 'item-info';
-      const meta = item.task ? `<div class="item-meta">${item.task}</div>` : '';
+      let metaText = item.task || '';
+      if (item.stale) metaText = (metaText ? metaText + ' · ' : '') + 'not on current wiki list';
+      const meta = metaText ? `<div class="item-meta">${metaText}</div>` : '';
       info.innerHTML = `<div class="item-name">${item.name}</div>${meta}`;
 
       const del = document.createElement('button');
@@ -624,36 +705,90 @@ document.getElementById('search-box').addEventListener('input', e => {
 // ---------------------------------------------------------------------------
 // Screenshot / scan
 // ---------------------------------------------------------------------------
+let scanCountdown = 3;
+let countdownSkip = null;   // resolver — clicking the button again skips the wait
+
+let _progressPoll = null;
+function startScanProgress(statusEl) {
+  stopScanProgress();
+  _progressPoll = setInterval(async () => {
+    try {
+      const s = await api('GET', '/api/scan-status');
+      if (!s.running) return;
+      if (s.phase === 'match' && s.total) {
+        statusEl.textContent = `Matching cells ${s.done}/${s.total}…`;
+      } else if (s.phase) {
+        statusEl.textContent = `Scanning — ${s.phase}…`;
+      }
+    } catch (_) {}
+  }, 500);
+}
+function stopScanProgress() {
+  if (_progressPoll) { clearInterval(_progressPoll); _progressPoll = null; }
+}
+
+function showScanWarnings(res) {
+  if (res.warnings && res.warnings.length) {
+    toast('⚠ ' + res.warnings[0], 4000);
+  }
+}
+
+function showConfirmBar(matches) {
+  const bar = document.getElementById('confirm-bar');
+  if (!matches || !matches.length) { bar.classList.remove('show'); return; }
+  document.getElementById('confirm-names').textContent =
+    matches.map(m => m.name).join(', ');
+  bar.dataset.ids = JSON.stringify(matches.map(m => m.entry_id));
+  bar.classList.add('show');
+}
+
+document.getElementById('btn-confirm-acquire').addEventListener('click', async () => {
+  const bar = document.getElementById('confirm-bar');
+  const ids = JSON.parse(bar.dataset.ids || '[]');
+  const res = await api('POST', '/api/keep-list/acquire', { ids });
+  bar.classList.remove('show');
+  await loadKeepList();
+  toast(`✓ Marked ${res.updated} item${res.updated !== 1 ? 's' : ''} acquired`);
+});
+document.getElementById('btn-confirm-dismiss').addEventListener('click', () => {
+  document.getElementById('confirm-bar').classList.remove('show');
+});
+
 document.getElementById('btn-screenshot').addEventListener('click', async () => {
   const btn = document.getElementById('btn-screenshot');
   const status = document.getElementById('ocr-status');
-  btn.disabled = true;
 
-  for (let i = 3; i >= 1; i--) {
-    btn.textContent = `Tab to Tarkov… ${i}`;
+  if (countdownSkip) { countdownSkip(); return; }   // second click = scan now
+  btn.classList.add('active');
+
+  for (let i = scanCountdown; i >= 1; i--) {
+    btn.textContent = `Tab to Tarkov… ${i} (click to skip)`;
     status.textContent = `Scanning in ${i} second${i !== 1 ? 's' : ''} — tab to your stash now`;
-    await new Promise(r => setTimeout(r, 1000));
+    const skipped = await new Promise(r => {
+      countdownSkip = () => r(true);
+      setTimeout(() => r(false), 1000);
+    });
+    if (skipped) break;
   }
-
+  countdownSkip = null;
+  btn.classList.remove('active');
+  btn.disabled = true;
   btn.textContent = 'Scanning…';
-  status.textContent = 'Taking screenshot and running OCR…';
+  status.textContent = 'Taking screenshot…';
+  startScanProgress(status);
 
   try {
     const res = await api('POST', '/api/screenshot');
-    if (res.image) {
-      document.getElementById('no-screenshot').style.display = 'none';
-      const img = document.getElementById('stash-image');
-      img.style.display = 'block';
-      img.src = 'data:image/png;base64,' + res.image;
-
-      const keep = res.detections.filter(d => d.acquired).length;
-      const sell = res.detections.filter(d => !d.acquired).length;
-      const total = res.detections.length;
-      status.textContent = `Found ${total} items — ${keep} keep (green), ${sell} sell (red)`;
-      document.getElementById('detections-bar').textContent =
-        total ? res.detections.map(d => `${d.matched} (${d.score}%)`).join('  ·  ') : 'No items detected. Try adjusting the stash region.';
+    stopScanProgress();
+    if (res.error) {
+      status.textContent = 'Error: ' + res.error;
+      toast('✗ Scan failed: ' + res.error, 4000);
+    } else if (res.image) {
+      applyScanResult({ ...res, ts: lastScanTs });
+      showScanWarnings(res);
     }
   } catch(e) {
+    stopScanProgress();
     status.textContent = 'Error: ' + e.message;
   }
 
@@ -788,23 +923,31 @@ function applyScanResult(res) {
   const img = document.getElementById('stash-image');
   img.style.display = 'block';
   img.src = 'data:image/png;base64,' + res.image;
-  const keep = res.detections.filter(d => d.acquired).length;
-  const sell = res.detections.filter(d => !d.acquired).length;
+  const acquired = res.detections.filter(d => d.acquired).length;
+  const needed = res.detections.filter(d => !d.acquired).length;
   document.getElementById('ocr-status').textContent =
-    `Found ${res.detections.length} items — ${keep} keep (green), ${sell} sell (red)`;
+    `Found ${res.detections.length} list items — ${acquired} acquired (green), ${needed} needed (red)`;
   document.getElementById('detections-bar').textContent =
     res.detections.length
       ? res.detections.map(d => `${d.matched} (${d.score}%)`).join('  ·  ')
-      : 'No items detected. Try adjusting the stash region.';
-  lastScanTs = res.ts;
+      : 'No keep-list items detected. Try adjusting the stash region.';
+  showConfirmBar(res.checklist_matches);
+  if (res.ts) lastScanTs = res.ts;
 }
 
 async function pollHotkey() {
   try {
     const res = await api('GET', `/api/last-scan?since=${lastScanTs}`);
     if (res.ready) {
-      applyScanResult(res);
-      toast('✓ Hotkey scan complete');
+      if (res.error) {
+        lastScanTs = res.ts;
+        document.getElementById('ocr-status').textContent = 'Hotkey scan failed: ' + res.error;
+        toast('✗ Hotkey scan failed: ' + res.error, 4500);
+      } else {
+        applyScanResult(res);
+        showScanWarnings(res);
+        toast('✓ Hotkey scan complete');
+      }
     }
   } catch (_) {}
   setTimeout(pollHotkey, 1500);
@@ -824,14 +967,156 @@ helpModal.addEventListener('click', e => {
   if (e.target === helpModal) helpModal.style.display = 'none';
 });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') helpModal.style.display = 'none';
+  if (e.key === 'Escape') {
+    helpModal.style.display = 'none';
+    document.getElementById('settings-modal').style.display = 'none';
+  }
 });
+
+// ---------------------------------------------------------------------------
+// Wiki sync
+// ---------------------------------------------------------------------------
+document.getElementById('btn-sync-wiki').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-sync-wiki');
+  btn.disabled = true; btn.textContent = 'Syncing…';
+  try {
+    const res = await api('POST', '/api/kappa/refresh');
+    if (res.ok) {
+      await loadKeepList();
+      const bits = [];
+      if (res.added.length) bits.push(`${res.added.length} added`);
+      if (res.stale.length) bits.push(`${res.stale.length} no longer listed`);
+      toast(`✓ Kappa list synced${bits.length ? ' — ' + bits.join(', ') : ' — up to date'}`);
+    } else {
+      toast('✗ Wiki sync failed: ' + (res.error || 'unknown error'), 4500);
+    }
+  } catch(e) { toast('✗ Wiki sync failed: ' + e.message, 4500); }
+  btn.disabled = false; btn.innerHTML = '&#8635; Sync Wiki';
+});
+
+// ---------------------------------------------------------------------------
+// Settings modal — hotkey recorder + scan countdown
+// ---------------------------------------------------------------------------
+const settingsModal = document.getElementById('settings-modal');
+const hotkeyInput   = document.getElementById('hotkey-input');
+let pendingHotkey = null;
+
+function prettyHotkey(pynputStr) {
+  if (!pynputStr) return '…';
+  return pynputStr.split('+')
+    .map(p => p.replace(/[<>]/g, ''))
+    .map(p => p.length === 1 ? p.toUpperCase() : p.charAt(0).toUpperCase() + p.slice(1))
+    .join(' + ');
+}
+
+function setHotkeyLabels(pynputStr) {
+  document.getElementById('hotkey-label').textContent = prettyHotkey(pynputStr);
+  document.querySelectorAll('.hotkey-mention').forEach(el => {
+    el.textContent = prettyHotkey(pynputStr);
+  });
+}
+
+document.getElementById('btn-settings').addEventListener('click', async () => {
+  const settings = await api('GET', '/api/settings');
+  pendingHotkey = null;
+  hotkeyInput.value = prettyHotkey(settings.hotkey);
+  hotkeyInput.placeholder = 'Click, then press keys';
+  document.getElementById('countdown-input').value = settings.scan_countdown ?? 3;
+  document.getElementById('settings-error').textContent = '';
+  settingsModal.style.display = 'flex';
+});
+document.getElementById('btn-settings-close').addEventListener('click', () => {
+  settingsModal.style.display = 'none';
+});
+settingsModal.addEventListener('click', e => {
+  if (e.target === settingsModal) settingsModal.style.display = 'none';
+});
+
+hotkeyInput.addEventListener('focus', () => {
+  hotkeyInput.value = '';
+  hotkeyInput.placeholder = 'Press your combo now…';
+});
+
+hotkeyInput.addEventListener('keydown', e => {
+  e.preventDefault();
+  e.stopPropagation();
+  if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return;   // wait for the real key
+  const mods = [];
+  if (e.ctrlKey)  mods.push('<ctrl>');
+  if (e.altKey)   mods.push('<alt>');
+  if (e.shiftKey) mods.push('<shift>');
+  let key = e.key.toLowerCase();
+  const named = { ' ': 'space', escape: 'esc', arrowup: 'up', arrowdown: 'down',
+                  arrowleft: 'left', arrowright: 'right', pageup: 'page_up',
+                  pagedown: 'page_down' };
+  if (named[key]) key = `<${named[key]}>`;
+  else if (/^f\d{1,2}$/.test(key)) key = `<${key}>`;                  // F1–F12
+  else if (key.length > 1) key = `<${key}>`;                          // other named keys
+  if (!mods.length && key.length === 1) {
+    document.getElementById('settings-error').textContent =
+      'Use at least one modifier (Ctrl/Alt/Shift) with letter keys.';
+    return;
+  }
+  pendingHotkey = [...mods, key].join('+');
+  hotkeyInput.value = prettyHotkey(pendingHotkey);
+  document.getElementById('settings-error').textContent = '';
+});
+
+document.getElementById('btn-hotkey-save').addEventListener('click', async () => {
+  const err = document.getElementById('settings-error');
+  if (!pendingHotkey) { err.textContent = 'Press a key combo in the field first.'; return; }
+  const res = await api('POST', '/api/hotkey', { hotkey: pendingHotkey });
+  if (res.ok) {
+    setHotkeyLabels(res.hotkey);
+    toast('✓ Hotkey set to ' + prettyHotkey(res.hotkey));
+    err.textContent = '';
+    pendingHotkey = null;
+  } else {
+    err.textContent = res.error || 'Failed to set hotkey.';
+  }
+});
+
+document.getElementById('countdown-input').addEventListener('change', async e => {
+  const v = Math.max(0, Math.min(10, parseInt(e.target.value) || 0));
+  e.target.value = v;
+  const settings = await api('GET', '/api/settings');
+  settings.scan_countdown = v;
+  await api('POST', '/api/settings', settings);
+  scanCountdown = v;
+  toast(`Scan countdown set to ${v}s`);
+});
+
+// ---------------------------------------------------------------------------
+// Health check — warn when Tesseract is missing
+// ---------------------------------------------------------------------------
+async function checkHealth() {
+  try {
+    const h = await api('GET', '/api/health');
+    const banner = document.getElementById('health-banner');
+    if (!h.tesseract) {
+      document.getElementById('health-banner-text').innerHTML =
+        '⚠ Tesseract OCR is not installed — item-name reading is disabled and scan accuracy will suffer. ' +
+        'Install it with <code>winget install UB-Mannheim.TesseractOCR</code> and restart the app.';
+      banner.classList.add('show');
+    } else {
+      banner.classList.remove('show');
+    }
+  } catch (_) {}
+}
+
+async function initSettings() {
+  const settings = await api('GET', '/api/settings');
+  scanCountdown = settings.scan_countdown ?? 3;
+  setHotkeyLabels(settings.hotkey);
+}
 
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 loadKeepList();
 initPrestige();
+initSettings();
+checkHealth();
 pollHotkey();
 </script>
 </body>

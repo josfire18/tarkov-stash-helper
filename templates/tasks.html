@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tasks &amp; Hideout — Tarkov Stash Helper</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='4' r='2.5' fill='none' stroke='%23c4a040' stroke-width='1.5'/%3E%3Crect x='4' y='7' width='24' height='22' rx='4' ry='4' fill='%230d0f10' stroke='%23c4a040' stroke-width='1.5'/%3E%3Cline x1='9' y1='14' x2='23' y2='14' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3Cline x1='9' y1='18' x2='23' y2='18' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3Cline x1='9' y1='22' x2='19' y2='22' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3C/svg%3E">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #0d0f10;
+    color: #c8c0b0;
+    font-family: 'Segoe UI', sans-serif;
+    font-size: 13px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── Nav / Header ── */
+  header {
+    background: #161a1b;
+    border-bottom: 1px solid #2a2a2a;
+    padding: 0 16px;
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    flex-shrink: 0;
+    height: 42px;
+  }
+  .nav-logo {
+    color: #c4a040; font-size: 14px; font-weight: 700;
+    letter-spacing: 1px; text-transform: uppercase;
+    display: flex; align-items: center; padding-right: 20px;
+    border-right: 1px solid #2a2a2a; text-decoration: none;
+  }
+  .nav-tabs { display: flex; align-items: stretch; padding: 0 12px; }
+  .nav-tab {
+    display: flex; align-items: center; padding: 0 16px; font-size: 12px;
+    color: #666; text-decoration: none; border-bottom: 2px solid transparent;
+    transition: color .15s, border-color .15s;
+  }
+  .nav-tab:hover { color: #c8c0b0; }
+  .nav-tab.active { color: #c4a040; border-bottom-color: #c4a040; }
+  .spacer { flex: 1; }
+  .header-status { display: flex; align-items: center; gap: 10px; font-size: 11px; color: #555; }
+
+  button {
+    background: #252a2b; color: #c8c0b0; border: 1px solid #3a3a3a;
+    padding: 6px 14px; cursor: pointer; font-size: 12px; border-radius: 3px;
+    transition: background .15s; white-space: nowrap;
+  }
+  button:hover { background: #2e3335; border-color: #555; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.primary { background: #2a3a1e; border-color: #4a7a2a; color: #8fcc5a; }
+
+  /* ── Layout ── */
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  .panel { display: flex; flex-direction: column; overflow: hidden; }
+  .panel-left  { flex: 1.2; border-right: 1px solid #1e1e1e; }
+  .panel-right { flex: 1; }
+
+  .panel-toolbar {
+    background: #131618; border-bottom: 1px solid #1e1e1e;
+    padding: 8px 12px; display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+  }
+  .panel-toolbar input {
+    flex: 1; background: #0d0f10; border: 1px solid #2a2a2a; color: #c8c0b0;
+    padding: 5px 8px; font-size: 12px; border-radius: 3px; outline: none;
+  }
+  .panel-toolbar input:focus { border-color: #555; }
+  .panel-title {
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 1.5px; color: #c4a040; white-space: nowrap;
+  }
+
+  .panel-scroll { flex: 1; overflow-y: auto; padding: 4px 0 20px; }
+  .panel-scroll::-webkit-scrollbar { width: 6px; }
+  .panel-scroll::-webkit-scrollbar-track { background: #0d0f10; }
+  .panel-scroll::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 3px; }
+
+  /* ── Aggregate item rows ── */
+  .agg-row { border-bottom: 1px solid #141618; }
+  .agg-main {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 12px; cursor: pointer; transition: background .1s;
+  }
+  .agg-main:hover { background: #131618; }
+  .agg-row.done .agg-name { color: #4a6a4a; text-decoration: line-through; }
+  .agg-info { flex: 1; min-width: 0; }
+  .agg-name { font-size: 12px; color: #e0d8c8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .agg-sub  { font-size: 10px; color: #555; margin-top: 1px; }
+  .agg-progress { height: 3px; background: #1e1e1e; border-radius: 2px; overflow: hidden; margin-top: 4px; }
+  .agg-progress .fill { height: 100%; background: linear-gradient(90deg, #2a5a1e, #5aaa2a); }
+  .agg-row.done .agg-progress .fill { background: #2a5a1e; }
+
+  .have-controls { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
+  .have-controls button {
+    width: 24px; height: 24px; padding: 0; font-size: 14px; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .have-count { font-size: 12px; min-width: 52px; text-align: center; color: #c8c0b0; }
+  .have-count b { color: #8fcc5a; }
+
+  .fir-badge {
+    font-size: 9px; font-weight: 700; color: #e0a030; background: #2a1e00;
+    border: 1px solid #5a3a00; padding: 1px 5px; border-radius: 2px;
+    flex-shrink: 0; letter-spacing: 0.5px;
+  }
+  .kappa-badge {
+    font-size: 9px; font-weight: 700; color: #b48ae0; background: #1e1030;
+    border: 1px solid #4a3a6a; padding: 1px 5px; border-radius: 2px;
+    flex-shrink: 0; letter-spacing: 0.5px;
+  }
+
+  .agg-sources { display: none; padding: 2px 12px 8px 34px; }
+  .agg-row.expanded .agg-sources { display: block; }
+  .agg-source { font-size: 11px; color: #777; padding: 2px 0; display: flex; gap: 8px; align-items: center; }
+  .agg-source .src-count { color: #c4a040; }
+
+  /* ── Tasks / hideout sections ── */
+  .section-header {
+    padding: 6px 12px; font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 1.5px; color: #c4a040;
+    background: #131618; border-top: 1px solid #1e1e1e; border-bottom: 1px solid #1e1e1e;
+    display: flex; align-items: center; justify-content: space-between;
+    cursor: pointer; user-select: none; position: sticky; top: 0; z-index: 5;
+  }
+  .section-header .counts { color: #555; font-size: 10px; }
+  .section-body.collapsed { display: none; }
+
+  .trader-header {
+    padding: 5px 12px 3px; font-size: 10px; font-weight: 600;
+    color: #8a8070; text-transform: uppercase; letter-spacing: 1px;
+    background: #101315;
+  }
+
+  .task-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 12px; border-bottom: 1px solid #141618; transition: background .1s;
+  }
+  .task-row:hover { background: #131618; }
+  .task-row.completed { opacity: 0.4; }
+  .task-row.completed .task-name { text-decoration: line-through; }
+
+  .task-check {
+    width: 16px; height: 16px; border: 1px solid #3a3a3a; border-radius: 2px;
+    cursor: pointer; flex-shrink: 0; display: flex; align-items: center;
+    justify-content: center; transition: background .1s, border-color .1s;
+  }
+  .task-check.checked { background: #2a5a1e; border-color: #4a9a2a; }
+  .task-check.checked::after { content: '✓'; color: #7adc4a; font-size: 10px; }
+
+  .task-info { flex: 1; min-width: 0; }
+  .task-name { font-size: 12px; color: #c8c0b0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .task-items { font-size: 10px; color: #555; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .task-level { font-size: 10px; color: #666; flex-shrink: 0; }
+
+  /* ── Toast ── */
+  #toast {
+    position: fixed; bottom: 24px; right: 24px;
+    background: #161a1b; border: 1px solid #3a3a3a;
+    padding: 10px 16px; border-radius: 4px; font-size: 12px;
+    opacity: 0; transition: opacity .3s; z-index: 2000; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+
+  .empty-note { padding: 40px; text-align: center; color: #333; }
+</style>
+</head>
+<body>
+
+<header>
+  <a class="nav-logo" href="/">&#x2302; Tarkov</a>
+  <nav class="nav-tabs">
+    <a class="nav-tab" href="/">Keep List</a>
+    <a class="nav-tab active" href="/tasks">Tasks &amp; Hideout</a>
+    <a class="nav-tab" href="/sell">Sell Advisor</a>
+  </nav>
+  <div class="spacer"></div>
+  <div class="header-status">
+    <span id="cache-age"></span>
+    <button id="btn-refresh" style="padding:4px 10px;font-size:11px">&#8635; Refresh from tarkov.dev</button>
+  </div>
+</header>
+
+<div class="main">
+  <!-- Left: aggregate items needed -->
+  <div class="panel panel-left">
+    <div class="panel-toolbar">
+      <span class="panel-title">Items needed</span>
+      <input type="text" id="search-box" placeholder="Filter items…">
+      <label style="font-size:11px;color:#666;display:flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap">
+        <input type="checkbox" id="hide-done" style="flex:none;width:auto" checked> hide complete
+      </label>
+    </div>
+    <div class="panel-scroll" id="agg-scroll">
+      <div class="empty-note">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Right: tasks + hideout -->
+  <div class="panel panel-right">
+    <div class="panel-toolbar">
+      <span class="panel-title">Tasks &amp; Hideout</span>
+      <input type="text" id="task-search" placeholder="Filter tasks/stations…">
+      <label style="font-size:11px;color:#666;display:flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap">
+        <input type="checkbox" id="hide-completed-tasks" style="flex:none;width:auto"> hide done
+      </label>
+    </div>
+    <div class="panel-scroll" id="tasks-scroll">
+      <div class="empty-note">Loading…</div>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+let view = null;          // /api/tasks response
+let filterText = '';
+let taskFilter = '';
+let hideDone = true;
+let hideCompletedTasks = false;
+const expanded = new Set();       // item_ids with the sources list open
+const collapsedSections = new Set();
+
+// ---------------------------------------------------------------------------
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts);
+  return r.json();
+}
+
+let toastTimer;
+function toast(msg, duration = 2200) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), duration);
+}
+
+// ---------------------------------------------------------------------------
+// Load + render
+// ---------------------------------------------------------------------------
+async function loadView() {
+  try {
+    const res = await api('GET', '/api/tasks');
+    if (res.error) {
+      document.getElementById('agg-scroll').innerHTML =
+        `<div class="empty-note">Could not load task data:<br>${res.error}</div>`;
+      document.getElementById('tasks-scroll').innerHTML =
+        `<div class="empty-note">—</div>`;
+      return;
+    }
+    view = res;
+    const age = Math.round(res.cache_age_minutes);
+    document.getElementById('cache-age').textContent =
+      age < 60 ? `data ${age}m old` : `data ${Math.round(age / 60)}h old`;
+    renderAggregate();
+    renderTasks();
+  } catch(e) {
+    document.getElementById('agg-scroll').innerHTML =
+      `<div class="empty-note">Could not load task data: ${e.message}</div>`;
+  }
+}
+
+function renderAggregate() {
+  if (!view) return;
+  const scroll = document.getElementById('agg-scroll');
+  const q = filterText.toLowerCase();
+  scroll.innerHTML = '';
+
+  let shown = 0;
+  for (const rec of view.aggregate) {
+    if (q && !rec.name.toLowerCase().includes(q) &&
+        !(rec.shortName || '').toLowerCase().includes(q)) continue;
+    const done = rec.have >= rec.total_needed;
+    if (done && hideDone) continue;
+    shown++;
+
+    const row = document.createElement('div');
+    row.className = 'agg-row' + (done ? ' done' : '') + (expanded.has(rec.item_id) ? ' expanded' : '');
+
+    const pct = rec.total_needed ? Math.min(100, Math.round(rec.have / rec.total_needed * 100)) : 0;
+    const nsrc = rec.sources.length;
+
+    const main = document.createElement('div');
+    main.className = 'agg-main';
+    main.innerHTML = `
+      <div class="agg-info">
+        <div class="agg-name">${rec.name}</div>
+        <div class="agg-sub">${nsrc} source${nsrc !== 1 ? 's' : ''} — click for details</div>
+        <div class="agg-progress"><div class="fill" style="width:${pct}%"></div></div>
+      </div>
+      ${rec.fir_needed ? '<div class="fir-badge" title="' + rec.fir_needed + ' must be Found In Raid">FIR ×' + rec.fir_needed + '</div>' : ''}`;
+
+    const controls = document.createElement('div');
+    controls.className = 'have-controls';
+    const minus = document.createElement('button');
+    minus.textContent = '−';
+    minus.title = 'I used/lost one';
+    minus.addEventListener('click', e => { e.stopPropagation(); bumpHave(rec, -1); });
+    const count = document.createElement('div');
+    count.className = 'have-count';
+    count.innerHTML = `<b>${rec.have}</b> / ${rec.total_needed}`;
+    const plus = document.createElement('button');
+    plus.textContent = '+';
+    plus.title = 'I found one';
+    plus.addEventListener('click', e => { e.stopPropagation(); bumpHave(rec, +1); });
+    controls.append(minus, count, plus);
+    main.appendChild(controls);
+
+    main.addEventListener('click', () => {
+      if (expanded.has(rec.item_id)) expanded.delete(rec.item_id);
+      else expanded.add(rec.item_id);
+      renderAggregate();
+    });
+
+    const sources = document.createElement('div');
+    sources.className = 'agg-sources';
+    sources.innerHTML = rec.sources.map(s => `
+      <div class="agg-source">
+        <span class="src-count">×${s.count}</span>
+        <span>${s.name}</span>
+        ${s.fir ? '<span class="fir-badge">FIR</span>' : ''}
+        <span style="color:#444">${s.type === 'hideout' ? '(hideout)' : ''}</span>
+      </div>`).join('');
+
+    row.append(main, sources);
+    scroll.appendChild(row);
+  }
+
+  if (!shown) {
+    scroll.innerHTML = `<div class="empty-note">${
+      q ? 'No items match your filter.'
+        : 'Nothing needed — mark tasks/hideout levels incomplete on the right to see requirements.'}</div>`;
+  }
+}
+
+async function bumpHave(rec, delta) {
+  const res = await api('POST', '/api/tasks/have', { item_id: rec.item_id, delta });
+  if (res.ok) {
+    rec.have = res.have;
+    renderAggregate();
+  }
+}
+
+function sectionHeader(label, counts, key) {
+  const hdr = document.createElement('div');
+  hdr.className = 'section-header';
+  hdr.innerHTML = `<span>${label}</span><span class="counts">${counts}</span>`;
+  hdr.addEventListener('click', () => {
+    if (collapsedSections.has(key)) collapsedSections.delete(key);
+    else collapsedSections.add(key);
+    renderTasks();
+  });
+  return hdr;
+}
+
+function renderTasks() {
+  if (!view) return;
+  const scroll = document.getElementById('tasks-scroll');
+  const q = taskFilter.toLowerCase();
+  scroll.innerHTML = '';
+
+  // --- Tasks grouped by trader ---
+  const byTrader = {};
+  let tDone = 0;
+  for (const t of view.tasks) {
+    if (t.completed) tDone++;
+    if (q && !t.name.toLowerCase().includes(q) && !t.trader.toLowerCase().includes(q)) continue;
+    if (hideCompletedTasks && t.completed) continue;
+    (byTrader[t.trader] = byTrader[t.trader] || []).push(t);
+  }
+
+  scroll.appendChild(sectionHeader('Tasks (item hand-ins)', `${tDone}/${view.tasks.length} done`, 'tasks'));
+  const tasksBody = document.createElement('div');
+  tasksBody.className = 'section-body' + (collapsedSections.has('tasks') ? ' collapsed' : '');
+  for (const trader of Object.keys(byTrader).sort()) {
+    const th = document.createElement('div');
+    th.className = 'trader-header';
+    th.textContent = trader;
+    tasksBody.appendChild(th);
+    for (const t of byTrader[trader].sort((a, b) => a.minPlayerLevel - b.minPlayerLevel)) {
+      const row = document.createElement('div');
+      row.className = 'task-row' + (t.completed ? ' completed' : '');
+      const check = document.createElement('div');
+      check.className = 'task-check' + (t.completed ? ' checked' : '');
+      check.title = t.completed ? 'Mark not completed' : 'Mark completed';
+      check.addEventListener('click', () => completeToggle('task', t.id, !t.completed, t.name));
+      const info = document.createElement('div');
+      info.className = 'task-info';
+      info.innerHTML = `
+        <div class="task-name">${t.name}</div>
+        <div class="task-items">${t.items.map(i => `${i.count}× ${i.name}${i.fir ? ' (FIR)' : ''}`).join(' · ')}</div>`;
+      row.append(check, info);
+      if (t.kappaRequired) {
+        const kb = document.createElement('div');
+        kb.className = 'kappa-badge';
+        kb.title = 'Required for Kappa';
+        kb.textContent = 'κ';
+        row.appendChild(kb);
+      }
+      const lvl = document.createElement('div');
+      lvl.className = 'task-level';
+      lvl.textContent = t.minPlayerLevel ? `L${t.minPlayerLevel}` : '';
+      row.appendChild(lvl);
+      tasksBody.appendChild(row);
+    }
+  }
+  if (!Object.keys(byTrader).length) {
+    tasksBody.innerHTML = '<div class="empty-note">No tasks match.</div>';
+  }
+  scroll.appendChild(tasksBody);
+
+  // --- Hideout stations ---
+  let levelsTotal = 0, levelsDone = 0;
+  for (const s of view.stations)
+    for (const lv of s.levels) { levelsTotal++; if (lv.completed) levelsDone++; }
+
+  scroll.appendChild(sectionHeader('Hideout', `${levelsDone}/${levelsTotal} levels`, 'hideout'));
+  const hideoutBody = document.createElement('div');
+  hideoutBody.className = 'section-body' + (collapsedSections.has('hideout') ? ' collapsed' : '');
+  let anyStation = false;
+  for (const s of view.stations) {
+    if (q && !s.name.toLowerCase().includes(q)) continue;
+    const levels = s.levels.filter(lv => !(hideCompletedTasks && lv.completed));
+    if (!levels.length) continue;
+    anyStation = true;
+    const th = document.createElement('div');
+    th.className = 'trader-header';
+    th.textContent = s.name;
+    hideoutBody.appendChild(th);
+    for (const lv of levels) {
+      const row = document.createElement('div');
+      row.className = 'task-row' + (lv.completed ? ' completed' : '');
+      const check = document.createElement('div');
+      check.className = 'task-check' + (lv.completed ? ' checked' : '');
+      check.title = lv.completed ? 'Mark not built' : 'Mark built';
+      check.addEventListener('click', () =>
+        completeToggle('hideout', lv.id, !lv.completed, `${s.name} L${lv.level}`));
+      const info = document.createElement('div');
+      info.className = 'task-info';
+      const itemsTxt = lv.items.length
+        ? lv.items.map(i => `${i.count}× ${i.name}`).join(' · ')
+        : 'no item requirements';
+      info.innerHTML = `
+        <div class="task-name">Level ${lv.level}</div>
+        <div class="task-items">${itemsTxt}</div>`;
+      row.append(check, info);
+      hideoutBody.appendChild(row);
+    }
+  }
+  if (!anyStation) {
+    hideoutBody.innerHTML = '<div class="empty-note">No stations match.</div>';
+  }
+  scroll.appendChild(hideoutBody);
+}
+
+async function completeToggle(type, id, done, label) {
+  const res = await api('POST', '/api/tasks/complete', { type, id, done });
+  if (res.ok) {
+    toast(done ? `✓ ${label} marked complete` : `${label} marked incomplete`);
+    await loadView();   // aggregate totals change with completion
+  } else {
+    toast('Failed: ' + (res.error || 'unknown error'));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Toolbar events
+// ---------------------------------------------------------------------------
+document.getElementById('search-box').addEventListener('input', e => {
+  filterText = e.target.value;
+  renderAggregate();
+});
+document.getElementById('task-search').addEventListener('input', e => {
+  taskFilter = e.target.value;
+  renderTasks();
+});
+document.getElementById('hide-done').addEventListener('change', e => {
+  hideDone = e.target.checked;
+  renderAggregate();
+});
+document.getElementById('hide-completed-tasks').addEventListener('change', e => {
+  hideCompletedTasks = e.target.checked;
+  renderTasks();
+});
+document.getElementById('btn-refresh').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-refresh');
+  btn.disabled = true; btn.textContent = 'Refreshing…';
+  try {
+    const res = await api('POST', '/api/tasks/refresh');
+    if (res.ok) {
+      toast(`✓ Refreshed — ${res.tasks} tasks, ${res.stations} stations`);
+      await loadView();
+    } else {
+      toast('✗ Refresh failed: ' + (res.error || 'unknown error'), 4500);
+    }
+  } catch(e) { toast('✗ Refresh failed: ' + e.message, 4500); }
+  btn.disabled = false; btn.innerHTML = '&#8635; Refresh from tarkov.dev';
+});
+
+// ---------------------------------------------------------------------------
+loadView();
+</script>
+</body>
+</html>
