@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sell Advisor — Tarkov Stash Helper</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='4' r='2.5' fill='none' stroke='%23c4a040' stroke-width='1.5'/%3E%3Crect x='4' y='7' width='24' height='22' rx='4' ry='4' fill='%230d0f10' stroke='%23c4a040' stroke-width='1.5'/%3E%3Cline x1='9' y1='14' x2='23' y2='14' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3Cline x1='9' y1='18' x2='23' y2='18' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3Cline x1='9' y1='22' x2='19' y2='22' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3C/svg%3E">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #0d0f10;
+    color: #c8c0b0;
+    font-family: 'Segoe UI', sans-serif;
+    font-size: 13px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── Nav / Header ── */
+  header {
+    background: #161a1b;
+    border-bottom: 1px solid #2a2a2a;
+    padding: 0 16px;
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    flex-shrink: 0;
+    height: 42px;
+  }
+  .nav-logo {
+    color: #c4a040;
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    padding-right: 20px;
+    border-right: 1px solid #2a2a2a;
+    text-decoration: none;
+  }
+  .nav-tabs { display: flex; align-items: stretch; padding: 0 12px; }
+  .nav-tab {
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    font-size: 12px;
+    color: #666;
+    text-decoration: none;
+    border-bottom: 2px solid transparent;
+    transition: color .15s, border-color .15s;
+    cursor: pointer;
+  }
+  .nav-tab:hover { color: #c8c0b0; }
+  .nav-tab.active { color: #c4a040; border-bottom-color: #c4a040; }
+  .spacer { flex: 1; }
+  .price-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: #555;
+  }
+  .price-dot { width: 7px; height: 7px; border-radius: 50%; background: #3a3a3a; flex-shrink: 0; }
+  .price-dot.fresh  { background: #4a9a2a; }
+  .price-dot.stale  { background: #9a6a2a; }
+  .price-dot.absent { background: #9a2a2a; }
+
+  button {
+    background: #252a2b;
+    color: #c8c0b0;
+    border: 1px solid #3a3a3a;
+    padding: 6px 14px;
+    cursor: pointer;
+    font-size: 12px;
+    border-radius: 3px;
+    transition: background .15s;
+    white-space: nowrap;
+  }
+  button:hover  { background: #2e3335; border-color: #555; }
+  button.primary { background: #2a3a1e; border-color: #4a7a2a; color: #8fcc5a; }
+  button.primary:hover { background: #334a22; }
+  button:disabled { opacity: .4; cursor: default; }
+
+  /* ── Layout ── */
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  /* ── Screenshot panel ── */
+  .screenshot-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid #1e1e1e;
+    overflow: hidden;
+  }
+  .screenshot-toolbar {
+    background: #131618;
+    border-bottom: 1px solid #1e1e1e;
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+  .screenshot-toolbar span { font-size: 11px; color: #666; }
+  .screenshot-container {
+    flex: 1;
+    overflow: auto;
+    background: #0a0c0d;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 12px;
+  }
+  #stash-image { max-width: 100%; border: 1px solid #2a2a2a; display: none; }
+  .no-scan {
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; height: 100%; gap: 12px; color: #444;
+  }
+  .no-scan .hint { font-size: 12px; color: #333; }
+
+  /* ── Results panel ── */
+  .results-panel {
+    width: 480px;
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    overflow: hidden;
+  }
+  .results-toolbar {
+    background: #131618;
+    border-bottom: 1px solid #1e1e1e;
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .results-toolbar input {
+    flex: 1;
+    background: #0d0f10;
+    border: 1px solid #2a2a2a;
+    color: #c8c0b0;
+    padding: 5px 8px;
+    font-size: 12px;
+    border-radius: 3px;
+    outline: none;
+  }
+  .results-toolbar input:focus { border-color: #555; }
+
+  .results-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: 6px 0;
+  }
+  .results-scroll::-webkit-scrollbar { width: 6px; }
+  .results-scroll::-webkit-scrollbar-track { background: #0d0f10; }
+  .results-scroll::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 3px; }
+
+  /* ── Result row ── */
+  .result-row {
+    padding: 8px 12px;
+    border-bottom: 1px solid #141618;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    grid-template-rows: auto auto;
+    gap: 3px 8px;
+    align-items: start;
+    transition: background .1s;
+  }
+  .result-row:hover { background: #131618; }
+
+  .item-num {
+    font-size: 11px;
+    font-weight: 700;
+    min-width: 22px;
+    height: 22px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 1px;
+    color: #fff;
+    flex-shrink: 0;
+  }
+  .item-num.flea   { background: #1e8c28; }
+  .item-num.trader { background: #9c6a0a; }
+  .item-num.keep   { background: #404040; }
+
+  .item-name { font-size: 13px; color: #e0d8c8; font-weight: 500; }
+
+  .rec-badge {
+    grid-row: 1 / 3;
+    align-self: center;
+    padding: 4px 10px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-align: center;
+    min-width: 60px;
+  }
+  .rec-flea   { background: #1e3a14; border: 1px solid #3a7a20; color: #7acc40; }
+  .rec-trader { background: #2a2010; border: 1px solid #6a5010; color: #c4a040; }
+  .rec-keep   { background: #1e1e1e; border: 1px solid #404040; color: #888; }
+
+  .price-line {
+    font-size: 11px;
+    color: #888;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+  }
+  .price-highlight { color: #c8c0b0; font-weight: 600; }
+  .price-fee       { color: #666; font-size: 10px; }
+  .trader-name     { color: #c4a040; }
+  .reason          { font-size: 10px; color: #4a4a4a; margin-top: 2px; }
+
+  /* ── Summary bar ── */
+  .summary-bar {
+    border-top: 1px solid #1e1e1e;
+    background: #0d0f10;
+    padding: 8px 12px;
+    font-size: 11px;
+    color: #555;
+    display: flex;
+    gap: 16px;
+    flex-shrink: 0;
+  }
+  .summary-bar .s-flea   { color: #7acc40; }
+  .summary-bar .s-trader { color: #c4a040; }
+
+  /* ── Toast ── */
+  #toast {
+    position: fixed; bottom: 24px; right: 24px;
+    background: #161a1b; border: 1px solid #3a3a3a;
+    padding: 10px 16px; border-radius: 4px;
+    font-size: 12px; opacity: 0; transition: opacity .3s;
+    z-index: 2000; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+
+  /* ── Region banner ── */
+  #region-banner {
+    background: #2a1e00; border-bottom: 1px solid #6a5010;
+    padding: 7px 16px; font-size: 12px; color: #c4a040;
+    display: none; align-items: center; gap: 12px;
+  }
+  #region-banner.show { display: flex; }
+
+  /* ── Region selection modal ── */
+  #region-modal {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.85); z-index: 3000;
+    flex-direction: column; align-items: center; justify-content: center;
+  }
+  #region-modal.show { display: flex; }
+  #region-modal canvas {
+    cursor: crosshair;
+    border: 1px solid #3a3a3a;
+    max-width: 95vw; max-height: 88vh;
+  }
+  #region-modal-hint {
+    color: #888; font-size: 12px; margin-top: 8px; text-align: center;
+  }
+  #region-modal-countdown {
+    color: #c4a040; font-size: 22px; font-weight: 700;
+    margin-bottom: 16px; min-height: 30px;
+  }
+  #region-modal-close {
+    margin-top: 12px; padding: 5px 20px; font-size: 12px;
+    background: #1e1e1e; border: 1px solid #3a3a3a; color: #666;
+    border-radius: 3px; cursor: pointer;
+  }
+  #region-modal-close:hover { background: #2a2a2a; color: #aaa; }
+
+  .match-text { font-size: 10px; color: #444; }
+
+  .section-header {
+    padding: 6px 12px 4px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: #6a6055;
+    text-transform: uppercase;
+    background: #101315;
+    border-top: 1px solid #1e1e1e;
+    border-bottom: 1px solid #1e1e1e;
+    position: sticky;
+    top: 0;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <a class="nav-logo" href="/">&#x2302; Tarkov</a>
+  <nav class="nav-tabs">
+    <a class="nav-tab" href="/">Keep List</a>
+    <a class="nav-tab active" href="/sell">Sell Advisor</a>
+  </nav>
+  <div class="spacer"></div>
+  <div class="price-status" style="margin-right:12px">
+    <div class="price-dot" id="price-dot"></div>
+    <span id="price-label">Checking prices…</span>
+    <button id="btn-refresh-prices" style="padding:4px 10px;font-size:11px">Refresh Prices</button>
+    <button id="btn-build-index" style="padding:4px 10px;font-size:11px;margin-left:6px">&#x26A1; Build Icon DB</button>
+    <span id="model-status" style="margin-left:8px;font-size:11px;color:#8ab4f8"></span>
+    <button id="btn-set-region" style="padding:4px 10px;font-size:11px;margin-left:10px">&#x1F4D0; Set Stash Region</button>
+  </div>
+</header>
+
+<div id="region-banner">
+  ⚠ No stash region set — scanning is disabled.
+  <button id="btn-banner-region" style="padding:2px 10px;font-size:11px">Set Region Now</button>
+</div>
+
+<div class="main">
+  <!-- Screenshot panel -->
+  <div class="screenshot-panel">
+    <div class="screenshot-toolbar">
+      <button id="btn-scan" class="primary" disabled title="Set stash region first">&#x1F4F7; Scan Stash</button>
+      <span id="scan-status" title="F9 triggers scan when this browser window is focused. The stash region is captured from its saved position — no need to alt-tab.">Ready — click Scan Stash or press F9</span>
+    </div>
+    <div class="screenshot-container">
+      <div class="no-scan" id="no-scan">
+        <div style="font-size:48px;opacity:.15">&#x1F4B0;</div>
+        <div>No scan yet</div>
+        <div class="hint">Green = sell on flea &nbsp;|&nbsp; Gold = sell to trader &nbsp;|&nbsp; Grey = keep</div>
+      </div>
+      <img id="stash-image" alt="Stash scan">
+    </div>
+  </div>
+
+  <!-- Results panel -->
+  <div class="results-panel">
+    <div class="results-toolbar">
+      <input type="text" id="search-box" placeholder="Filter items…">
+      <span id="result-count" style="font-size:11px;color:#555;white-space:nowrap"></span>
+    </div>
+    <div class="results-scroll" id="results-scroll">
+      <div style="padding:40px;text-align:center;color:#333">Scan your stash to see sell recommendations.</div>
+    </div>
+    <div class="summary-bar" id="summary-bar">
+      <span>Scan to see results</span>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<!-- Region selection modal -->
+<div id="region-modal">
+  <div id="region-modal-countdown"></div>
+  <canvas id="region-canvas"></canvas>
+  <div id="region-modal-hint">Click and drag to select your stash area, then release to save.</div>
+  <button id="region-modal-close">✕ Cancel (Esc)</button>
+</div>
+
+<script>
+let allResults = [];
+let filterText  = '';
+let regionSet   = false;
+let indexReady  = false;
+
+// ---------------------------------------------------------------------------
+// API
+// ---------------------------------------------------------------------------
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts);
+  return r.json();
+}
+
+// ---------------------------------------------------------------------------
+// Toast
+// ---------------------------------------------------------------------------
+let toastTimer;
+function toast(msg, duration = 2200) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), duration);
+}
+
+// ---------------------------------------------------------------------------
+// Format numbers
+// ---------------------------------------------------------------------------
+function fmt(n) {
+  if (!n && n !== 0) return '—';
+  return n.toLocaleString('en-US') + ' ₽';
+}
+
+// ---------------------------------------------------------------------------
+// Scan button gate — only enable when region + icon DB are both ready
+// ---------------------------------------------------------------------------
+function updateScanButton() {
+  const btn = document.getElementById('btn-scan');
+  if (!regionSet || !indexReady) {
+    btn.disabled = true;
+    btn.title = !regionSet ? 'Set stash region first' : 'Build icon DB first';
+  } else {
+    btn.disabled = false;
+    btn.title = '';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Price cache status
+// ---------------------------------------------------------------------------
+async function checkPriceStatus() {
+  const s = await api('GET', '/api/prices/status');
+  const dot   = document.getElementById('price-dot');
+  const label = document.getElementById('price-label');
+  if (!s.cached) {
+    dot.className   = 'price-dot absent';
+    label.textContent = 'No price data — click Refresh';
+  } else if (s.age_minutes > 30) {
+    dot.className   = 'price-dot stale';
+    label.textContent = `Prices ${Math.round(s.age_minutes)}m old (stale)`;
+  } else {
+    dot.className   = 'price-dot fresh';
+    label.textContent = `Prices updated ${Math.round(s.age_minutes)}m ago · ${s.count.toLocaleString()} items`;
+  }
+}
+
+document.getElementById('btn-refresh-prices').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-refresh-prices');
+  btn.disabled = true; btn.textContent = 'Fetching…';
+  try {
+    const r = await api('POST', '/api/prices/refresh');
+    toast(r.ok ? `✓ Prices refreshed — ${r.count.toLocaleString()} items` : `Error: ${r.error}`);
+  } catch(e) { toast('Failed: ' + e.message); }
+  btn.disabled = false; btn.textContent = 'Refresh Prices';
+  checkPriceStatus();
+});
+
+// ---------------------------------------------------------------------------
+// Icon DB / matcher status polling
+// ---------------------------------------------------------------------------
+let _statusPoll = null;
+
+function startStatusPoll() {
+  if (_statusPoll) return;
+  _statusPoll = setInterval(updateModelStatus, 1500);
+}
+function stopStatusPoll() {
+  if (_statusPoll) { clearInterval(_statusPoll); _statusPoll = null; }
+}
+
+async function updateModelStatus() {
+  try {
+    const ms = await api('GET', '/api/icons/matcher-status');
+    const el = document.getElementById('model-status');
+    const buildBtn = document.getElementById('btn-build-index');
+
+    buildBtn.disabled = ms.running;
+
+    if (ms.running) {
+      const pct = ms.total ? Math.round(100 * ms.done_count / ms.total) : 0;
+      el.style.color = '#8ab4f8';
+      el.textContent = `Building icon DB… ${ms.done_count}/${ms.total} (${pct}%)`;
+      startStatusPoll();
+      indexReady = false;
+    } else if (ms.error) {
+      el.style.color = '#f87171';
+      el.textContent = `Error: ${ms.error}`;
+      indexReady = false;
+      stopStatusPoll();
+    } else if (ms.ready) {
+      el.style.color = '#4ade80';
+      el.textContent = `✓ Icon DB ready — ${ms.item_count.toLocaleString()} items`;
+      indexReady = true;
+      stopStatusPoll();
+    } else {
+      el.style.color = '#f59e0b';
+      el.textContent = 'No icon DB — click Build Icon DB';
+      indexReady = false;
+      stopStatusPoll();
+    }
+
+    updateScanButton();
+  } catch(e) {}
+}
+
+document.getElementById('btn-build-index').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-build-index');
+  btn.disabled = true;
+  try {
+    const r = await api('POST', '/api/icons/build-index');
+    if (!r.ok) { toast(r.message || 'Failed'); btn.disabled = false; return; }
+    toast('Downloading & indexing icons… check status bar.');
+    startStatusPoll();
+  } catch(e) {
+    toast('Failed: ' + e.message);
+    btn.disabled = false;
+  }
+});
+
+// Check status on page load
+updateModelStatus();
+
+// ---------------------------------------------------------------------------
+// Region selection
+// ---------------------------------------------------------------------------
+let _currentSettings = {};
+
+async function loadRegionState() {
+  try {
+    _currentSettings = await api('GET', '/api/settings');
+    regionSet = !!_currentSettings.region;
+    const banner = document.getElementById('region-banner');
+    if (regionSet) {
+      banner.classList.remove('show');
+    } else {
+      banner.classList.add('show');
+    }
+    updateScanButton();
+  } catch(e) {}
+}
+
+function startRegionSelection() {
+  const modal     = document.getElementById('region-modal');
+  const canvas    = document.getElementById('region-canvas');
+  const countdown = document.getElementById('region-modal-countdown');
+  const hint      = document.getElementById('region-modal-hint');
+
+  modal.classList.add('show');
+  hint.textContent = 'Switch to Tarkov now…';
+  countdown.textContent = '';
+
+  let secs = 3;
+  countdown.textContent = `Capturing in ${secs}…`;
+  const interval = setInterval(() => {
+    secs--;
+    if (secs > 0) {
+      countdown.textContent = `Capturing in ${secs}…`;
+    } else {
+      clearInterval(interval);
+      countdown.textContent = 'Capturing…';
+      captureAndShowRegion(canvas, countdown, hint);
+    }
+  }, 1000);
+}
+
+async function captureAndShowRegion(canvas, countdown, hint) {
+  try {
+    const res = await api('GET', '/api/calibration-screenshot?delay=0');
+    const monW = res.width, monH = res.height;
+
+    const img = new Image();
+    img.onload = () => {
+      // Fit canvas to viewport
+      const maxW = window.innerWidth  * 0.95;
+      const maxH = window.innerHeight * 0.88;
+      const scale = Math.min(maxW / monW, maxH / monH, 1);
+      canvas.width  = Math.round(monW * scale);
+      canvas.height = Math.round(monH * scale);
+
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+      countdown.textContent = '';
+      hint.textContent = 'Click and drag to select your stash area. Release to save.';
+
+      // Drag logic
+      let dragging = false, startX = 0, startY = 0, curX = 0, curY = 0;
+
+      function redraw() {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        if (!dragging && curX === 0) return;
+        const rx = Math.min(startX, curX), ry = Math.min(startY, curY);
+        const rw = Math.abs(curX - startX), rh = Math.abs(curY - startY);
+        ctx.strokeStyle = '#f87171';
+        ctx.lineWidth   = 2;
+        ctx.setLineDash([6, 3]);
+        ctx.strokeRect(rx, ry, rw, rh);
+        ctx.fillStyle = 'rgba(248,113,113,.08)';
+        ctx.fillRect(rx, ry, rw, rh);
+      }
+
+      canvas.onmousedown = e => {
+        const r = canvas.getBoundingClientRect();
+        startX = e.clientX - r.left;
+        startY = e.clientY - r.top;
+        curX = startX; curY = startY;
+        dragging = true;
+      };
+      canvas.onmousemove = e => {
+        if (!dragging) return;
+        const r = canvas.getBoundingClientRect();
+        curX = e.clientX - r.left;
+        curY = e.clientY - r.top;
+        redraw();
+      };
+      canvas.onmouseup = async e => {
+        if (!dragging) return;
+        dragging = false;
+        const r = canvas.getBoundingClientRect();
+        curX = e.clientX - r.left;
+        curY = e.clientY - r.top;
+
+        const rx = Math.min(startX, curX), ry = Math.min(startY, curY);
+        const rw = Math.abs(curX - startX), rh = Math.abs(curY - startY);
+        if (rw < 20 || rh < 20) { hint.textContent = 'Selection too small — try again.'; return; }
+
+        // Scale back to monitor coords
+        const scaleX = monW / canvas.width;
+        const scaleY = monH / canvas.height;
+        const region = {
+          x: Math.round(rx * scaleX),
+          y: Math.round(ry * scaleY),
+          w: Math.round(rw * scaleX),
+          h: Math.round(rh * scaleY),
+        };
+
+        await api('POST', '/api/settings', { ..._currentSettings, region });
+        _currentSettings.region = region;
+        document.getElementById('region-modal').classList.remove('show');
+        toast(`✓ Region saved: ${region.w}×${region.h} at (${region.x}, ${region.y})`);
+        regionSet = true;
+        document.getElementById('region-banner').classList.remove('show');
+        updateScanButton();
+      };
+    };
+    img.src = 'data:image/jpeg;base64,' + res.image;
+  } catch(e) {
+    countdown.textContent = 'Capture failed: ' + e.message;
+  }
+}
+
+// Keyboard shortcuts
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    document.getElementById('region-modal').classList.remove('show');
+    return;
+  }
+  // F9 triggers scan when browser is focused and modal is not open
+  if (e.key === 'F9' && !document.getElementById('region-modal').classList.contains('show')) {
+    e.preventDefault();
+    runScan();
+  }
+});
+
+document.getElementById('btn-set-region').addEventListener('click', startRegionSelection);
+document.getElementById('btn-banner-region').addEventListener('click', startRegionSelection);
+document.getElementById('region-modal-close').addEventListener('click', () => {
+  document.getElementById('region-modal').classList.remove('show');
+});
+
+// ---------------------------------------------------------------------------
+// Render results
+// ---------------------------------------------------------------------------
+function renderResults(results) {
+  const scroll = document.getElementById('results-scroll');
+  const q = filterText.toLowerCase();
+  const filtered = results.filter(r =>
+    !q || r.matched_name.toLowerCase().includes(q) ||
+          (r.trader_name || '').toLowerCase().includes(q)
+  );
+
+  if (!filtered.length) {
+    const msg = filterText
+      ? 'No items match your filter.'
+      : 'No items detected — try rebuilding the icon DB if this is unexpected.';
+    scroll.innerHTML = `<div style="padding:40px;text-align:center;color:#333">${msg}</div>`;
+    document.getElementById('result-count').textContent = '';
+    return;
+  }
+
+  // Group: TRADER section first, then FLEA, then KEEP — each sorted by the
+  // money you'd actually get (trader_price / flea_net), descending.
+  const grp = r => r.recommend === 'trader' ? 0 : r.recommend === 'flea' ? 1 : 2;
+  const val = r => r.recommend === 'flea' ? (r.flea_net || 0) : (r.trader_price || 0);
+  filtered.sort((a, b) => (grp(a) - grp(b)) || (val(b) - val(a)));
+
+  scroll.innerHTML = '';
+  let fleaCount = 0, traderCount = 0, keepCount = 0;
+  let lastGroup = null;
+  const groupLabel = { 0: 'SELL TO TRADER', 1: 'SELL ON FLEA', 2: 'KEEP' };
+
+  for (const r of filtered) {
+    if (r.recommend === 'flea') fleaCount++;
+    else if (r.recommend === 'keep') keepCount++;
+    else traderCount++;
+
+    // Section divider whenever the recommendation group changes.
+    const g = grp(r);
+    if (g !== lastGroup) {
+      lastGroup = g;
+      const hdr = document.createElement('div');
+      hdr.className = 'section-header';
+      hdr.textContent = groupLabel[g];
+      scroll.appendChild(hdr);
+    }
+
+    const row = document.createElement('div');
+    row.className = 'result-row';
+
+    let badgeClass, badgeText, priceLine;
+    if (r.recommend === 'keep') {
+      badgeClass = 'rec-keep'; badgeText = 'KEEP';
+      priceLine  = `<span style="color:#555">On keep list — do not sell</span>`;
+    } else if (r.recommend === 'flea') {
+      badgeClass = 'rec-flea'; badgeText = 'FLEA';
+      priceLine  = `
+        List at <span class="price-highlight">${fmt(r.flea_list)}</span>
+        <span class="price-fee">(net ~${fmt(r.flea_net)} after fees)</span>
+        &nbsp;·&nbsp; Trader: ${fmt(r.trader_price)} via <span class="trader-name">${r.trader_name || '—'}</span>`;
+    } else {
+      badgeClass = 'rec-trader'; badgeText = 'TRADER';
+      priceLine  = `
+        Sell to <span class="trader-name">${r.trader_name || '—'}</span>
+        for <span class="price-highlight">${fmt(r.trader_price)}</span>
+        ${r.flea_list ? `&nbsp;·&nbsp; Flea: ${fmt(r.flea_list)}` : ''}`;
+    }
+
+    const numClass = r.recommend === 'keep' ? 'keep' : r.recommend;
+    row.innerHTML = `
+      <div class="item-num ${numClass}">${r.num}</div>
+      <div>
+        <div class="item-name">${r.matched_name}</div>
+        <div class="match-text">${r.score}% match</div>
+      </div>
+      <div class="rec-badge ${badgeClass}">${badgeText}</div>
+      <div></div>
+      <div class="price-line" style="grid-column:2/4">${priceLine}</div>
+      <div class="reason">${r.reason || ''}</div>`;
+
+    scroll.appendChild(row);
+  }
+
+  document.getElementById('result-count').textContent = `${filtered.length} items`;
+  const summary = document.getElementById('summary-bar');
+  summary.innerHTML = `
+    <span class="s-flea">&#x25CF; ${fleaCount} flea</span>
+    <span class="s-trader">&#x25CF; ${traderCount} trader</span>
+    ${keepCount ? `<span style="color:#666">&#x25CF; ${keepCount} keep</span>` : ''}
+    <span style="color:#444">|</span>
+    <span>${fleaCount + traderCount} sellable</span>`;
+}
+
+// ---------------------------------------------------------------------------
+// Scan
+// ---------------------------------------------------------------------------
+function applyScan(res) {
+  if (res.error) {
+    document.getElementById('scan-status').textContent = 'Error: ' + res.error;
+    if (res.traceback) console.error(res.traceback);
+    return;
+  }
+  document.getElementById('no-scan').style.display = 'none';
+  const img = document.getElementById('stash-image');
+  img.style.display = 'block';
+  img.src = 'data:image/png;base64,' + res.image;
+  allResults = res.results || [];
+  renderResults(allResults);
+  const sellCount = allResults.filter(r => r.recommend !== 'keep').length;
+  const keepCount = allResults.filter(r => r.recommend === 'keep').length;
+  const parts = [];
+  if (sellCount) parts.push(`${sellCount} to sell`);
+  if (keepCount) parts.push(`${keepCount} to keep`);
+  document.getElementById('scan-status').textContent =
+    `${allResults.length} items found` + (parts.length ? ` — ${parts.join(', ')}` : '');
+}
+
+async function runScan() {
+  const btn = document.getElementById('btn-scan');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = 'Scanning…';
+  document.getElementById('scan-status').textContent = 'Scanning stash…';
+  try {
+    const res = await api('POST', '/api/sell-scan');
+    applyScan(res);
+  } catch(e) {
+    document.getElementById('scan-status').textContent = 'Error: ' + e.message;
+  }
+  btn.disabled = false;
+  btn.textContent = '📷 Scan Stash';
+  updateScanButton();
+}
+
+document.getElementById('btn-scan').addEventListener('click', runScan);
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+document.getElementById('search-box').addEventListener('input', e => {
+  filterText = e.target.value;
+  renderResults(allResults);
+});
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+updateScanButton();   // ensure button starts disabled before async calls return
+checkPriceStatus();
+loadRegionState();
+</script>
+</body>
+</html>

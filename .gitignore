@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.spec
+
+# Data — downloaded/generated locally, not committed
+data/icons/
+data/tmpl_src/
+data/eval/
+data/prices_cache.json
+data/icon_db.npz
+data/icon_model.pt
+data/icon_model_meta.json
+data/icon_index.json
+data/cache_map.json
+data/settings.json
+data/keep_list.json
+data/app.log
+
+# Keep the data folder itself
+!data/.gitkeep
+
+# Virtual envs
+venv/
+.venv/
+env/
+.buildvenv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Claude Code internal state
+.claude/

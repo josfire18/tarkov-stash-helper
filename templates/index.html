@@ -1,0 +1,838 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tarkov Stash Helper</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='4' r='2.5' fill='none' stroke='%23c4a040' stroke-width='1.5'/%3E%3Crect x='4' y='7' width='24' height='22' rx='4' ry='4' fill='%230d0f10' stroke='%23c4a040' stroke-width='1.5'/%3E%3Cline x1='9' y1='14' x2='23' y2='14' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3Cline x1='9' y1='18' x2='23' y2='18' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3Cline x1='9' y1='22' x2='19' y2='22' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3C/svg%3E">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #0d0f10;
+    color: #c8c0b0;
+    font-family: 'Segoe UI', sans-serif;
+    font-size: 13px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── Header ── */
+  header {
+    background: #161a1b;
+    border-bottom: 1px solid #2a2a2a;
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+  header h1 { font-size: 15px; font-weight: 600; color: #c4a040; letter-spacing: 1px; text-transform: uppercase; }
+  header .spacer { flex: 1; }
+
+  /* ── Buttons ── */
+  button {
+    background: #252a2b;
+    color: #c8c0b0;
+    border: 1px solid #3a3a3a;
+    padding: 6px 14px;
+    cursor: pointer;
+    font-size: 12px;
+    border-radius: 3px;
+    transition: background .15s, border-color .15s;
+    white-space: nowrap;
+  }
+  button:hover { background: #2e3335; border-color: #555; }
+  button.primary { background: #2a3a1e; border-color: #4a7a2a; color: #8fcc5a; }
+  button.primary:hover { background: #334a22; }
+  button.danger { background: #3a1e1e; border-color: #7a2a2a; color: #cc5a5a; }
+  button.danger:hover { background: #4a2222; }
+  button.active { background: #1e2e3a; border-color: #2a6a9a; color: #5aaae0; }
+
+  /* ── Layout ── */
+  .main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* ── Screenshot panel ── */
+  .screenshot-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid #1e1e1e;
+    overflow: hidden;
+  }
+  .screenshot-toolbar {
+    background: #131618;
+    border-bottom: 1px solid #1e1e1e;
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+  .screenshot-toolbar span { font-size: 11px; color: #666; }
+  .screenshot-container {
+    flex: 1;
+    overflow: auto;
+    background: #0a0c0d;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 12px;
+  }
+  #stash-image {
+    max-width: 100%;
+    border: 1px solid #2a2a2a;
+    cursor: crosshair;
+  }
+  .no-screenshot {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    gap: 12px;
+    color: #444;
+  }
+  .no-screenshot .hint { font-size: 12px; color: #333; }
+
+  /* ── Calibration modal ── */
+  #cal-modal {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,.92);
+    z-index: 1000;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+  }
+  #cal-instructions {
+    color: #c4a040; font-size: 13px;
+    background: #161a1b; border: 1px solid #c4a040;
+    padding: 8px 20px; border-radius: 4px;
+    pointer-events: none;
+  }
+  #cal-container {
+    position: relative;
+    cursor: crosshair;
+    flex-shrink: 0;
+    max-width: 95vw;
+    max-height: 85vh;
+    overflow: hidden;
+  }
+  #cal-img { display: block; max-width: 95vw; max-height: 85vh; }
+  #cal-box {
+    position: absolute;
+    border: 2px solid #c4a040;
+    background: rgba(196,160,64,.15);
+    pointer-events: none;
+    display: none;
+  }
+
+  /* ── Keep list panel ── */
+  .keeplist-panel {
+    width: 360px;
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    overflow: hidden;
+  }
+  .keeplist-toolbar {
+    background: #131618;
+    border-bottom: 1px solid #1e1e1e;
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .keeplist-toolbar input {
+    flex: 1;
+    background: #0d0f10;
+    border: 1px solid #2a2a2a;
+    color: #c8c0b0;
+    padding: 5px 8px;
+    font-size: 12px;
+    border-radius: 3px;
+    outline: none;
+  }
+  .keeplist-toolbar input:focus { border-color: #555; }
+
+  .keeplist-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0;
+  }
+  .keeplist-scroll::-webkit-scrollbar { width: 6px; }
+  .keeplist-scroll::-webkit-scrollbar-track { background: #0d0f10; }
+  .keeplist-scroll::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 3px; }
+
+  /* ── Category ── */
+  .category { margin-bottom: 4px; }
+  .category-header {
+    padding: 6px 12px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: #c4a040;
+    background: #131618;
+    border-top: 1px solid #1e1e1e;
+    border-bottom: 1px solid #1e1e1e;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    user-select: none;
+  }
+  .category-header .counts { color: #555; font-size: 10px; }
+  .category-header .toggle-arrow { transition: transform .15s; }
+  .category-header.collapsed .toggle-arrow { transform: rotate(-90deg); }
+  .category-items.collapsed { display: none; }
+
+  /* ── Item row ── */
+  .item-row {
+    display: flex;
+    align-items: center;
+    padding: 5px 12px;
+    gap: 8px;
+    border-bottom: 1px solid #141618;
+    transition: background .1s;
+  }
+  .item-row:hover { background: #131618; }
+  .item-row.acquired { opacity: 0.45; }
+  .item-row.acquired .item-name { text-decoration: line-through; }
+
+  .item-check {
+    width: 16px; height: 16px;
+    border: 1px solid #3a3a3a;
+    border-radius: 2px;
+    cursor: pointer;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background .1s, border-color .1s;
+  }
+  .item-check.checked { background: #2a5a1e; border-color: #4a9a2a; }
+  .item-check.checked::after { content: '✓'; color: #7adc4a; font-size: 10px; }
+
+  .item-info { flex: 1; min-width: 0; }
+  .item-name { font-size: 12px; color: #c8c0b0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .item-meta { font-size: 10px; color: #555; margin-top: 1px; }
+  .item-count { font-size: 10px; color: #888; background: #1e2020; padding: 1px 5px; border-radius: 2px; flex-shrink: 0; }
+  .fir-badge { font-size: 9px; font-weight: 700; color: #e0a030; background: #2a1e00; border: 1px solid #5a3a00; padding: 1px 5px; border-radius: 2px; flex-shrink: 0; letter-spacing: 0.5px; }
+  .item-delete {
+    width: 18px; height: 18px;
+    border: none;
+    background: none;
+    color: #3a2a2a;
+    cursor: pointer;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    flex-shrink: 0;
+    transition: color .1s;
+  }
+  .item-delete:hover { background: none; border: none; color: #cc5a5a; }
+
+  /* ── Add item form ── */
+  .add-item-form {
+    border-top: 1px solid #1e1e1e;
+    padding: 10px 12px;
+    background: #0d0f10;
+    flex-shrink: 0;
+  }
+  .add-item-form .form-row { display: flex; gap: 6px; margin-bottom: 6px; }
+  .add-item-form input, .add-item-form select {
+    background: #131618;
+    border: 1px solid #2a2a2a;
+    color: #c8c0b0;
+    padding: 5px 8px;
+    font-size: 12px;
+    border-radius: 3px;
+    outline: none;
+  }
+  .add-item-form input:focus, .add-item-form select:focus { border-color: #555; }
+  .add-item-form .name-input { flex: 1; }
+  .add-item-form select { width: 110px; flex-shrink: 0; }
+
+  /* ── Detections panel ── */
+  .detections-bar {
+    border-top: 1px solid #1e1e1e;
+    background: #0d0f10;
+    padding: 6px 12px;
+    font-size: 11px;
+    color: #555;
+    flex-shrink: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* ── Toast ── */
+  #toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    background: #161a1b;
+    border: 1px solid #3a3a3a;
+    padding: 10px 16px;
+    border-radius: 4px;
+    font-size: 12px;
+    opacity: 0;
+    transition: opacity .3s;
+    z-index: 2000;
+    pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+
+  /* ── Progress bar ── */
+  .progress-bar-wrap { padding: 8px 12px 4px; }
+  .progress-label { font-size: 10px; color: #666; margin-bottom: 4px; display: flex; justify-content: space-between; }
+  .progress-bar { height: 4px; background: #1e1e1e; border-radius: 2px; overflow: hidden; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg, #2a5a1e, #5aaa2a); border-radius: 2px; transition: width .4s; }
+</style>
+</head>
+<body>
+
+<header>
+  <a href="/" style="color:#c4a040;font-size:14px;font-weight:700;letter-spacing:1px;text-transform:uppercase;text-decoration:none;display:flex;align-items:center;padding-right:20px;border-right:1px solid #2a2a2a;flex-shrink:0">&#x2302; Tarkov</a>
+  <nav style="display:flex;align-items:stretch;padding:0 12px">
+    <a href="/" style="display:flex;align-items:center;padding:0 16px;font-size:12px;color:#c4a040;text-decoration:none;border-bottom:2px solid #c4a040">Keep List</a>
+    <a href="/sell" style="display:flex;align-items:center;padding:0 16px;font-size:12px;color:#666;text-decoration:none;border-bottom:2px solid transparent">Sell Advisor</a>
+  </nav>
+  <div class="spacer"></div>
+  <label style="font-size:11px;color:#666;margin-right:4px">Prestige</label>
+  <select id="prestige-select" style="background:#1a1a1a;border:1px solid #3a3a3a;color:#c4a040;padding:5px 8px;border-radius:3px;font-size:12px;cursor:pointer">
+    <option value="0">None</option>
+    <option value="1">1</option>
+    <option value="2">2</option>
+    <option value="3" selected>3</option>
+    <option value="4">4</option>
+    <option value="5">5</option>
+    <option value="6">6</option>
+  </select>
+  <div style="width:1px;height:20px;background:#2a2a2a;margin:0 8px"></div>
+  <span id="hotkey-badge" style="font-size:11px;color:#555;background:#131618;border:1px solid #2a2a2a;padding:4px 10px;border-radius:3px">
+    Hotkey: <span style="color:#c4a040">F9</span> — press in-game to scan
+  </span>
+  <button id="btn-calibrate" class="active">Set Stash Region</button>
+  <button id="btn-help">? Help</button>
+  <button id="btn-reset" class="danger">Reset List</button>
+</header>
+
+<!-- Help modal -->
+<div id="help-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:3000;align-items:center;justify-content:center">
+  <div style="background:#161a1b;border:1px solid #3a3a3a;border-radius:6px;width:520px;max-height:80vh;overflow-y:auto;padding:24px;position:relative">
+    <button id="btn-help-close" style="position:absolute;top:12px;right:12px;background:none;border:none;color:#666;font-size:18px;cursor:pointer;padding:0">&times;</button>
+    <h2 style="color:#c4a040;font-size:14px;letter-spacing:1px;text-transform:uppercase;margin-bottom:16px">&#x2302; How to use Tarkov Stash Helper</h2>
+
+    <div style="display:flex;flex-direction:column;gap:16px;font-size:12px;line-height:1.7;color:#b0a898">
+
+      <section>
+        <div style="color:#c4a040;font-weight:600;margin-bottom:6px">1 — First-time setup</div>
+        <ol style="padding-left:18px;display:flex;flex-direction:column;gap:4px">
+          <li>Launch Tarkov and open your stash.</li>
+          <li>Click <b style="color:#5aaae0">Set Stash Region</b> in the header — a dark overlay will appear over this browser window.</li>
+          <li>Click and drag a rectangle over the area of your screen that contains the stash grid, then release. The coordinates are saved automatically.</li>
+          <li>You only need to do this once unless you change your monitor layout.</li>
+        </ol>
+      </section>
+
+      <section>
+        <div style="color:#c4a040;font-weight:600;margin-bottom:6px">2 — Scanning your stash</div>
+        <ol style="padding-left:18px;display:flex;flex-direction:column;gap:4px">
+          <li>Open your stash in Tarkov <em>(keep the game focused so lossless scaling is active)</em>.</li>
+          <li>Press <b style="color:#c4a040">F9</b> — the screenshot fires instantly while the game is still in the foreground.</li>
+          <li>Tab to this browser — the scan result is already loaded.</li>
+          <li><b style="color:#8fcc5a">Green highlight</b> = item is on your keep list (acquired or still needed).<br>
+              <b style="color:#cc5a5a">Red highlight</b> = not on the keep list → safe to sell.</li>
+          <li>Alternatively, click <b>Scan Stash</b> manually (will capture at 720p if game isn't focused).</li>
+        </ol>
+      </section>
+
+      <section>
+        <div style="color:#c4a040;font-weight:600;margin-bottom:6px">3 — Keep list</div>
+        <ul style="padding-left:18px;display:flex;flex-direction:column;gap:4px">
+          <li>Check the box next to an item once you've found it or turned it in — it'll grey out and stop appearing as a keep target in scans.</li>
+          <li>Use the search bar to filter by item name or task.</li>
+          <li>Add custom items with the form at the bottom — optionally set aliases (comma separated) so OCR can recognise the in-game abbreviated name.</li>
+          <li>Items with a <b style="color:#e0a030">FIR</b> badge must be Found In Raid when handed in.</li>
+          <li>Click &times; on any row to permanently remove an item.</li>
+        </ul>
+      </section>
+
+      <section>
+        <div style="color:#c4a040;font-weight:600;margin-bottom:6px">4 — Prestige</div>
+        <ul style="padding-left:18px;display:flex;flex-direction:column;gap:4px">
+          <li>Set your current prestige level in the header dropdown.</li>
+          <li>At prestige 1, New Beginning figurines do <em>not</em> need to be FIR — the badge is hidden.</li>
+          <li>At prestige 2 and above, all New Beginning figurines must be FIR — the amber FIR badge appears.</li>
+        </ul>
+      </section>
+
+      <section>
+        <div style="color:#c4a040;font-weight:600;margin-bottom:6px">5 — OCR tips</div>
+        <ul style="padding-left:18px;display:flex;flex-direction:column;gap:4px">
+          <li>OCR works best when the stash region is set tightly — don't include the inventory/gear panels.</li>
+          <li>If an item isn't detected, add its in-game short name as an alias via the add form (e.g. "FireKlea" for FireKlean gun lube).</li>
+          <li>Requires <b>Tesseract OCR</b> to be installed: <code style="background:#0d0f10;padding:1px 5px;border-radius:2px">winget install UB-Mannheim.TesseractOCR</code></li>
+          <li>Closing this window just minimizes it to the system tray — right-click the tray icon to reopen or quit.</li>
+        </ul>
+      </section>
+
+    </div>
+  </div>
+</div>
+
+<div class="main">
+  <!-- Screenshot panel -->
+  <div class="screenshot-panel">
+    <div class="screenshot-toolbar">
+      <button id="btn-screenshot" class="primary">&#x1F4F7; Scan Stash</button>
+      <span id="ocr-status">Click "Scan Stash" to analyse your stash</span>
+    </div>
+    <div class="screenshot-container" id="screenshot-container">
+      <div class="no-screenshot" id="no-screenshot">
+        <div style="font-size:48px;opacity:.15">&#x1F4E6;</div>
+        <div>No scan yet</div>
+        <div class="hint">1. Open your stash in Tarkov &nbsp;|&nbsp; 2. Set region (optional) &nbsp;|&nbsp; 3. Click Scan Stash</div>
+      </div>
+      <img id="stash-image" style="display:none" alt="Stash scan">
+    </div>
+    <div class="detections-bar" id="detections-bar">Ready.</div>
+  </div>
+
+  <!-- Keep list panel -->
+  <div class="keeplist-panel">
+    <div class="keeplist-toolbar">
+      <input type="text" id="search-box" placeholder="Filter items…">
+    </div>
+
+    <div class="keeplist-scroll" id="keeplist-scroll">
+      <div style="padding:40px;text-align:center;color:#333">Loading…</div>
+    </div>
+
+    <div class="add-item-form">
+      <div class="form-row">
+        <input type="text" class="name-input" id="add-name" placeholder="Item name">
+        <select id="add-category">
+          <option value="kappa">Kappa</option>
+          <option value="tasks">Tasks</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <input type="text" id="add-aliases" placeholder="Aliases (comma separated)" style="flex:1">
+        <input type="number" id="add-count" placeholder="Qty" style="width:60px">
+      </div>
+      <div class="form-row">
+        <input type="text" id="add-task" placeholder="Task name (optional)" style="flex:1">
+        <button class="primary" id="btn-add" style="flex-shrink:0">+ Add</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Region selection overlay -->
+<div id="cal-modal">
+  <div id="cal-instructions">Click and drag to select your stash grid — release to confirm &nbsp;|&nbsp; Esc to cancel</div>
+  <div id="cal-container">
+    <img id="cal-img" alt="Screen capture">
+    <div id="cal-box"></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+let keepList = null;
+let filterText = '';
+let dragStart = null;
+let currentPrestige = 3;
+
+// ---------------------------------------------------------------------------
+// API
+// ---------------------------------------------------------------------------
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts);
+  return r.json();
+}
+
+// ---------------------------------------------------------------------------
+// Toast
+// ---------------------------------------------------------------------------
+let toastTimer;
+function toast(msg, duration = 2200) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), duration);
+}
+
+// ---------------------------------------------------------------------------
+// Keep list rendering
+// ---------------------------------------------------------------------------
+async function loadKeepList() {
+  keepList = await api('GET', '/api/keep-list');
+  renderKeepList();
+}
+
+function renderKeepList() {
+  if (!keepList) return;
+  const scroll = document.getElementById('keeplist-scroll');
+  const q = filterText.toLowerCase();
+  scroll.innerHTML = '';
+
+  for (const cat of keepList.categories) {
+    const items = cat.items.filter(i => !q || i.name.toLowerCase().includes(q) || (i.task || '').toLowerCase().includes(q));
+    if (!items.length) continue;
+
+    const acquired = items.filter(i => i.acquired).length;
+    const total = items.length;
+
+    const catDiv = document.createElement('div');
+    catDiv.className = 'category';
+
+    const header = document.createElement('div');
+    header.className = 'category-header';
+    header.innerHTML = `
+      <span>${cat.label}</span>
+      <span class="counts">${acquired}/${total} &nbsp;<span class="toggle-arrow">▾</span></span>`;
+    catDiv.appendChild(header);
+
+    // Progress bar
+    const progressWrap = document.createElement('div');
+    progressWrap.className = 'progress-bar-wrap';
+    const pct = total ? Math.round(acquired / total * 100) : 0;
+    progressWrap.innerHTML = `
+      <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>`;
+    catDiv.appendChild(progressWrap);
+
+    const itemsDiv = document.createElement('div');
+    itemsDiv.className = 'category-items';
+
+    for (const item of items) {
+      const row = document.createElement('div');
+      row.className = 'item-row' + (item.acquired ? ' acquired' : '');
+      row.dataset.id = item.id;
+
+      const check = document.createElement('div');
+      check.className = 'item-check' + (item.acquired ? ' checked' : '');
+      check.addEventListener('click', () => toggleItem(item.id));
+
+      const info = document.createElement('div');
+      info.className = 'item-info';
+      const meta = item.task ? `<div class="item-meta">${item.task}</div>` : '';
+      info.innerHTML = `<div class="item-name">${item.name}</div>${meta}`;
+
+      const del = document.createElement('button');
+      del.className = 'item-delete';
+      del.innerHTML = '&times;';
+      del.title = 'Remove';
+      del.addEventListener('click', (e) => { e.stopPropagation(); removeItem(item.id); });
+
+      row.appendChild(check);
+      row.appendChild(info);
+      if (item.count) {
+        const cnt = document.createElement('div');
+        cnt.className = 'item-count';
+        cnt.textContent = `×${item.count}`;
+        row.appendChild(cnt);
+      }
+      // FIR badge: New Beginning items require FIR on prestige 2+
+      if (item.task && item.task.includes('New Beginning')) {
+        if (currentPrestige >= 2) {
+          const fir = document.createElement('div');
+          fir.className = 'fir-badge';
+          fir.title = 'Must be Found In Raid';
+          fir.textContent = 'FIR';
+          row.appendChild(fir);
+        }
+      }
+      row.appendChild(del);
+      itemsDiv.appendChild(row);
+    }
+
+    catDiv.appendChild(itemsDiv);
+    scroll.appendChild(catDiv);
+
+    header.addEventListener('click', () => {
+      header.classList.toggle('collapsed');
+      itemsDiv.classList.toggle('collapsed');
+    });
+  }
+}
+
+async function toggleItem(id) {
+  const res = await api('POST', '/api/keep-list/toggle', { id });
+  if (res.ok) {
+    for (const cat of keepList.categories)
+      for (const item of cat.items)
+        if (item.id === id) item.acquired = res.acquired;
+    renderKeepList();
+    toast(res.acquired ? '✓ Marked acquired' : '✗ Marked needed');
+  }
+}
+
+async function removeItem(id) {
+  if (!confirm('Remove this item from the keep list?')) return;
+  await api('DELETE', `/api/keep-list/remove/${id}`);
+  await loadKeepList();
+  toast('Item removed');
+}
+
+// ---------------------------------------------------------------------------
+// Add item
+// ---------------------------------------------------------------------------
+document.getElementById('btn-add').addEventListener('click', async () => {
+  const name = document.getElementById('add-name').value.trim();
+  if (!name) { toast('Enter an item name'); return; }
+  const aliases = document.getElementById('add-aliases').value.split(',').map(s => s.trim()).filter(Boolean);
+  const count = parseInt(document.getElementById('add-count').value) || undefined;
+  const task = document.getElementById('add-task').value.trim() || undefined;
+  const category = document.getElementById('add-category').value;
+
+  await api('POST', '/api/keep-list/add', { name, aliases, count, task, category });
+  document.getElementById('add-name').value = '';
+  document.getElementById('add-aliases').value = '';
+  document.getElementById('add-count').value = '';
+  document.getElementById('add-task').value = '';
+  await loadKeepList();
+  toast(`Added: ${name}`);
+});
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+document.getElementById('search-box').addEventListener('input', e => {
+  filterText = e.target.value;
+  renderKeepList();
+});
+
+// ---------------------------------------------------------------------------
+// Screenshot / scan
+// ---------------------------------------------------------------------------
+document.getElementById('btn-screenshot').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-screenshot');
+  const status = document.getElementById('ocr-status');
+  btn.disabled = true;
+
+  for (let i = 3; i >= 1; i--) {
+    btn.textContent = `Tab to Tarkov… ${i}`;
+    status.textContent = `Scanning in ${i} second${i !== 1 ? 's' : ''} — tab to your stash now`;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
+  btn.textContent = 'Scanning…';
+  status.textContent = 'Taking screenshot and running OCR…';
+
+  try {
+    const res = await api('POST', '/api/screenshot');
+    if (res.image) {
+      document.getElementById('no-screenshot').style.display = 'none';
+      const img = document.getElementById('stash-image');
+      img.style.display = 'block';
+      img.src = 'data:image/png;base64,' + res.image;
+
+      const keep = res.detections.filter(d => d.acquired).length;
+      const sell = res.detections.filter(d => !d.acquired).length;
+      const total = res.detections.length;
+      status.textContent = `Found ${total} items — ${keep} keep (green), ${sell} sell (red)`;
+      document.getElementById('detections-bar').textContent =
+        total ? res.detections.map(d => `${d.matched} (${d.score}%)`).join('  ·  ') : 'No items detected. Try adjusting the stash region.';
+    }
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+  }
+
+  btn.disabled = false;
+  btn.textContent = '📷 Scan Stash';
+});
+
+// ---------------------------------------------------------------------------
+// Region calibration — screenshot-based
+// ---------------------------------------------------------------------------
+const calModal     = document.getElementById('cal-modal');
+const calImg       = document.getElementById('cal-img');
+const calBox       = document.getElementById('cal-box');
+const calContainer = document.getElementById('cal-container');
+let calActualW = 1, calActualH = 1;
+
+document.getElementById('btn-calibrate').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-calibrate');
+  btn.disabled = true;
+  for (let i = 3; i >= 1; i--) {
+    btn.textContent = `Tab to Tarkov… ${i}`;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  btn.textContent = 'Capturing…';
+  try {
+    const res = await api('GET', '/api/calibration-screenshot');
+    calActualW = res.width;
+    calActualH = res.height;
+    calImg.src = 'data:image/jpeg;base64,' + res.image;
+    calModal.style.display = 'flex';
+  } catch(e) {
+    toast('Screenshot failed: ' + e.message);
+  }
+  btn.disabled = false;
+  btn.textContent = 'Set Stash Region';
+});
+
+calContainer.addEventListener('mousedown', e => {
+  const r = calImg.getBoundingClientRect();
+  dragStart = { x: e.clientX - r.left, y: e.clientY - r.top };
+  calBox.style.left = dragStart.x + 'px';
+  calBox.style.top  = dragStart.y + 'px';
+  calBox.style.width  = '0';
+  calBox.style.height = '0';
+  calBox.style.display = 'block';
+  e.preventDefault();
+});
+
+calContainer.addEventListener('mousemove', e => {
+  if (!dragStart) return;
+  const r = calImg.getBoundingClientRect();
+  const cx = e.clientX - r.left, cy = e.clientY - r.top;
+  const x = Math.max(0, Math.min(dragStart.x, cx));
+  const y = Math.max(0, Math.min(dragStart.y, cy));
+  const w = Math.abs(cx - dragStart.x);
+  const h = Math.abs(cy - dragStart.y);
+  calBox.style.left = x + 'px'; calBox.style.top = y + 'px';
+  calBox.style.width = w + 'px'; calBox.style.height = h + 'px';
+});
+
+calContainer.addEventListener('mouseup', async e => {
+  if (!dragStart) return;
+  const r    = calImg.getBoundingClientRect();
+  const cx   = e.clientX - r.left, cy = e.clientY - r.top;
+  const dispX = Math.min(dragStart.x, cx);
+  const dispY = Math.min(dragStart.y, cy);
+  const dispW = Math.abs(cx - dragStart.x);
+  const dispH = Math.abs(cy - dragStart.y);
+  dragStart = null;
+
+  if (dispW < 30 || dispH < 30) { toast('Selection too small — try again'); return; }
+
+  // Scale from displayed image size back to actual screen coordinates
+  const scaleX = calActualW / r.width;
+  const scaleY = calActualH / r.height;
+  const region = {
+    x: Math.round(dispX * scaleX),
+    y: Math.round(dispY * scaleY),
+    w: Math.round(dispW * scaleX),
+    h: Math.round(dispH * scaleY)
+  };
+
+  calModal.style.display = 'none';
+  calBox.style.display = 'none';
+
+  const settings = await api('GET', '/api/settings');
+  settings.region = region;
+  await api('POST', '/api/settings', settings);
+  toast(`Region set: ${region.w}×${region.h} at (${region.x}, ${region.y})`);
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { calModal.style.display = 'none'; dragStart = null; }
+});
+
+// ---------------------------------------------------------------------------
+// Reset
+// ---------------------------------------------------------------------------
+document.getElementById('btn-reset').addEventListener('click', async () => {
+  if (!confirm('Reset the keep list to defaults? This cannot be undone.')) return;
+  await api('POST', '/api/reset');
+  await loadKeepList();
+  toast('Keep list reset to defaults');
+});
+
+// ---------------------------------------------------------------------------
+// Prestige selector
+// ---------------------------------------------------------------------------
+async function initPrestige() {
+  const settings = await api('GET', '/api/settings');
+  currentPrestige = settings.prestige || 3;
+  document.getElementById('prestige-select').value = currentPrestige;
+  renderKeepList();
+}
+
+document.getElementById('prestige-select').addEventListener('change', async e => {
+  currentPrestige = parseInt(e.target.value);
+  const settings = await api('GET', '/api/settings');
+  settings.prestige = currentPrestige;
+  await api('POST', '/api/settings', settings);
+  toast(`Prestige set to ${currentPrestige}`);
+  renderKeepList();
+});
+
+// ---------------------------------------------------------------------------
+// Hotkey polling — check for scans triggered while Tarkov was focused
+// ---------------------------------------------------------------------------
+let lastScanTs = 0;
+
+function applyScanResult(res) {
+  document.getElementById('no-screenshot').style.display = 'none';
+  const img = document.getElementById('stash-image');
+  img.style.display = 'block';
+  img.src = 'data:image/png;base64,' + res.image;
+  const keep = res.detections.filter(d => d.acquired).length;
+  const sell = res.detections.filter(d => !d.acquired).length;
+  document.getElementById('ocr-status').textContent =
+    `Found ${res.detections.length} items — ${keep} keep (green), ${sell} sell (red)`;
+  document.getElementById('detections-bar').textContent =
+    res.detections.length
+      ? res.detections.map(d => `${d.matched} (${d.score}%)`).join('  ·  ')
+      : 'No items detected. Try adjusting the stash region.';
+  lastScanTs = res.ts;
+}
+
+async function pollHotkey() {
+  try {
+    const res = await api('GET', `/api/last-scan?since=${lastScanTs}`);
+    if (res.ready) {
+      applyScanResult(res);
+      toast('✓ Hotkey scan complete');
+    }
+  } catch (_) {}
+  setTimeout(pollHotkey, 1500);
+}
+
+// ---------------------------------------------------------------------------
+// Help modal
+// ---------------------------------------------------------------------------
+const helpModal = document.getElementById('help-modal');
+document.getElementById('btn-help').addEventListener('click', () => {
+  helpModal.style.display = 'flex';
+});
+document.getElementById('btn-help-close').addEventListener('click', () => {
+  helpModal.style.display = 'none';
+});
+helpModal.addEventListener('click', e => {
+  if (e.target === helpModal) helpModal.style.display = 'none';
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') helpModal.style.display = 'none';
+});
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+loadKeepList();
+initPrestige();
+pollHotkey();
+</script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+flask
+waitress
+mss
+pillow
+pytesseract
+rapidfuzz
+requests
+pynput
+pystray
+pywebview
+opencv-python
+numpy
