@@ -6,6 +6,7 @@ import base64
 import uuid
 import threading
 import time
+import subprocess
 from io import BytesIO
 
 import math
@@ -20,6 +21,8 @@ from rapidfuzz import process as rfuzz
 from pynput import keyboard
 import cv2
 import numpy as np
+
+APP_VERSION = '0.3.1'
 
 FROZEN = getattr(sys, 'frozen', False)
 
@@ -69,6 +72,12 @@ PRESTIGE_WIKI_TTL    = 7 * 86400 # seconds (7 d) — Prestige requirements chang
 TASKS_CACHE_TTL      = 86400 # seconds (24 h) — task/hideout requirements change per patch
 FLEA_MIN_PROFIT      = 10000 # recommend flea only if net > trader by this much
 TARKOV_API           = 'https://api.tarkov.dev/graphql'
+# Self-update: owner/repo are baked in here and NEVER taken from the client —
+# the download URL that ends up in _update_state always traces back to this
+# exact GitHub API call.
+GITHUB_RELEASES_API  = 'https://api.github.com/repos/josfire18/tarkov-stash-helper/releases/latest'
+UPDATE_ASSET_NAME    = 'TarkovStashHelper.exe'
+UPDATE_CACHE_TTL     = 6 * 3600  # seconds (6 h)
 # The raw wiki page (escapefromtarkov.fandom.com/wiki/Collector) sits behind a
 # Cloudflare bot challenge and returns "Just a moment..." to plain HTTP clients.
 # The MediaWiki API serves the identical rendered HTML unchallenged — always
@@ -174,6 +183,14 @@ _scan_lock = threading.Lock()
 # Live progress of the currently running scan, polled by the frontend.
 _scan_state = {'running': False, 'phase': None, 'done': 0, 'total': 0, 'ts': 0}
 
+# /api/update-check result, cached UPDATE_CACHE_TTL seconds so the UI's
+# poll-on-load doesn't hit GitHub on every page load.
+_update_cache = {'ts': 0, 'data': None}
+# The exe asset's download URL/size for the latest checked release, kept
+# server-side only — /api/update-apply reads this instead of trusting
+# anything the client might send.
+_update_state = {'download_url': None, 'asset_size': None, 'tag': None}
+
 # The region-picker modal (on both pages) already grabs a full-monitor frame
 # via /api/calibration-screenshot to show the user something to drag a
 # rectangle over. Stashing that same frame here lets a scan triggered right
@@ -200,6 +217,45 @@ def load_json(path, default_fn):
 def save_json(path, data):
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Self-update — version comparison
+# ---------------------------------------------------------------------------
+
+def _ver_tuple(s):
+    """
+    Parse a version string ('0.3.1', 'v0.3.1', 'v0.3.0-beta1') into a tuple of
+    ints (0, 3, 1). Tolerant of a leading 'v'/'V' and any junk after the
+    numeric dot-groups (a trailing '-beta1', build metadata, etc. is simply
+    ignored — only the leading numeric run is parsed). Returns None if the
+    string has no leading numeric dot-group at all (e.g. '', 'garbage').
+    """
+    if not s:
+        return None
+    s = s.strip()
+    if s[:1] in ('v', 'V'):
+        s = s[1:]
+    m = re.match(r'\d+(?:\.\d+)*', s)
+    if not m:
+        return None
+    return tuple(int(x) for x in m.group().split('.'))
+
+
+def _is_newer(remote, local):
+    """
+    True iff `remote` version string is strictly newer than `local`.
+    Unequal-length tuples (e.g. '0.3' vs '0.3.1') are padded on the right with
+    zeros before comparing. False (never raises) when either side fails to
+    parse, or on ties/older.
+    """
+    rt, lt = _ver_tuple(remote), _ver_tuple(local)
+    if rt is None or lt is None:
+        return False
+    n = max(len(rt), len(lt))
+    rt = rt + (0,) * (n - len(rt))
+    lt = lt + (0,) * (n - len(lt))
+    return rt > lt
 
 
 # ---------------------------------------------------------------------------
@@ -2532,6 +2588,7 @@ def health():
         'prices_cached':  os.path.exists(PRICES_PATH),
         'hotkey':         hotkey_manager.current,
         'exact_ids':      _exact_ids_status(),
+        'app_version':    APP_VERSION,
     })
 
 @app.route('/api/hotkey', methods=['POST'])
@@ -2670,6 +2727,154 @@ def reset_keep_list():
     except Exception as e:
         print(f"[kappa] post-reset sync skipped: {e}")
     return jsonify({'ok': True})
+
+# ---------------------------------------------------------------------------
+# Self-update
+# ---------------------------------------------------------------------------
+
+def _fetch_latest_release():
+    """Hit the hardcoded GitHub releases/latest endpoint. Raises on any
+    network/HTTP/JSON failure — callers must catch."""
+    r = http_requests.get(GITHUB_RELEASES_API, timeout=6, headers={
+        'User-Agent': 'TarkovStashHelper/1.0 (github.com/josfire18/tarkov-stash-helper)',
+    })
+    r.raise_for_status()
+    return r.json()
+
+
+def _get_update_status(force=False):
+    """
+    Shared cache-check + fetch logic behind /api/update-check and
+    /api/update-apply. Populates _update_cache (the response the UI sees) and
+    _update_state (the download URL, kept server-side) as a side effect.
+
+    Never raises — any network/parse failure is folded into the returned
+    dict's 'error' field with update_available False, so the caller always
+    gets a 200-shaped result.
+    """
+    now = time.time()
+    if not force and _update_cache['data'] and now - _update_cache['ts'] < UPDATE_CACHE_TTL:
+        return _update_cache['data']
+
+    result = {
+        'current':           APP_VERSION,
+        'latest':            None,
+        'update_available':  False,
+        'notes_url':         None,
+        'can_auto':          False,
+        'error':             None,
+    }
+    try:
+        release = _fetch_latest_release()
+        tag = release.get('tag_name') or ''
+        update_available = _is_newer(tag, APP_VERSION)
+        asset = next((a for a in (release.get('assets') or [])
+                     if a.get('name') == UPDATE_ASSET_NAME), None)
+
+        result['latest']           = tag
+        result['notes_url']        = release.get('html_url')
+        result['update_available'] = update_available
+        result['can_auto']         = bool(FROZEN and update_available and asset)
+
+        _update_state['tag'] = tag
+        if update_available and asset:
+            _update_state['download_url'] = asset.get('browser_download_url')
+            _update_state['asset_size']   = asset.get('size')
+        else:
+            _update_state['download_url'] = None
+            _update_state['asset_size']   = None
+    except Exception as e:
+        result['error'] = str(e)
+
+    _update_cache['ts']   = now
+    _update_cache['data'] = result
+    return result
+
+
+@app.route('/api/update-check', methods=['GET'])
+def update_check():
+    force = request.args.get('force') in ('1', 'true', 'True')
+    return jsonify(_get_update_status(force=force))
+
+
+@app.route('/api/update-apply', methods=['POST'])
+def update_apply():
+    if not FROZEN:
+        return jsonify({'error': 'Running from source — update with git pull instead.'}), 400
+
+    status = _get_update_status(force=False)
+    if not status.get('update_available') or not _update_state.get('download_url'):
+        # Cache may be empty/stale (e.g. app just started) — force one refresh
+        # before giving up.
+        status = _get_update_status(force=True)
+    if not status.get('update_available') or not _update_state.get('download_url'):
+        return jsonify({'error': status.get('error') or 'No update available to apply.'}), 400
+
+    download_url = _update_state['download_url']
+    asset_size = _update_state.get('asset_size')
+    if not download_url.startswith('https://'):
+        return jsonify({'error': 'Refusing a non-HTTPS asset URL.'}), 400
+
+    exe_path = sys.executable
+    exe_dir = os.path.dirname(exe_path)
+    new_path = os.path.join(exe_dir, UPDATE_ASSET_NAME + '.new')
+
+    try:
+        with http_requests.get(download_url, stream=True, timeout=120, headers={
+            'User-Agent': 'TarkovStashHelper/1.0 (github.com/josfire18/tarkov-stash-helper)',
+        }) as r:
+            r.raise_for_status()
+            with open(new_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=1 << 20):
+                    if chunk:
+                        f.write(chunk)
+    except Exception as e:
+        return jsonify({'error': f'Download failed: {e}'}), 502
+
+    downloaded_size = os.path.getsize(new_path) if os.path.exists(new_path) else 0
+    if downloaded_size == 0 or (asset_size and downloaded_size != asset_size):
+        try:
+            os.remove(new_path)
+        except Exception:
+            pass
+        return jsonify({'error': 'Downloaded update file was empty or the wrong size.'}), 502
+
+    # updater.bat: waits for this process to exit (by PID), replaces the exe
+    # with the freshly-downloaded one, relaunches it, then deletes itself.
+    # Spawned detached below so it survives this process exiting.
+    pid = os.getpid()
+    bat_path = os.path.join(exe_dir, 'updater.bat')
+    bat = (
+        '@echo off\r\n'
+        ':wait\r\n'
+        f'tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul '
+        '&& (timeout /t 1 /nobreak >nul & goto wait)\r\n'
+        ':retry\r\n'
+        f'del "{exe_path}" >nul 2>&1\r\n'
+        f'if exist "{exe_path}" (timeout /t 1 /nobreak >nul & goto retry)\r\n'
+        f'move /y "{new_path}" "{exe_path}" >nul\r\n'
+        f'start "" "{exe_path}"\r\n'
+        'del "%~f0"\r\n'
+    )
+    try:
+        with open(bat_path, 'w', encoding='utf-8') as f:
+            f.write(bat)
+        subprocess.Popen(
+            ['cmd', '/c', bat_path],
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True, cwd=exe_dir,
+        )
+    except Exception as e:
+        return jsonify({'error': f'Failed to launch updater: {e}'}), 502
+
+    def _delayed_restart():
+        # Give the HTTP response time to flush to the browser before tearing
+        # the window/tray down.
+        time.sleep(1.5)
+        _shutdown_desktop()
+    threading.Thread(target=_delayed_restart, daemon=True).start()
+
+    return jsonify({'ok': True, 'restarting': True})
 
 # ---------------------------------------------------------------------------
 # Tasks & hideout page
@@ -3062,6 +3267,40 @@ def _startup_maintenance():
         print(f"[kappa] startup sync skipped (offline?): {e}")
 
 
+# Module-level handle to the running pywebview window / pystray icon / quit
+# event, populated by _run_app. Lets the update-apply route's restart thread
+# (which has no closure over _run_app's locals) tear the desktop down through
+# the exact same path the tray's Quit menu item uses. Stays all-None when run
+# from source without the desktop shell (e.g. under pytest).
+_desktop = {'window': None, 'tray': None, 'quitting': None}
+
+
+def _shutdown_desktop():
+    """
+    Tear down the tray + window the same way the tray's Quit action does,
+    then exit the process. Shared by on_quit and the post-update-apply
+    restart so both paths behave identically. When _desktop was never
+    populated (no pywebview window — running windowless from source), this
+    just falls back to os._exit(0).
+    """
+    quitting = _desktop.get('quitting')
+    if quitting is not None:
+        quitting.set()
+    tray = _desktop.get('tray')
+    if tray is not None:
+        try:
+            tray.stop()
+        except Exception:
+            pass
+    window = _desktop.get('window')
+    if window is not None:
+        try:
+            window.destroy()
+        except Exception:
+            pass
+    os._exit(0)
+
+
 def _run_app():
     """Hosts the local Flask UI in a native window (pywebview) instead of a
     browser tab, so there's no URL for the user to see or navigate to — it
@@ -3081,6 +3320,8 @@ def _run_app():
     )
 
     quitting = threading.Event()
+    _desktop['window'] = window
+    _desktop['quitting'] = quitting
 
     def on_closing():
         if quitting.is_set():
@@ -3094,10 +3335,7 @@ def _run_app():
         window.show()
 
     def on_quit(icon, item):
-        quitting.set()
-        icon.stop()
-        window.destroy()
-        os._exit(0)
+        _shutdown_desktop()
 
     tray_icon = pystray.Icon(
         'TarkovStashHelper',
@@ -3108,6 +3346,7 @@ def _run_app():
             pystray.MenuItem('Quit', on_quit),
         ),
     )
+    _desktop['tray'] = tray_icon
     threading.Thread(target=tray_icon.run, daemon=True).start()
 
     webview.start()  # blocks; owns the main thread
