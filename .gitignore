@@ -42,3 +42,5 @@ env/
 data/kappa_wiki.json
 data/tasks_cache.json
 data/progress.json
+data/prestige_wiki.json
+data/eft_hash_status.json

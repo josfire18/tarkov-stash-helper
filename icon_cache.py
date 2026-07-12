@@ -242,13 +242,45 @@ def save_cache_map(cmap):
 _assoc_lock = threading.Lock()
 
 
+def _load_exact_map(items, cache_dir):
+    """
+    Consult the validation-gated exact-hash pipeline (eft_hash.py).  Returns
+    {filename: item_id}, empty when the gate is closed (or anything about the
+    pipeline is unavailable) — callers can treat an empty dict as "no-op" and
+    stay byte-identical to the pre-exact-map behaviour.
+    """
+    try:
+        import eft_hash
+        status = eft_hash.get_status(DATA)
+        if not status or not status.get('enabled'):
+            return {}
+        idx_path = os.path.join(cache_dir, 'index.json')
+        if not os.path.exists(idx_path):
+            return {}
+        with open(idx_path, encoding='utf-8') as f:
+            index_json = json.load(f)
+        return eft_hash.build_exact_map(items, index_json,
+                                        provider=status.get('provider', 'ratstash-2022'))
+    except Exception as e:
+        print(f"[icon_cache] exact-map pass skipped: {e}")
+        return {}
+
+
 def associate_cache(items, load_src_fn, force=False):
     """
     Incrementally associate every icon-cache PNG to an item ID (visually).
 
     Only new/changed files (by mtime, unless force) are re-associated; existing
     entries are reused.  Persists and returns the cache-map:
-        {filename: {item_id, name, score, mtime, preset, unknown, W, H}}
+        {filename: {item_id, name, score, mtime, preset, unknown, W, H, exact}}
+
+    Files present in a *validated* exact hash map (eft_hash.py, gated on
+    agreement with this very cache-map) skip NCC visual matching entirely —
+    their identity is definitive, so recording score=1.0/exact=True and moving
+    on is both faster and more precise.  When the gate is closed (today, and
+    for the foreseeable future — see eft_hash.py docstring), the exact map is
+    empty and this is a no-op: behaviour is unchanged from before exact-map
+    existed.
     """
     cache_dir = find_cache_dir()
     if not cache_dir:
@@ -271,20 +303,39 @@ def associate_cache(items, load_src_fn, force=False):
         print(f"[icon_cache] {len(files)} cache icons, all associations current")
         return cmap
 
+    exact_map = _load_exact_map(items, cache_dir)
+    id_to_item = {it['id']: it for it in items} if exact_map else {}
+
     print(f"[icon_cache] associating {len(todo)} new/changed of {len(files)} cache icons…")
     ref_index = _build_reference_index(items, load_src_fn)
 
-    n_strong = n_preset = n_unknown = 0
+    n_strong = n_preset = n_unknown = n_exact = 0
     for i, (fp, fn, mt) in enumerate(todo):
         if i and i % 250 == 0:
             print(f"[icon_cache] associate… {i}/{len(todo)}")
+        if fn in exact_map:
+            # Validated exact identity — skip the NCC shortlist+verify pass.
+            bgra = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
+            if bgra is None or bgra.size == 0:
+                continue
+            h_px, w_px = bgra.shape[:2]
+            W, H = slot_size(w_px, h_px)
+            eid = exact_map[fn]
+            eitem = id_to_item.get(eid)
+            cmap[fn] = {
+                'mtime': mt, 'W': W, 'H': H, 'score': 1.0,
+                'item_id': eid, 'name': eitem['name'] if eitem else eid,
+                'preset': False, 'unknown': False, 'exact': True,
+            }
+            n_exact += 1
+            continue
         bgra = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
         if bgra is None or bgra.size == 0:
             continue
         h_px, w_px = bgra.shape[:2]
         W, H = slot_size(w_px, h_px)
         iid, name, score = _associate_one(bgra, W, H, ref_index.get((W, H)))
-        entry = {'mtime': mt, 'W': W, 'H': H, 'score': round(float(score), 4)}
+        entry = {'mtime': mt, 'W': W, 'H': H, 'score': round(float(score), 4), 'exact': False}
         if iid is not None and score >= STRONG:
             entry.update({'item_id': iid, 'name': name, 'preset': False, 'unknown': False})
             n_strong += 1
@@ -303,7 +354,7 @@ def associate_cache(items, load_src_fn, force=False):
 
     save_cache_map(cmap)
     print(f"[icon_cache] associated: {n_strong} strong, {n_preset} preset, "
-          f"{n_unknown} unknown")
+          f"{n_unknown} unknown, {n_exact} exact")
     return cmap
 
 
@@ -319,9 +370,12 @@ def build_cache_templates(items, template_fn, tint_fn, load_src_fn, force=False)
     tint_fn(item)                     -> BGR tint tuple
     load_src_fn(item)                 -> (base_bgra, has_alpha)
 
-    Returns list of (footprint_wh, item_id, name, rotated, canon, mask), one
-    native plus (for non-square icons) two 90°-rotated variants per associated
-    cache icon.  `unknown` associations are skipped.
+    Returns list of (footprint_wh, item_id, name, rotated, canon, mask, exact),
+    one native plus (for non-square icons) two 90°-rotated variants per
+    associated cache icon.  `unknown` associations are skipped.  `exact` is
+    True when the association came from the validated exact-hash pipeline
+    (eft_hash.py) rather than NCC visual matching — app.py uses it to prefer
+    (and give extra trust to) these templates.
     """
     with _assoc_lock:
         cmap = associate_cache(items, load_src_fn, force=force)
@@ -343,6 +397,7 @@ def build_cache_templates(items, template_fn, tint_fn, load_src_fn, force=False)
             continue
         W, H = entry.get('W', 1), entry.get('H', 1)
         tint = tint_fn(item)
+        exact = bool(entry.get('exact'))
         name = item['name'] + (' (build)' if entry.get('preset') else '')
         variants = [((W, H), False, bgra)]
         if W != H:
@@ -353,5 +408,5 @@ def build_cache_templates(items, template_fn, tint_fn, load_src_fn, force=False)
             if made is None:
                 continue
             canon, mask = made
-            records.append(((fw, fh), item['id'], name, rotated, canon, mask))
+            records.append(((fw, fh), item['id'], name, rotated, canon, mask, exact))
     return records

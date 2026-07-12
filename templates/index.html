@@ -85,10 +85,45 @@
     justify-content: center;
     padding: 12px;
   }
+  #stash-image-wrap { position: relative; display: none; }
   #stash-image {
+    display: block;
     max-width: 100%;
     border: 1px solid #2a2a2a;
     cursor: crosshair;
+  }
+
+  /* ── Region chip ── */
+  .region-chip {
+    font-size: 11px;
+    padding: 3px 9px;
+    border-radius: 10px;
+    background: #131618;
+    border: 1px solid #2a2a2a;
+    color: #6a9a4a;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .region-chip.unset { color: #e0a030; background: #2a1e00; border-color: #5a3a00; }
+
+  /* ── Click-to-highlight ring ── */
+  #highlight-ring {
+    position: absolute;
+    display: none;
+    border: 3px solid #22e6ff;
+    border-radius: 3px;
+    pointer-events: none;
+    box-sizing: border-box;
+    animation-name: highlight-pulse;
+    animation-duration: .9s;
+    animation-timing-function: ease-out;
+    animation-iteration-count: 3;
+    animation-fill-mode: forwards;
+  }
+  @keyframes highlight-pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(34,230,255,.9); opacity: 1; }
+    70%  { box-shadow: 0 0 0 14px rgba(34,230,255,0); opacity: 1; }
+    100% { box-shadow: 0 0 0 14px rgba(34,230,255,0); opacity: 0; }
   }
   .no-screenshot {
     display: flex;
@@ -273,10 +308,25 @@
     font-size: 11px;
     color: #555;
     flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    overflow-x: auto;
     white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
+  .detection-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 9px;
+    border-radius: 10px;
+    background: #1a1e1f;
+    border: 1px solid #2a2a2a;
+    color: #9a9284;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background .1s, border-color .1s, color .1s;
+  }
+  .detection-chip:hover { background: #16262b; border-color: #4ad4f0; color: #c8c0b0; }
 
   /* ── Toast ── */
   #toast {
@@ -300,10 +350,6 @@
   .progress-label { font-size: 10px; color: #666; margin-bottom: 4px; display: flex; justify-content: space-between; }
   .progress-bar { height: 4px; background: #1e1e1e; border-radius: 2px; overflow: hidden; }
   .progress-fill { height: 100%; background: linear-gradient(90deg, #2a5a1e, #5aaa2a); border-radius: 2px; transition: width .4s; }
-
-  /* ── Stale wiki rows ── */
-  .item-row.stale { opacity: 0.4; }
-  .stale-badge { font-size: 9px; font-weight: 700; color: #888; background: #1e1e1e; border: 1px solid #3a3a3a; padding: 1px 5px; border-radius: 2px; flex-shrink: 0; letter-spacing: 0.5px; }
 
   /* ── Health banner ── */
   #health-banner {
@@ -361,6 +407,7 @@
     <option value="5">5</option>
     <option value="6">6</option>
   </select>
+  <button id="btn-new-prestige" title="Reset progress for a new prestige run">&#8634; New prestige</button>
   <div style="width:1px;height:20px;background:#2a2a2a;margin:0 8px"></div>
   <span id="hotkey-badge" style="font-size:11px;color:#555;background:#131618;border:1px solid #2a2a2a;padding:4px 10px;border-radius:3px">
     Hotkey: <span id="hotkey-label" style="color:#c4a040">…</span> — press in-game to scan
@@ -400,7 +447,8 @@
           <li>Press <b style="color:#c4a040" class="hotkey-mention">…</b> — the screenshot fires instantly while the game is still in the foreground. You can change the hotkey in <b>⚙ Settings</b>.</li>
           <li>Tab to this window — the scan result is already loaded.</li>
           <li>On this page: <b style="color:#8fcc5a">green highlight</b> = keep-list item you've already acquired,
-              <b style="color:#cc5a5a">red highlight</b> = keep-list item still needed.
+              <b style="color:#cc5a5a">red highlight</b> = keep-list item still needed,
+              <b style="color:#e8a33d">amber highlight (not FIR)</b> = a Kappa item found but not Found-in-Raid, so it can't be handed in yet.
               On the Sell Advisor: <b style="color:#4ad4f0">cyan = KEEP</b> (needed for kappa/tasks — don't sell), green = flea, gold = trader.</li>
           <li>If a scan finds keep-list items you haven't checked off, a cyan bar appears — click <b>Mark acquired</b> to check them all at once.</li>
           <li>Alternatively, click <b>Scan Stash</b> manually (will capture at 720p if game isn't focused).</li>
@@ -471,6 +519,7 @@
   <div class="screenshot-panel">
     <div class="screenshot-toolbar">
       <button id="btn-screenshot" class="primary">&#x1F4F7; Scan Stash</button>
+      <span id="region-chip" class="region-chip unset">Region: …</span>
       <span id="ocr-status">Click "Scan Stash" to analyse your stash</span>
     </div>
     <div class="screenshot-container" id="screenshot-container">
@@ -479,7 +528,10 @@
         <div>No scan yet</div>
         <div class="hint">1. Open your stash in Tarkov &nbsp;|&nbsp; 2. Set region (optional) &nbsp;|&nbsp; 3. Click Scan Stash</div>
       </div>
-      <img id="stash-image" style="display:none" alt="Stash scan">
+      <div id="stash-image-wrap">
+        <img id="stash-image" alt="Stash scan">
+        <div id="highlight-ring"></div>
+      </div>
     </div>
     <div id="confirm-bar">
       <span>Found on your list:</span>
@@ -604,7 +656,7 @@ function renderKeepList() {
 
     for (const item of items) {
       const row = document.createElement('div');
-      row.className = 'item-row' + (item.acquired ? ' acquired' : '') + (item.stale ? ' stale' : '');
+      row.className = 'item-row' + (item.acquired ? ' acquired' : '');
       row.dataset.id = item.id;
 
       const check = document.createElement('div');
@@ -613,8 +665,7 @@ function renderKeepList() {
 
       const info = document.createElement('div');
       info.className = 'item-info';
-      let metaText = item.task || '';
-      if (item.stale) metaText = (metaText ? metaText + ' · ' : '') + 'not on current wiki list';
+      const metaText = item.task || '';
       const meta = metaText ? `<div class="item-meta">${metaText}</div>` : '';
       info.innerHTML = `<div class="item-name">${item.name}</div>${meta}`;
 
@@ -797,6 +848,27 @@ document.getElementById('btn-screenshot').addEventListener('click', async () => 
 });
 
 // ---------------------------------------------------------------------------
+// Region chip — persistent "Region: WxH" / "No region set" indicator
+// ---------------------------------------------------------------------------
+function updateRegionChip(settings) {
+  const chip = document.getElementById('region-chip');
+  if (settings && settings.region) {
+    chip.textContent = `Region: ${settings.region.w}×${settings.region.h}`;
+    chip.classList.remove('unset');
+  } else {
+    chip.textContent = 'No region set';
+    chip.classList.add('unset');
+  }
+}
+
+async function initRegionChip() {
+  try {
+    const settings = await api('GET', '/api/settings');
+    updateRegionChip(settings);
+  } catch (_) {}
+}
+
+// ---------------------------------------------------------------------------
 // Region calibration — screenshot-based
 // ---------------------------------------------------------------------------
 const calModal     = document.getElementById('cal-modal');
@@ -877,7 +949,23 @@ calContainer.addEventListener('mouseup', async e => {
   const settings = await api('GET', '/api/settings');
   settings.region = region;
   await api('POST', '/api/settings', settings);
-  toast(`Region set: ${region.w}×${region.h} at (${region.x}, ${region.y})`);
+  updateRegionChip(settings);
+  toast('Region saved — scanning calibration frame…');
+
+  // Instant proof the region works: re-use the full-screen frame the
+  // calibration modal just grabbed (cropped server-side to the new region)
+  // instead of live-grabbing, which would capture this window on top.
+  try {
+    const res = await api('POST', '/api/screenshot', { from_calibration: true });
+    if (res.error) {
+      toast('✗ Calibration scan failed: ' + res.error, 4000);
+    } else if (res.image) {
+      applyScanResult({ ...res, ts: lastScanTs });
+      showScanWarnings(res);
+    }
+  } catch (e) {
+    toast('✗ Calibration scan failed: ' + e.message, 4000);
+  }
 });
 
 document.addEventListener('keydown', e => {
@@ -913,24 +1001,85 @@ document.getElementById('prestige-select').addEventListener('change', async e =>
   renderKeepList();
 });
 
+document.getElementById('btn-new-prestige').addEventListener('click', async () => {
+  const ok = confirm(
+    'Start a new prestige?\n\n' +
+    'This resets ALL task and hideout progress and un-checks every keep-list ' +
+    'item (Kappa + manual).\n\n' +
+    'Your region, hotkey, grid calibration, and other settings are kept.\n\n' +
+    'This cannot be undone.'
+  );
+  if (!ok) return;
+  const btn = document.getElementById('btn-new-prestige');
+  btn.disabled = true;
+  try {
+    const res = await api('POST', '/api/prestige/advance');
+    currentPrestige = res.prestige;
+    document.getElementById('prestige-select').value = currentPrestige;
+    await loadKeepList();
+    toast(`✓ New prestige — now at ${currentPrestige}`);
+  } catch (e) {
+    toast('✗ Failed to start new prestige: ' + e.message, 4500);
+  }
+  btn.disabled = false;
+});
+
 // ---------------------------------------------------------------------------
 // Hotkey polling — check for scans triggered while Tarkov was focused
 // ---------------------------------------------------------------------------
 let lastScanTs = 0;
 
+// ---------------------------------------------------------------------------
+// Click-to-highlight — scale an image-native pixel rect onto the rendered
+// <img> (which may be shrunk to fit the panel) and pulse a ring over it.
+// ---------------------------------------------------------------------------
+function highlightCell(px, py, pw, ph) {
+  const img = document.getElementById('stash-image');
+  const ring = document.getElementById('highlight-ring');
+  if (!img || !img.naturalWidth) return;
+  const scale = img.clientWidth / img.naturalWidth;
+  ring.style.left   = (px * scale) + 'px';
+  ring.style.top    = (py * scale) + 'px';
+  ring.style.width  = (pw * scale) + 'px';
+  ring.style.height = (ph * scale) + 'px';
+  // Restart the pulse animation even if the same cell is clicked twice.
+  ring.style.display = 'none';
+  ring.style.animation = 'none';
+  void ring.offsetWidth;   // force reflow
+  ring.style.display = 'block';
+  ring.style.animation = '';
+  img.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function renderDetectionsBar(detections) {
+  const bar = document.getElementById('detections-bar');
+  bar.innerHTML = '';
+  if (!detections.length) {
+    bar.textContent = 'No keep-list items detected. Try adjusting the stash region.';
+    return;
+  }
+  for (const d of detections) {
+    const chip = document.createElement('span');
+    chip.className = 'detection-chip';
+    chip.textContent = `${d.matched}${d.not_fir ? ' (not FIR)' : ''} (${d.score}%)`;
+    if (d.x != null && d.y != null && d.w != null && d.h != null) {
+      chip.title = 'Click to highlight in the scan image';
+      chip.addEventListener('click', () => highlightCell(d.x, d.y, d.w, d.h));
+    }
+    bar.appendChild(chip);
+  }
+}
+
 function applyScanResult(res) {
   document.getElementById('no-screenshot').style.display = 'none';
+  document.getElementById('stash-image-wrap').style.display = 'inline-block';
   const img = document.getElementById('stash-image');
-  img.style.display = 'block';
   img.src = 'data:image/png;base64,' + res.image;
   const acquired = res.detections.filter(d => d.acquired).length;
   const needed = res.detections.filter(d => !d.acquired).length;
   document.getElementById('ocr-status').textContent =
     `Found ${res.detections.length} list items — ${acquired} acquired (green), ${needed} needed (red)`;
-  document.getElementById('detections-bar').textContent =
-    res.detections.length
-      ? res.detections.map(d => `${d.matched} (${d.score}%)`).join('  ·  ')
-      : 'No keep-list items detected. Try adjusting the stash region.';
+  renderDetectionsBar(res.detections);
   showConfirmBar(res.checklist_matches);
   if (res.ts) lastScanTs = res.ts;
 }
@@ -985,7 +1134,7 @@ document.getElementById('btn-sync-wiki').addEventListener('click', async () => {
       await loadKeepList();
       const bits = [];
       if (res.added.length) bits.push(`${res.added.length} added`);
-      if (res.stale.length) bits.push(`${res.stale.length} no longer listed`);
+      if (res.removed.length) bits.push(`${res.removed.length} removed — no longer on wiki`);
       toast(`✓ Kappa list synced${bits.length ? ' — ' + bits.join(', ') : ' — up to date'}`);
     } else {
       toast('✗ Wiki sync failed: ' + (res.error || 'unknown error'), 4500);
@@ -1116,6 +1265,7 @@ async function initSettings() {
 loadKeepList();
 initPrestige();
 initSettings();
+initRegionChip();
 checkHealth();
 pollHotkey();
 </script>
