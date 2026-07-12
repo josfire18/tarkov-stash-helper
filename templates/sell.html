@@ -115,12 +115,46 @@
     justify-content: center;
     padding: 12px;
   }
-  #stash-image { max-width: 100%; border: 1px solid #2a2a2a; display: none; }
+  #stash-image-wrap { position: relative; display: none; }
+  #stash-image { display: block; max-width: 100%; border: 1px solid #2a2a2a; }
   .no-scan {
     display: flex; flex-direction: column; align-items: center;
     justify-content: center; height: 100%; gap: 12px; color: #444;
   }
   .no-scan .hint { font-size: 12px; color: #333; }
+
+  /* ── Region chip ── */
+  .region-chip {
+    font-size: 11px;
+    padding: 3px 9px;
+    border-radius: 10px;
+    background: #131618;
+    border: 1px solid #2a2a2a;
+    color: #6a9a4a;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .region-chip.unset { color: #e0a030; background: #2a1e00; border-color: #5a3a00; }
+
+  /* ── Click-to-highlight ring ── */
+  #highlight-ring {
+    position: absolute;
+    display: none;
+    border: 3px solid #22e6ff;
+    border-radius: 3px;
+    pointer-events: none;
+    box-sizing: border-box;
+    animation-name: highlight-pulse;
+    animation-duration: .9s;
+    animation-timing-function: ease-out;
+    animation-iteration-count: 3;
+    animation-fill-mode: forwards;
+  }
+  @keyframes highlight-pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(34,230,255,.9); opacity: 1; }
+    70%  { box-shadow: 0 0 0 14px rgba(34,230,255,0); opacity: 1; }
+    100% { box-shadow: 0 0 0 14px rgba(34,230,255,0); opacity: 0; }
+  }
 
   /* ── Results panel ── */
   .results-panel {
@@ -172,6 +206,7 @@
     transition: background .1s;
   }
   .result-row:hover { background: #131618; }
+  .result-row.clickable { cursor: pointer; }
 
   .item-num {
     font-size: 11px;
@@ -219,6 +254,7 @@
   .price-fee       { color: #666; font-size: 10px; }
   .trader-name     { color: #c4a040; }
   .reason          { font-size: 10px; color: #4a4a4a; margin-top: 2px; }
+  .fir-warn        { color: #e8a33d; font-weight: 600; }
 
   /* ── Summary bar ── */
   .summary-bar {
@@ -325,6 +361,7 @@
   <div class="screenshot-panel">
     <div class="screenshot-toolbar">
       <button id="btn-scan" class="primary" disabled title="Set stash region first">&#x1F4F7; Scan Stash</button>
+      <span id="region-chip" class="region-chip unset">Region: …</span>
       <span id="scan-status" title="The scan hotkey works globally (even with the game focused). The stash region is captured from its saved position — no need to alt-tab.">Ready — click Scan Stash or press the scan hotkey</span>
     </div>
     <div class="screenshot-container">
@@ -333,7 +370,10 @@
         <div>No scan yet</div>
         <div class="hint">Green = sell on flea &nbsp;|&nbsp; Gold = sell to trader &nbsp;|&nbsp; <span style="color:#4ad4f0">Cyan = KEEP — needed for tasks/kappa, do not sell</span></div>
       </div>
-      <img id="stash-image" alt="Stash scan">
+      <div id="stash-image-wrap">
+        <img id="stash-image" alt="Stash scan">
+        <div id="highlight-ring"></div>
+      </div>
     </div>
   </div>
 
@@ -367,6 +407,20 @@ let allResults = [];
 let filterText  = '';
 let regionSet   = false;
 let indexReady  = false;
+let lastGrid    = null;   // grid from the most recent /api/sell-scan response
+
+// Per-trader accent colours — must match app.py's TRADER_COLORS_RGB so the
+// annotated screenshot's badge colours and this panel's section/row tints agree.
+const TRADER_COLORS = {
+  'Prapor':      'rgb(204, 80, 40)',
+  'Therapist':   'rgb(0, 150, 136)',
+  'Skier':       'rgb(66, 133, 244)',
+  'Peacekeeper': 'rgb(94, 92, 230)',
+  'Mechanic':    'rgb(154, 205, 50)',
+  'Ragman':      'rgb(216, 27, 96)',
+  'Jaeger':      'rgb(34, 139, 34)',
+};
+const DEFAULT_TRADER_COLOR = 'rgb(180, 120, 20)';
 
 // ---------------------------------------------------------------------------
 // API
@@ -512,11 +566,23 @@ updateModelStatus();
 // ---------------------------------------------------------------------------
 let _currentSettings = {};
 
+function updateRegionChip(settings) {
+  const chip = document.getElementById('region-chip');
+  if (settings && settings.region) {
+    chip.textContent = `Region: ${settings.region.w}×${settings.region.h}`;
+    chip.classList.remove('unset');
+  } else {
+    chip.textContent = 'No region set';
+    chip.classList.add('unset');
+  }
+}
+
 async function loadRegionState() {
   try {
     _currentSettings = await api('GET', '/api/settings');
     hotkeyCombo = parseHotkey(_currentSettings.hotkey);
     regionSet = !!_currentSettings.region;
+    updateRegionChip(_currentSettings);
     const banner = document.getElementById('region-banner');
     if (regionSet) {
       banner.classList.remove('show');
@@ -525,6 +591,27 @@ async function loadRegionState() {
     }
     updateScanButton();
   } catch(e) {}
+}
+
+// ---------------------------------------------------------------------------
+// Click-to-highlight — scale an image-native pixel rect onto the rendered
+// <img> (which may be shrunk to fit the panel) and pulse a ring over it.
+// ---------------------------------------------------------------------------
+function highlightCell(px, py, pw, ph) {
+  const img = document.getElementById('stash-image');
+  const ring = document.getElementById('highlight-ring');
+  if (!img || !img.naturalWidth) return;
+  const scale = img.clientWidth / img.naturalWidth;
+  ring.style.left   = (px * scale) + 'px';
+  ring.style.top    = (py * scale) + 'px';
+  ring.style.width  = (pw * scale) + 'px';
+  ring.style.height = (ph * scale) + 'px';
+  ring.style.display = 'none';
+  ring.style.animation = 'none';
+  void ring.offsetWidth;   // force reflow so the pulse restarts
+  ring.style.display = 'block';
+  ring.style.animation = '';
+  img.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
 function startRegionSelection() {
@@ -625,10 +712,28 @@ async function captureAndShowRegion(canvas, countdown, hint) {
         await api('POST', '/api/settings', { ..._currentSettings, region });
         _currentSettings.region = region;
         document.getElementById('region-modal').classList.remove('show');
-        toast(`✓ Region saved: ${region.w}×${region.h} at (${region.x}, ${region.y})`);
         regionSet = true;
         document.getElementById('region-banner').classList.remove('show');
+        updateRegionChip(_currentSettings);
         updateScanButton();
+
+        if (!indexReady) {
+          toast('✓ Region saved — build the Icon DB to run a scan.', 3500);
+          return;
+        }
+
+        toast('Region saved — scanning calibration frame…');
+        // Instant proof the region works: re-use the full-screen frame the
+        // calibration modal just grabbed (cropped server-side to the new
+        // region) instead of live-grabbing, which would capture this window
+        // on top of the game.
+        try {
+          const scanRes = await api('POST', '/api/sell-scan', { from_calibration: true });
+          applyScan(scanRes);
+          if (scanRes.warnings && scanRes.warnings.length) toast('⚠ ' + scanRes.warnings[0], 4000);
+        } catch (e) {
+          document.getElementById('scan-status').textContent = 'Error: ' + e.message;
+        }
       };
     };
     img.src = 'data:image/jpeg;base64,' + res.image;
@@ -675,6 +780,75 @@ document.getElementById('region-modal-close').addEventListener('click', () => {
 // ---------------------------------------------------------------------------
 // Render results
 // ---------------------------------------------------------------------------
+function buildResultRow(r) {
+  const row = document.createElement('div');
+  row.className = 'result-row';
+
+  let badgeClass, badgeText, priceLine;
+  if (r.recommend === 'keep') {
+    badgeClass = 'rec-keep'; badgeText = 'KEEP';
+    priceLine  = `<span style="color:#3a9ab4">${r.reason || 'On keep list'} — do not sell</span>`;
+  } else if (r.recommend === 'flea') {
+    badgeClass = 'rec-flea'; badgeText = 'FLEA';
+    priceLine  = `
+      List at <span class="price-highlight">${fmt(r.flea_list)}</span>
+      <span class="price-fee">(net ~${fmt(r.flea_net)} after fees)</span>
+      &nbsp;·&nbsp; Trader: ${fmt(r.trader_price)} via <span class="trader-name">${r.trader_name || '—'}</span>`;
+  } else {
+    badgeClass = 'rec-trader'; badgeText = 'TRADER';
+    priceLine  = `
+      Sell to <span class="trader-name">${r.trader_name || '—'}</span>
+      for <span class="price-highlight">${fmt(r.trader_price)}</span>
+      ${r.flea_list ? `&nbsp;·&nbsp; Flea: ${fmt(r.flea_list)}` : ''}`;
+  }
+
+  // A KEEP row should never carry non_fir_note any more (the backend falls
+  // it through to a normal sell rec instead) — this only ever fires on a
+  // trader/flea row for an item that was Kappa/aggregate FIR-protected.
+  const firHint = r.non_fir_note
+    ? `<span class="fir-warn">⚠ not FIR — can't be handed in</span>`
+    : '';
+
+  const numClass = r.recommend === 'keep' ? 'keep' : r.recommend;
+  row.innerHTML = `
+    <div class="item-num ${numClass}">${r.num}</div>
+    <div>
+      <div class="item-name">${r.matched_name}</div>
+      <div class="match-text">${r.score}% match</div>
+    </div>
+    <div class="rec-badge ${badgeClass}">${badgeText}</div>
+    <div></div>
+    <div class="price-line" style="grid-column:2/4">${priceLine}</div>
+    <div class="reason">${firHint} ${r.reason || ''}</div>`;
+
+  // Tint the item-num chip and rec-badge with the trader's accent colour so
+  // the panel visually batches by trader the same way the annotated
+  // screenshot's badge colours do.
+  if (r.recommend === 'trader') {
+    const color = TRADER_COLORS[r.trader_name] || DEFAULT_TRADER_COLOR;
+    row.querySelector('.item-num').style.background = color;
+    const badgeEl = row.querySelector('.rec-badge');
+    badgeEl.style.borderColor = color;
+    badgeEl.style.color = color;
+  }
+
+  // Click-to-highlight: jump to this item's cell in the annotated image.
+  if (r.col != null && r.row != null && r.W != null && r.H != null) {
+    row.classList.add('clickable');
+    row.title = 'Click to highlight in the scan image';
+    row.addEventListener('click', () => {
+      if (!lastGrid) return;
+      const px = lastGrid.origin_x + r.col * lastGrid.cell_w;
+      const py = lastGrid.origin_y + r.row * lastGrid.cell_h;
+      const pw = r.W * lastGrid.cell_w;
+      const ph = r.H * lastGrid.cell_h;
+      highlightCell(px, py, pw, ph);
+    });
+  }
+
+  return row;
+}
+
 function renderResults(results) {
   const scroll = document.getElementById('results-scroll');
   const q = filterText.toLowerCase();
@@ -692,76 +866,72 @@ function renderResults(results) {
     return;
   }
 
-  // Group: TRADER section first, then FLEA, then KEEP — each sorted by the
-  // money you'd actually get (trader_price / flea_net), descending.
-  const grp = r => r.recommend === 'trader' ? 0 : r.recommend === 'flea' ? 1 : 2;
-  const val = r => r.recommend === 'flea' ? (r.flea_net || 0) : (r.trader_price || 0);
-  filtered.sort((a, b) => (grp(a) - grp(b)) || (val(b) - val(a)));
-
-  scroll.innerHTML = '';
-  let fleaCount = 0, traderCount = 0, keepCount = 0;
-  let lastGroup = null;
-  const groupLabel = { 0: 'SELL TO TRADER', 1: 'SELL ON FLEA', 2: 'KEEP' };
-
+  // Bucket into per-trader groups, a flea group, and a keep group.
+  const traderGroups = new Map();   // trader name -> items[]
+  const fleaItems = [];
+  const keepItems = [];
   for (const r of filtered) {
-    if (r.recommend === 'flea') fleaCount++;
-    else if (r.recommend === 'keep') keepCount++;
-    else traderCount++;
-
-    // Section divider whenever the recommendation group changes.
-    const g = grp(r);
-    if (g !== lastGroup) {
-      lastGroup = g;
-      const hdr = document.createElement('div');
-      hdr.className = 'section-header';
-      hdr.textContent = groupLabel[g];
-      scroll.appendChild(hdr);
-    }
-
-    const row = document.createElement('div');
-    row.className = 'result-row';
-
-    let badgeClass, badgeText, priceLine;
-    if (r.recommend === 'keep') {
-      badgeClass = 'rec-keep'; badgeText = 'KEEP';
-      priceLine  = `<span style="color:#3a9ab4">${r.reason || 'On keep list'} — do not sell</span>`;
+    if (r.recommend === 'trader') {
+      const key = r.trader_name || 'Unknown trader';
+      if (!traderGroups.has(key)) traderGroups.set(key, []);
+      traderGroups.get(key).push(r);
     } else if (r.recommend === 'flea') {
-      badgeClass = 'rec-flea'; badgeText = 'FLEA';
-      priceLine  = `
-        List at <span class="price-highlight">${fmt(r.flea_list)}</span>
-        <span class="price-fee">(net ~${fmt(r.flea_net)} after fees)</span>
-        &nbsp;·&nbsp; Trader: ${fmt(r.trader_price)} via <span class="trader-name">${r.trader_name || '—'}</span>`;
+      fleaItems.push(r);
     } else {
-      badgeClass = 'rec-trader'; badgeText = 'TRADER';
-      priceLine  = `
-        Sell to <span class="trader-name">${r.trader_name || '—'}</span>
-        for <span class="price-highlight">${fmt(r.trader_price)}</span>
-        ${r.flea_list ? `&nbsp;·&nbsp; Flea: ${fmt(r.flea_list)}` : ''}`;
+      keepItems.push(r);
     }
-
-    const numClass = r.recommend === 'keep' ? 'keep' : r.recommend;
-    row.innerHTML = `
-      <div class="item-num ${numClass}">${r.num}</div>
-      <div>
-        <div class="item-name">${r.matched_name}</div>
-        <div class="match-text">${r.score}% match</div>
-      </div>
-      <div class="rec-badge ${badgeClass}">${badgeText}</div>
-      <div></div>
-      <div class="price-line" style="grid-column:2/4">${priceLine}</div>
-      <div class="reason">${r.reason || ''}</div>`;
-
-    scroll.appendChild(row);
   }
 
+  // Trader sections ordered by each group's total trader value, descending;
+  // rows within a section ordered by trader_price, descending.
+  const traderSections = [...traderGroups.entries()]
+    .map(([name, items]) => {
+      items.sort((a, b) => (b.trader_price || 0) - (a.trader_price || 0));
+      const total = items.reduce((s, r) => s + (r.trader_price || 0), 0);
+      return { name, items, total };
+    })
+    .sort((a, b) => b.total - a.total);
+
+  fleaItems.sort((a, b) => (b.flea_net || 0) - (a.flea_net || 0));
+
+  scroll.innerHTML = '';
+
+  for (const sec of traderSections) {
+    const color = TRADER_COLORS[sec.name] || DEFAULT_TRADER_COLOR;
+    const hdr = document.createElement('div');
+    hdr.className = 'section-header';
+    hdr.style.color = color;
+    hdr.textContent = `SELL TO ${sec.name.toUpperCase()}`;
+    scroll.appendChild(hdr);
+    for (const r of sec.items) scroll.appendChild(buildResultRow(r));
+  }
+
+  if (fleaItems.length) {
+    const hdr = document.createElement('div');
+    hdr.className = 'section-header';
+    hdr.textContent = 'SELL ON FLEA';
+    scroll.appendChild(hdr);
+    for (const r of fleaItems) scroll.appendChild(buildResultRow(r));
+  }
+
+  if (keepItems.length) {
+    const hdr = document.createElement('div');
+    hdr.className = 'section-header';
+    hdr.textContent = 'KEEP';
+    scroll.appendChild(hdr);
+    for (const r of keepItems) scroll.appendChild(buildResultRow(r));
+  }
+
+  const traderCount = filtered.length - fleaItems.length - keepItems.length;
   document.getElementById('result-count').textContent = `${filtered.length} items`;
   const summary = document.getElementById('summary-bar');
-  summary.innerHTML = `
-    <span class="s-flea">&#x25CF; ${fleaCount} flea</span>
-    <span class="s-trader">&#x25CF; ${traderCount} trader</span>
-    ${keepCount ? `<span style="color:#666">&#x25CF; ${keepCount} keep</span>` : ''}
-    <span style="color:#444">|</span>
-    <span>${fleaCount + traderCount} sellable</span>`;
+  const bits = traderSections.map(s =>
+    `<span style="color:${TRADER_COLORS[s.name] || DEFAULT_TRADER_COLOR}">&#x25CF; ${s.name} &times;${s.items.length}</span>`);
+  if (fleaItems.length) bits.push(`<span class="s-flea">&#x25CF; ${fleaItems.length} flea</span>`);
+  if (keepItems.length) bits.push(`<span style="color:#666">&#x25CF; ${keepItems.length} keep</span>`);
+  bits.push(`<span style="color:#444">|</span>`);
+  bits.push(`<span>${fleaItems.length + traderCount} sellable</span>`);
+  summary.innerHTML = bits.join('');
 }
 
 // ---------------------------------------------------------------------------
@@ -774,9 +944,10 @@ function applyScan(res) {
     return;
   }
   document.getElementById('no-scan').style.display = 'none';
+  document.getElementById('stash-image-wrap').style.display = 'inline-block';
   const img = document.getElementById('stash-image');
-  img.style.display = 'block';
   img.src = 'data:image/png;base64,' + res.image;
+  lastGrid = res.grid || null;
   allResults = res.results || [];
   renderResults(allResults);
   const sellCount = allResults.filter(r => r.recommend !== 'keep').length;

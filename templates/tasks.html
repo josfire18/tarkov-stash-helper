@@ -169,6 +169,19 @@
   #toast.show { opacity: 1; }
 
   .empty-note { padding: 40px; text-align: center; color: #333; }
+
+  /* ── Non-kappa task dimming (κ-required only filter) ── */
+  .task-row.non-kappa { opacity: 0.4; }
+
+  /* ── Prestige requirements card ── */
+  .prestige-card { flex-shrink: 0; border-bottom: 1px solid #1e1e1e; }
+  .prestige-row {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+    padding: 5px 12px; font-size: 11px; color: #b0a898;
+    border-bottom: 1px solid #141618;
+  }
+  .prestige-row .prestige-label { color: #8a8070; flex-shrink: 0; }
+  .prestige-row .prestige-value { text-align: right; }
 </style>
 </head>
 <body>
@@ -197,6 +210,15 @@
         <input type="checkbox" id="hide-done" style="flex:none;width:auto" checked> hide complete
       </label>
     </div>
+    <div class="prestige-card" id="prestige-card">
+      <div class="section-header" id="prestige-header">
+        <span id="prestige-title">Prestige requirements</span>
+        <span class="counts">▾</span>
+      </div>
+      <div class="section-body" id="prestige-body">
+        <div class="empty-note">Loading…</div>
+      </div>
+    </div>
     <div class="panel-scroll" id="agg-scroll">
       <div class="empty-note">Loading…</div>
     </div>
@@ -207,6 +229,9 @@
     <div class="panel-toolbar">
       <span class="panel-title">Tasks &amp; Hideout</span>
       <input type="text" id="task-search" placeholder="Filter tasks/stations…">
+      <label style="font-size:11px;color:#666;display:flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap">
+        <input type="checkbox" id="kappa-only" style="flex:none;width:auto" checked> &kappa;-required only
+      </label>
       <label style="font-size:11px;color:#666;display:flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap">
         <input type="checkbox" id="hide-completed-tasks" style="flex:none;width:auto"> hide done
       </label>
@@ -225,6 +250,8 @@ let filterText = '';
 let taskFilter = '';
 let hideDone = true;
 let hideCompletedTasks = false;
+let kappaOnly = true;             // mirrors settings.kappa_only_tasks
+let prestigeData = null;          // /api/prestige response
 const expanded = new Set();       // item_ids with the sources list open
 const collapsedSections = new Set();
 
@@ -250,7 +277,7 @@ function toast(msg, duration = 2200) {
 // ---------------------------------------------------------------------------
 async function loadView() {
   try {
-    const res = await api('GET', '/api/tasks');
+    const res = await api('GET', `/api/tasks?kappa_only=${kappaOnly ? 1 : 0}`);
     if (res.error) {
       document.getElementById('agg-scroll').innerHTML =
         `<div class="empty-note">Could not load task data:<br>${res.error}</div>`;
@@ -389,7 +416,8 @@ function renderTasks() {
     tasksBody.appendChild(th);
     for (const t of byTrader[trader].sort((a, b) => a.minPlayerLevel - b.minPlayerLevel)) {
       const row = document.createElement('div');
-      row.className = 'task-row' + (t.completed ? ' completed' : '');
+      row.className = 'task-row' + (t.completed ? ' completed' : '')
+        + (kappaOnly && !t.kappaRequired ? ' non-kappa' : '');
       const check = document.createElement('div');
       check.className = 'task-check' + (t.completed ? ' checked' : '');
       check.title = t.completed ? 'Mark not completed' : 'Mark completed';
@@ -463,6 +491,67 @@ function renderTasks() {
   scroll.appendChild(hideoutBody);
 }
 
+// ---------------------------------------------------------------------------
+// Prestige requirements card
+// ---------------------------------------------------------------------------
+async function loadPrestige() {
+  try {
+    prestigeData = await api('GET', '/api/prestige');
+    renderPrestige();
+  } catch(e) {
+    document.getElementById('prestige-body').innerHTML =
+      `<div class="empty-note">Could not load prestige data: ${e.message}</div>`;
+  }
+}
+
+function renderPrestige() {
+  const title = document.getElementById('prestige-title');
+  const body = document.getElementById('prestige-body');
+  body.classList.toggle('collapsed', collapsedSections.has('prestige'));
+  if (!prestigeData) return;
+
+  const current = prestigeData.current ?? 0;
+
+  if (!prestigeData.levels || !prestigeData.levels.length) {
+    title.textContent = 'Prestige requirements';
+    body.innerHTML = `<div class="empty-note">Could not load prestige data` +
+      (prestigeData.error ? `: ${prestigeData.error}` : '') + `</div>`;
+    return;
+  }
+
+  if (current >= 6) {
+    title.textContent = 'Prestige — Max';
+    body.innerHTML = '<div class="empty-note">Max prestige.</div>';
+    return;
+  }
+
+  const next = current + 1;
+  const row = prestigeData.levels.find(l => l.level === next);
+  title.textContent = `Prestige ${next} requirements`;
+  if (!row) {
+    body.innerHTML = '<div class="empty-note">No data for this level.</div>';
+    return;
+  }
+  const fields = [
+    ['PMC level', row.pmc_level],
+    ['Quests completed', row.quests],
+    ['Skills', row.skills],
+    ['Hideout upgrades', row.hideout],
+    ['Items (incl. roubles)', row.items],
+  ];
+  body.innerHTML = fields.map(([label, value]) => `
+    <div class="prestige-row">
+      <span class="prestige-label">${label}</span>
+      <span class="prestige-value">${value || '—'}</span>
+    </div>`).join('');
+}
+
+document.getElementById('prestige-header').addEventListener('click', () => {
+  if (collapsedSections.has('prestige')) collapsedSections.delete('prestige');
+  else collapsedSections.add('prestige');
+  renderPrestige();
+});
+
 async function completeToggle(type, id, done, label) {
   const res = await api('POST', '/api/tasks/complete', { type, id, done });
   if (res.ok) {
@@ -492,6 +581,13 @@ document.getElementById('hide-completed-tasks').addEventListener('change', e => 
   hideCompletedTasks = e.target.checked;
   renderTasks();
 });
+document.getElementById('kappa-only').addEventListener('change', async e => {
+  kappaOnly = e.target.checked;
+  const settings = await api('GET', '/api/settings');
+  settings.kappa_only_tasks = kappaOnly;
+  await api('POST', '/api/settings', settings);
+  await loadView();
+});
 document.getElementById('btn-refresh').addEventListener('click', async () => {
   const btn = document.getElementById('btn-refresh');
   btn.disabled = true; btn.textContent = 'Refreshing…';
@@ -508,7 +604,16 @@ document.getElementById('btn-refresh').addEventListener('click', async () => {
 });
 
 // ---------------------------------------------------------------------------
-loadView();
+async function init() {
+  try {
+    const settings = await api('GET', '/api/settings');
+    kappaOnly = settings.kappa_only_tasks ?? true;
+    document.getElementById('kappa-only').checked = kappaOnly;
+  } catch (_) {}
+  await loadView();
+  loadPrestige();
+}
+init();
 </script>
 </body>
 </html>

@@ -9,6 +9,7 @@ import time
 from io import BytesIO
 
 import math
+import re
 import requests as http_requests
 
 from flask import Flask, jsonify, request, render_template
@@ -42,6 +43,7 @@ SETTINGS_PATH  = os.path.join(DATA, 'settings.json')
 KEEPLIST_PATH  = os.path.join(DATA, 'keep_list.json')
 PRICES_PATH    = os.path.join(DATA, 'prices_cache.json')
 KAPPA_WIKI_PATH  = os.path.join(DATA, 'kappa_wiki.json')   # cached Collector item names from the wiki
+PRESTIGE_WIKI_PATH = os.path.join(DATA, 'prestige_wiki.json')  # cached Prestige requirements from the wiki
 TASKS_CACHE_PATH = os.path.join(DATA, 'tasks_cache.json')  # cached tasks + hideout requirements (tarkov.dev)
 PROGRESS_PATH    = os.path.join(DATA, 'progress.json')     # user task/hideout completion + have-counts
 ICONS_DIR      = os.path.join(DATA, 'icons')          # legacy 64×64 iconLink thumbnails (UI only)
@@ -63,6 +65,7 @@ OCR_THRESHOLD        = 65    # fuzzy match score cutoff
 OCR_SCALE            = 2     # scale factor applied to image before OCR (larger = better accuracy)
 PRICE_CACHE_TTL      = 1800  # seconds (30 min)
 KAPPA_WIKI_TTL       = 86400 # seconds (24 h) — Collector list changes rarely
+PRESTIGE_WIKI_TTL    = 7 * 86400 # seconds (7 d) — Prestige requirements change only per major patch
 TASKS_CACHE_TTL      = 86400 # seconds (24 h) — task/hideout requirements change per patch
 FLEA_MIN_PROFIT      = 10000 # recommend flea only if net > trader by this much
 TARKOV_API           = 'https://api.tarkov.dev/graphql'
@@ -72,14 +75,21 @@ TARKOV_API           = 'https://api.tarkov.dev/graphql'
 # fetch through it, never the page URL.
 COLLECTOR_WIKI_API   = ('https://escapefromtarkov.fandom.com/api.php'
                         '?action=parse&page=Collector&prop=text&format=json&formatversion=2')
+# Same Cloudflare-avoidance pattern as COLLECTOR_WIKI_API — the Prestige page
+# must be fetched through the MediaWiki API too, never the plain page URL.
+PRESTIGE_WIKI_API    = ('https://escapefromtarkov.fandom.com/api.php'
+                        '?action=parse&page=Prestige&prop=text&format=json&formatversion=2')
 ICON_MATCH_THRESHOLD = 0.68  # cv2.TM_CCOEFF_NORMED score cutoff for icon matching
 CANONICAL_PER_SLOT   = 64    # px per 1×1 slot in the canonical-size template
 ICON_MATCH_MIN_SCORE = 0.40  # NCC threshold to accept an icon match
 LABEL_BLANK_PX       = 13    # top rows of each cell to overwrite with bg colour (removes item-name label)
 CORNER_BLANK_PX      = 18    # top-right (FiR ✓) and bottom-right (stack count) corner blanking
+FIR_BRIGHT           = 170   # grayscale floor for a pixel to count as part of the FiR ✓ mark
+FIR_MIN_PX           = 6     # below this many bright px, too little signal to call it FiR (indeterminate)
+FIR_MAX_FRAC         = 0.5   # above this fraction of the corner window lit up, probably not a clean ✓ (indeterminate)
 NCC_MARGIN_MIN       = 0.04  # require top-1 NCC to beat top-2 by this much (rejects ambiguous matches)
 ICON_DB_PATH         = os.path.join(DATA, 'icon_db.npz')
-DB_VERSION           = 5     # bump whenever the vector format changes; forces a rebuild
+DB_VERSION           = 6     # bump whenever the vector format changes; forces a rebuild
 _STASH_BG_BGR        = (38, 42, 44)  # Tarkov stash cell background colour (BGR) — used for blanked (masked-out) regions
 GRID_PITCH_1080P     = 63    # px per slot in-game @ 1080p (NOT 64 — verified from the icon cache geometry)
 
@@ -99,6 +109,22 @@ EFT_BG_TINTS = {
     'red':     (29, 32, 49),
 }
 DEFAULT_TINT = (54, 54, 53)
+
+# Per-trader badge colours (RGB — PIL's ImageDraw, unlike the OpenCV/BGR
+# pipeline above, takes RGB(A) tuples) so the sell-scan screenshot's numbered
+# badges visually batch by trader instead of all sharing one gold colour.
+# Picked to stay distinct from the flea badge (30,150,30 green) and the KEEP
+# badge (0,140,180 cyan) used elsewhere in draw_badge calls in this module.
+TRADER_COLORS_RGB = {
+    'Prapor':      (204, 80, 40),    # orange-red
+    'Therapist':   (0, 150, 136),    # teal
+    'Skier':       (66, 133, 244),   # blue
+    'Peacekeeper': (94, 92, 230),    # indigo
+    'Mechanic':    (154, 205, 50),   # yellow-green
+    'Ragman':      (216, 27, 96),    # magenta
+    'Jaeger':      (34, 139, 34),    # forest green
+}
+DEFAULT_TRADER_BADGE_RGB = (180, 120, 20)  # fallback (e.g. Fence) — the old uniform trader-gold
 
 # The scanner only cares about items / parts / components — NOT ammo, full
 # weapons, weapon presets, or storage containers.  Templates for these tarkov.dev
@@ -147,6 +173,16 @@ _scan_lock = threading.Lock()
 
 # Live progress of the currently running scan, polled by the frontend.
 _scan_state = {'running': False, 'phase': None, 'done': 0, 'total': 0, 'ts': 0}
+
+# The region-picker modal (on both pages) already grabs a full-monitor frame
+# via /api/calibration-screenshot to show the user something to drag a
+# rectangle over. Stashing that same frame here lets a scan triggered right
+# after a region save reuse it instead of live-grabbing — a live re-grab at
+# that moment would capture the helper's own window sitting on top of the
+# game. Only used when the caller opts in (from_calibration=True) and the
+# frame is still fresh; see _calibration_crop_if_fresh.
+_last_calibration = {'bgr': None, 'ts': 0}
+CALIBRATION_TTL = 180  # seconds — how stale the stashed calibration frame may be before it's ignored
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +276,57 @@ def capture_stash_image(settings, require_region=False):
         img = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX')
     img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
     return img, img_bgr
+
+
+def _crop_calibration(frame_bgr, region):
+    """
+    Crop a full-monitor BGR frame to `region` ({'x','y','w','h'}), the same
+    coordinate space the region-picker drew its rectangle in.  Returns the
+    cropped ndarray, or None if the frame/region is missing or the crop
+    would be empty (e.g. the region falls outside the captured frame).
+    """
+    if frame_bgr is None or not region:
+        return None
+    x, y, w, h = region.get('x', 0), region.get('y', 0), region.get('w', 0), region.get('h', 0)
+    fh, fw = frame_bgr.shape[:2]
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(fw, x + w), min(fh, y + h)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return frame_bgr[y1:y2, x1:x2]
+
+
+def _calibration_crop_if_fresh(settings):
+    """
+    Return a cropped BGR frame from the last calibration screenshot, if a
+    region is configured and the stashed frame is still within CALIBRATION_TTL
+    seconds old. Returns None otherwise (caller falls back to a live grab).
+    """
+    region = settings.get('region')
+    if not region:
+        return None
+    if time.time() - _last_calibration.get('ts', 0) >= CALIBRATION_TTL:
+        return None
+    return _crop_calibration(_last_calibration.get('bgr'), region)
+
+
+def capture_for_scan(settings, from_calibration, require_region, warnings):
+    """
+    Shared capture step for both scan pipelines (keep-scan and sell-scan).
+
+    When from_calibration is True and the region-picker's stashed full-monitor
+    frame is still fresh, crop it to the configured region instead of live-
+    grabbing — avoids capturing the helper's own window on top of the game
+    right after a region save. Falls back to a normal live grab (and records
+    a warning) when the calibration frame is stale or missing.
+    """
+    if from_calibration:
+        img_bgr = _calibration_crop_if_fresh(settings)
+        if img_bgr is not None:
+            img = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+            return img, img_bgr
+        warnings.append('Calibration frame unavailable or stale — used a live screen grab instead.')
+    return capture_stash_image(settings, require_region=require_region)
 
 
 def map_keep_entries_to_ids(keep_list, price_idx):
@@ -419,6 +506,58 @@ def _apply_label_blank(img_bgr):
         # bottom-right corner (stack-count digits)
         out[h - c:, w - c:] = _STASH_BG_BGR
     return out
+
+
+def detect_fir(img_bgr, grid, col, row, W, H):
+    """
+    Read the Found-in-Raid ✓ out of the RAW frame (call this BEFORE any
+    _apply_label_blank crop-copy has blanked the corner — `img_bgr` here is
+    the full screenshot, not a per-cell copy, so the mark is still present).
+
+    The game draws a small white/bright checkmark in the top-right corner of
+    the item's FOOTPRINT (not each individual cell), so the sample window is
+    anchored off the footprint's right edge, scaled to the same 18px@63px-cell
+    ratio _apply_label_blank uses.
+
+    Three-valued return — True / False / None — and this is load-bearing:
+      True  = confidently FiR (a checkmark-shaped bright cluster was found).
+      False = confidently NOT FiR (corner is clean background).
+      None  = indeterminate (label overflow into the corner, off-image window,
+              or ambiguous pixel count). Callers must NEVER treat None as
+              "not FiR" — a caller that downgrades/unprotects an item on None
+              risks incorrectly letting a real FiR item be sold or excluding
+              it from a Kappa checklist it actually satisfies.
+    """
+    x2 = grid['origin_x'] + (col + W) * grid['cell_w']
+    y1 = grid['origin_y'] + row * grid['cell_h']
+    c = round(18 * grid['cell_w'] / 63)
+    if c < 1:
+        return None
+    sh, sw = img_bgr.shape[:2]
+    wx1, wy1 = max(0, x2 - c), max(0, y1)
+    wx2, wy2 = min(sw, x2), min(sh, y1 + c)
+    if wy2 - wy1 < 3 or wx2 - wx1 < 3:
+        return None
+    window = img_bgr[wy1:wy2, wx1:wx2]
+
+    gray = cv2.cvtColor(window, cv2.COLOR_BGR2GRAY)
+    hsv  = cv2.cvtColor(window, cv2.COLOR_BGR2HSV)
+    sat  = hsv[:, :, 1]
+    bright_mask = (gray > FIR_BRIGHT) & (sat < 60)
+
+    # If the bright mask touches the window's left edge, it's very likely the
+    # item's name label overflowing into the corner (long names run the full
+    # cell width) rather than the checkmark glyph — indeterminate, not False.
+    if bright_mask[:, 0].any():
+        return None
+
+    n = int(bright_mask.sum())
+    if n == 0:
+        return False
+    max_px = FIR_MAX_FRAC * window.shape[0] * window.shape[1]
+    if FIR_MIN_PX <= n <= max_px:
+        return True
+    return None
 
 
 def _canonical_bgr_flat(img_bgr, W, H):
@@ -641,8 +780,9 @@ def build_icon_db(price_cache, progress_cb=None, workers=24, use_cache=True):
             import icon_cache
             cache_recs = icon_cache.build_cache_templates(
                 items, _template_from_bgra, tint_for, _load_template_source)
-            for (wh, item_id, name, rotated, vec, mask) in cache_recs:
-                _append_record(by_size_raw, wh, item_id, name, 'cache', rotated, vec, mask)
+            for (wh, item_id, name, rotated, vec, mask, exact) in cache_recs:
+                src = 'cache-exact' if exact else 'cache'
+                _append_record(by_size_raw, wh, item_id, name, src, rotated, vec, mask)
                 cache_ids.add(item_id)
             print(f"[icon_db] cache templates: {len(cache_recs)} "
                   f"({len(cache_ids)} distinct items)")
@@ -807,6 +947,28 @@ OCR_OVER_CUTOFF  = 84   # OCR overrides a *different* NCC identity → needs thi
 OCR_SHORT_OVER   = 99   # short OCR tokens (≤3 chars) overriding NCC need near-exact (blocks 'Li'→Splint)
 
 
+def _ocr_tokens_contained(text, name, short):
+    """
+    True iff every OCR token is equal to, or a prefix of, some token of the
+    candidate's `name + ' ' + short` (case-insensitive).  Empty OCR token list
+    (e.g. blank/whitespace-only OCR text) always fails.
+
+    Guards the OCR override tier: rapidfuzz's WRatio scores on overall string
+    similarity, so a misread label can still cross OCR_OVER_CUTOFF against an
+    unrelated item purely by chance substring overlap — the reproduced failure
+    was a PMAG label OCR'd as 'gen m3' scoring 85.5 against "Benelli M3 …
+    charging handle" (>= the old 84 cutoff).  'gen' is not a token (or prefix
+    of a token) of any Benelli name/shortName token, so this correctly rejects
+    it, while still allowing legitimate partial reads like 'benel m3' (a
+    prefix of 'benelli') or 'pmag 30 gen m3' (all exact tokens) through.
+    """
+    ocr_tokens = [t for t in re.split(r'[^A-Za-z0-9]+', text.lower()) if len(t) >= 2]
+    if not ocr_tokens:
+        return False
+    ref_tokens = [t for t in re.split(r'[^A-Za-z0-9]+', (name + ' ' + short).lower()) if t]
+    return all(any(rt.startswith(ot) for rt in ref_tokens) for ot in ocr_tokens)
+
+
 def _ocr_cell_label(img_bgr, col, row, W, grid):
     """
     OCR the item name the game prints across the top of a cell (single line,
@@ -852,20 +1014,21 @@ def build_label_matcher(price_cache):
     with different-size items and avoids same-name cross-size ambiguity
     (CAT tourniquet vs Cat figurine).
 
-    Returns matcher(text, fw, fh) -> (item_id, score, name, native_w, native_h) | None.
+    Returns matcher(text, fw, fh) -> (item_id, score, name, short, native_w, native_h) | None.
     """
     from rapidfuzz import process, fuzz
-    by_size = {}   # (w,h) -> (choices, ids, names)
+    by_size = {}   # (w,h) -> (choices, ids, names, shorts)
     for it in price_cache.get('items', []):
         if not is_target_item(it):
             continue
         wh = (it.get('width') or 1, it.get('height') or 1)
-        b = by_size.setdefault(wh, ([], [], []))
+        b = by_size.setdefault(wh, ([], [], [], []))
         for s in {it.get('shortName') or '', it.get('name') or ''}:
             if s:
                 b[0].append(s.lower())
                 b[1].append(it['id'])
                 b[2].append(it['name'])
+                b[3].append(it.get('shortName') or '')
 
     def matcher(text, fw, fh):
         if not text or len(text) < 2:
@@ -879,7 +1042,7 @@ def build_label_matcher(price_cache):
                                    score_cutoff=OCR_LABEL_BASE)
             if r and (best is None or r[1] > best[1]):
                 _, score, idx = r
-                best = (b[1][idx], score, b[2][idx], wh[0], wh[1])
+                best = (b[1][idx], score, b[2][idx], b[3][idx], wh[0], wh[1])
         return best
 
     return matcher
@@ -897,6 +1060,7 @@ def _min_score_for_size(W, H):
 
 OCC_FRAC          = 0.72   # a footprint is a size candidate only if this fraction of its cells are occupied
 CACHE_SRC_BONUS   = 0.02   # adjust-score bias favouring exact game-cache templates over API templates
+CACHE_EXACT_BONUS = 0.04   # additional bias for cache-exact templates (validated hash identity, not just visual)
 
 
 def _build_occupancy(img_bgr, grid, n_rows, n_cols):
@@ -1023,7 +1187,10 @@ def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCOR
        (NCC keeps the footprint/rotation) — this is what separates same-shape
        items (L1 vs SJ12 vs eTG-c) that NCC alone cannot.
 
-    Detections carry `rotated` and `source` (ncc / cache / api / ocr).
+    Detections carry `rotated` and `source` (ncc / cache / cache-exact / api /
+    ocr / ncc+ocr).  `cache-exact` is a validation-gated exact hash identity
+    (see eft_hash.py) and is trusted enough to bypass the NCC margin check
+    and to require a near-perfect OCR read before being overridden.
     """
     if not icon_db:
         return []
@@ -1074,8 +1241,10 @@ def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCOR
 
                 # Size preference + exact-cache-source bias.
                 adj = sc + (W * H - 1) * 0.012
-                if bucket['sources'][i] == 'cache':
+                if bucket['sources'][i] in ('cache', 'cache-exact'):
                     adj += CACHE_SRC_BONUS
+                if bucket['sources'][i] == 'cache-exact':
+                    adj += CACHE_EXACT_BONUS
                 if best is None or adj > best[0]:
                     best = (adj, sc, margin, i, W, H, bucket)
 
@@ -1096,19 +1265,28 @@ def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCOR
                 text = _ocr_cell_label(img_bgr, col, row, W, grid)
                 cand = label_matcher(text, W, H)
                 if cand is not None:
-                    o_id, o_sc, o_name, o_w, o_h = cand
+                    o_id, o_sc, o_name, o_short, o_w, o_h = cand
                     agrees = ncc_id is not None and o_id == ncc_id
                     if agrees:
-                        need = OCR_AGREE_CUTOFF
+                        passes = o_sc >= OCR_AGREE_CUTOFF
                     elif len(text) <= 3:
-                        need = OCR_SHORT_OVER
+                        passes = o_sc >= OCR_SHORT_OVER
                     else:
-                        need = OCR_OVER_CUTOFF
-                    if o_sc >= need:
+                        # Override tier: OCR disagrees with (or NCC found no)
+                        # identity.  A cache-exact NCC identity (validated hash
+                        # match, not just visual) is trusted enough that only a
+                        # near-perfect OCR read should override it.
+                        need = OCR_SHORT_OVER if ncc_src == 'cache-exact' else OCR_OVER_CUTOFF
+                        # Token-containment guard: blocks a short/partial OCR
+                        # misread (e.g. a PMAG label OCR'd as 'gen m3') from
+                        # WRatio-matching an unrelated item's name ('Benelli M3
+                        # … charging handle', WRatio 85.5 >= old 84 cutoff).
+                        passes = o_sc >= need and _ocr_tokens_contained(text, o_name, o_short)
+                    if passes:
                         ocr_hit = cand
 
             if ocr_hit is not None:
-                item_id, ocr_sc, name, _o_w, _o_h = ocr_hit
+                item_id, ocr_sc, name, _o_short, _o_w, _o_h = ocr_hit
                 detections.append({
                     'col': col, 'row': row, 'W': W, 'H': H,
                     'item_id': item_id, 'name': name,
@@ -1126,9 +1304,13 @@ def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCOR
                 text1 = _ocr_cell_label(img_bgr, col, row, 1, grid)
                 cand1 = label_matcher(text1, 1, 1)
                 if cand1 is not None:
-                    o_id, o_sc, o_name, _w, _h = cand1
-                    need = OCR_SHORT_OVER if len(text1) <= 3 else OCR_OVER_CUTOFF
-                    if o_sc >= need:
+                    o_id, o_sc, o_name, o_short, _w, _h = cand1
+                    if len(text1) <= 3:
+                        passes = o_sc >= OCR_SHORT_OVER
+                    else:
+                        passes = (o_sc >= OCR_OVER_CUTOFF
+                                  and _ocr_tokens_contained(text1, o_name, o_short))
+                    if passes:
                         detections.append({
                             'col': col, 'row': row, 'W': 1, 'H': 1,
                             'item_id': o_id, 'name': o_name,
@@ -1141,7 +1323,13 @@ def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCOR
             if best is None:
                 continue
             size_min = _min_score_for_size(W, H)
-            if sc >= size_min and margin >= NCC_MARGIN_MIN:
+            # A cache-exact identity (validated hash match — see eft_hash.py)
+            # is authoritative on its own: accept it even below the NCC margin
+            # floor, provided the raw score still clears a stricter bar.  This
+            # is what separates the stimulant-injector family (shared
+            # silhouette dominates plain NCC — see comment at _canonical_bgr_flat).
+            exact_authoritative = ncc_src == 'cache-exact' and sc >= max(size_min, 0.75)
+            if sc >= size_min and (margin >= NCC_MARGIN_MIN or exact_authoritative):
                 detections.append({
                     'col': col, 'row': row, 'W': W, 'H': H,
                     'item_id': ncc_id, 'name': ncc_name,
@@ -1159,6 +1347,11 @@ def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCOR
         scores = [d['score'] for d in detections]
         print(f"[ncc] matched {len(detections)} items ({n_ambig} ambiguous) | "
               f"scores {min(scores):.1f}–{max(scores):.1f}%  avg {sum(scores)/len(scores):.1f}%")
+
+    # Found-in-Raid pass — reads the raw (un-blanked) frame, so this must run
+    # after all NCC/OCR matching (which works off label/corner-blanked crops).
+    for d in detections:
+        d['fir'] = detect_fir(img_bgr, grid, d['col'], d['row'], d['W'], d['H'])
     return detections
 
 
@@ -1258,6 +1451,11 @@ def sell_recommendation(item_data):
 # is a modifier combo nothing else claims.
 DEFAULT_HOTKEY = '<ctrl>+<shift>+s'
 
+# Shared label for the kappa keep-list category — also stamped unconditionally
+# onto existing installs by merge_kappa_into_keep_list so they migrate on the
+# next wiki sync.
+KAPPA_LABEL = 'Collector (Kappa) — hand-ins must be Found In Raid'
+
 def default_settings():
     return {
         'region': None, 'monitor': 0, 'hotkey': DEFAULT_HOTKEY, 'prestige': 3,
@@ -1267,6 +1465,7 @@ def default_settings():
         'ui_scale': 1.0,    # EFT UI scale — expected grid pitch = 63 * ui_scale px/slot
         'icon_cache_path': None,  # override for the EFT icon-cache folder (auto-discovered if null)
         'grid': None,       # last-good detected grid, persisted so a noisy frame can't derail a scan
+        'kappa_only_tasks': True,  # only kappaRequired tasks count toward task aggregate/KEEP totals
     }
 
 def default_keep_list():
@@ -1274,9 +1473,8 @@ def default_keep_list():
         'categories': [
             {
                 'id': 'kappa',
-                'label': 'Kappa (Collector)',
+                'label': KAPPA_LABEL,
                 'items': [
-                    # --- Still needed ---
                     {'id': 'tea',         'name': '42 Signature Blend English Tea', 'aliases': ['42 Sig', 'English Tea'],             'acquired': False},
                     {'id': 'axe',         'name': 'Antique axe',                    'aliases': ['Antique axe'],                       'acquired': False},
                     {'id': 'armband',     'name': 'Armband (Evasion)',               'aliases': ['Armband', 'Evasion'],                'acquired': False},
@@ -1287,70 +1485,45 @@ def default_keep_list():
                     {'id': 'wz_wallet',   'name': 'WZ Wallet',                        'aliases': ['WZ Wallet'],                         'acquired': False},
                     {'id': 'dumbbell',    'name': 'Mazoni golden dumbbell',           'aliases': ['Mazoni', 'Dumbbell'],                'acquired': False},
                     {'id': 'splint',      'name': 'Tigzresq splint',                  'aliases': ['Tigzresq', 'Splint'],                'acquired': False},
-                    # --- Acquired ---
-                    {'id': 'firesteel',   'name': 'Old firesteel',                    'aliases': ['Firesteel'],                         'acquired': True},
-                    {'id': 'book',        'name': 'Battered antique book',            'aliases': ['Book', 'Battered book'],             'acquired': True},
-                    {'id': 'fireklean',   'name': '#FireKlean gun lube',              'aliases': ['FireKlea', 'FireKlean'],             'acquired': True},
-                    {'id': 'rooster',     'name': 'Golden rooster figurine',          'aliases': ['Rooster'],                           'acquired': True},
-                    {'id': 'badge',       'name': 'Silver Badge',                     'aliases': ['Badge'],                             'acquired': True},
-                    {'id': 'beard_oil',   'name': "Deadlyslob's beard oil",           'aliases': ['BeardOil', 'Beard Oil'],             'acquired': True},
-                    {'id': 'mayo',        'name': 'Jar of DevilDog mayo',             'aliases': ['Mayo', 'DevilDog'],                  'acquired': True},
-                    {'id': 'sprats',      'name': 'Can of sprats',                    'aliases': ['Sprats'],                            'acquired': True},
-                    {'id': 'mustache',    'name': 'Fake mustache',                    'aliases': ['Mustache'],                          'acquired': True},
-                    {'id': 'kotton',      'name': 'Kotton beanie',                    'aliases': ['Kotton'],                            'acquired': True},
-                    {'id': 'raven',       'name': 'Raven figurine',                   'aliases': ['Raven'],                             'acquired': True},
-                    {'id': 'pestily',     'name': 'Pestily plague mask',              'aliases': ['Pestily'],                           'acquired': True},
-                    {'id': 'shroud',      'name': 'Shroud half-mask',                 'aliases': ['Shroud'],                            'acquired': True},
-                    {'id': 'drlupo',      'name': "Can of Dr. Lupo's coffee beans",   'aliases': ["DrLupo's", 'Dr Lupo'],               'acquired': True},
-                    {'id': 'veritas',     'name': 'Veritas guitar pick',              'aliases': ['Veritas'],                           'acquired': True},
-                    {'id': 'ratcola',     'name': 'Can of RatCola soda',              'aliases': ['RatCola'],                           'acquired': True},
-                    {'id': 'smoke',       'name': 'Smoke balaclava',                  'aliases': ['Smoke'],                             'acquired': True},
-                    {'id': 'lvndmark',    'name': "LVNDMARK's rat poison",            'aliases': ['LVNDMARK', 'Polson', 'Rat poison'],  'acquired': True},
-                    {'id': 'forklift',    'name': 'Missam forklift key',              'aliases': ['Missam'],                            'acquired': True},
-                    {'id': 'vhs',         'name': 'Video cassette (Cyborg Killer)',   'aliases': ['VHS', 'Cyborg Killer'],              'acquired': True},
-                    {'id': 'bakeezy',     'name': 'BakeEzy cook book',                'aliases': ['BakeEzy'],                           'acquired': True},
-                    {'id': 'johnb',       'name': 'JohnB Liquid DNB glasses',         'aliases': ['JohnB'],                             'acquired': True},
-                    {'id': 'baddie',      'name': "Baddie's red beard",               'aliases': ['Baddie'],                            'acquired': True},
-                    {'id': 'gingy',       'name': 'Gingy keychain',                   'aliases': ['Gingy'],                             'acquired': True},
-                    {'id': 'egg',         'name': 'Golden egg',                        'aliases': ['Egg'],                               'acquired': True},
-                    {'id': 'pass_',       'name': 'Press pass (NoiceGuy)',             'aliases': ['Pass', 'NoiceGuy'],                  'acquired': True},
-                    {'id': 'axel',        'name': 'Axel parrot figurine',              'aliases': ['Axel'],                              'acquired': True},
-                    {'id': 'glorious',    'name': 'Glorious E armored mask',           'aliases': ['Glorious'],                          'acquired': True},
-                    {'id': 'inseq',       'name': 'Inseq gas pipe wrench',             'aliases': ['Inseq'],                             'acquired': True},
-                    {'id': 'viibiin',     'name': 'Viibiin sneaker',                   'aliases': ['Viiblin', 'Viibiin'],                'acquired': True},
-                    {'id': 'tamatthi',    'name': 'Tamatthi kunai knife replica',      'aliases': ['Tamatthi'],                          'acquired': True},
-                    {'id': 'nut_sack',    'name': 'Nut Sack balaclava',                'aliases': ['Nut Sack', 'NutSack'],               'acquired': True},
-                    {'id': 'domontovich', 'name': 'Domontovich ushanka hat',           'aliases': ['Domontovich'],                       'acquired': True},
+                    {'id': 'firesteel',   'name': 'Old firesteel',                    'aliases': ['Firesteel'],                         'acquired': False},
+                    {'id': 'book',        'name': 'Battered antique book',            'aliases': ['Book', 'Battered book'],             'acquired': False},
+                    {'id': 'fireklean',   'name': '#FireKlean gun lube',              'aliases': ['FireKlea', 'FireKlean'],             'acquired': False},
+                    {'id': 'rooster',     'name': 'Golden rooster figurine',          'aliases': ['Rooster'],                           'acquired': False},
+                    {'id': 'badge',       'name': 'Silver Badge',                     'aliases': ['Badge'],                             'acquired': False},
+                    {'id': 'beard_oil',   'name': "Deadlyslob's beard oil",           'aliases': ['BeardOil', 'Beard Oil'],             'acquired': False},
+                    {'id': 'mayo',        'name': 'Jar of DevilDog mayo',             'aliases': ['Mayo', 'DevilDog'],                  'acquired': False},
+                    {'id': 'sprats',      'name': 'Can of sprats',                    'aliases': ['Sprats'],                            'acquired': False},
+                    {'id': 'mustache',    'name': 'Fake mustache',                    'aliases': ['Mustache'],                          'acquired': False},
+                    {'id': 'kotton',      'name': 'Kotton beanie',                    'aliases': ['Kotton'],                            'acquired': False},
+                    {'id': 'raven',       'name': 'Raven figurine',                   'aliases': ['Raven'],                             'acquired': False},
+                    {'id': 'pestily',     'name': 'Pestily plague mask',              'aliases': ['Pestily'],                           'acquired': False},
+                    {'id': 'shroud',      'name': 'Shroud half-mask',                 'aliases': ['Shroud'],                            'acquired': False},
+                    {'id': 'drlupo',      'name': "Can of Dr. Lupo's coffee beans",   'aliases': ["DrLupo's", 'Dr Lupo'],               'acquired': False},
+                    {'id': 'veritas',     'name': 'Veritas guitar pick',              'aliases': ['Veritas'],                           'acquired': False},
+                    {'id': 'ratcola',     'name': 'Can of RatCola soda',              'aliases': ['RatCola'],                           'acquired': False},
+                    {'id': 'smoke',       'name': 'Smoke balaclava',                  'aliases': ['Smoke'],                             'acquired': False},
+                    {'id': 'lvndmark',    'name': "LVNDMARK's rat poison",            'aliases': ['LVNDMARK', 'Polson', 'Rat poison'],  'acquired': False},
+                    {'id': 'forklift',    'name': 'Missam forklift key',              'aliases': ['Missam'],                            'acquired': False},
+                    {'id': 'vhs',         'name': 'Video cassette (Cyborg Killer)',   'aliases': ['VHS', 'Cyborg Killer'],              'acquired': False},
+                    {'id': 'bakeezy',     'name': 'BakeEzy cook book',                'aliases': ['BakeEzy'],                           'acquired': False},
+                    {'id': 'johnb',       'name': 'JohnB Liquid DNB glasses',         'aliases': ['JohnB'],                             'acquired': False},
+                    {'id': 'baddie',      'name': "Baddie's red beard",               'aliases': ['Baddie'],                            'acquired': False},
+                    {'id': 'gingy',       'name': 'Gingy keychain',                   'aliases': ['Gingy'],                             'acquired': False},
+                    {'id': 'egg',         'name': 'Golden egg',                        'aliases': ['Egg'],                               'acquired': False},
+                    {'id': 'pass_',       'name': 'Press pass (NoiceGuy)',             'aliases': ['Pass', 'NoiceGuy'],                  'acquired': False},
+                    {'id': 'axel',        'name': 'Axel parrot figurine',              'aliases': ['Axel'],                              'acquired': False},
+                    {'id': 'glorious',    'name': 'Glorious E armored mask',           'aliases': ['Glorious'],                          'acquired': False},
+                    {'id': 'inseq',       'name': 'Inseq gas pipe wrench',             'aliases': ['Inseq'],                             'acquired': False},
+                    {'id': 'viibiin',     'name': 'Viibiin sneaker',                   'aliases': ['Viiblin', 'Viibiin'],                'acquired': False},
+                    {'id': 'tamatthi',    'name': 'Tamatthi kunai knife replica',      'aliases': ['Tamatthi'],                          'acquired': False},
+                    {'id': 'nut_sack',    'name': 'Nut Sack balaclava',                'aliases': ['Nut Sack', 'NutSack'],               'acquired': False},
+                    {'id': 'domontovich', 'name': 'Domontovich ushanka hat',           'aliases': ['Domontovich'],                       'acquired': False},
                 ]
             },
             {
                 'id': 'tasks',
                 'label': 'Task Items (manual)',
-                'items': [
-                    {'id': 'fleece',       'name': 'Fleece fabric',                'aliases': ['Fleece'],           'count': 10, 'task': 'Ragman - Textile Part 2',    'acquired': False},
-                    {'id': 'cordura',      'name': 'Cordura polyamide fabric',     'aliases': ['Cordura'],          'count': 10, 'task': 'Ragman - Textile Part 2',    'acquired': False},
-                    {'id': 'kektape',      'name': 'KEKTAPE duct tape',            'aliases': ['KEK', 'KEKTAPE'],   'count': 5,  'task': 'Ragman - Textile Part 2',    'acquired': False},
-                    {'id': 'bear_tag',     'name': 'Dogtag BEAR',                  'aliases': ['BEAR'],             'count': 20, 'task': 'Peacekeeper - Trophies',     'acquired': False},
-                    {'id': 'usec_tag',     'name': 'Dogtag USEC',                  'aliases': ['USEC'],             'count': 20, 'task': 'Peacekeeper - Trophies',     'acquired': False},
-                    {'id': 'bear_tag6',    'name': 'Dogtag BEAR (Punisher 6)',     'aliases': [],                   'count': 7,  'task': 'Prapor - Punisher Part 6',   'acquired': False},
-                    {'id': 'usec_tag6',    'name': 'Dogtag USEC (Punisher 6)',     'aliases': [],                   'count': 7,  'task': 'Prapor - Punisher Part 6',   'acquired': False},
-                    {'id': 'cult_knife',   'name': 'Cultist knife',                'aliases': ['Cultist knife'],    'count': 12, 'task': 'Skier - Night Sweep',        'acquired': False},
-                    {'id': 'epsilon',      'name': 'Secure container Epsilon',     'aliases': ['Epsilon'],          'count': 1,  'task': 'Fence - The Choice',         'acquired': False},
-                    {'id': 'vodka',        'name': 'Bottle of Tarkovskaya vodka',  'aliases': ['Vodka'],            'count': 10, 'task': 'Ragman - Booze',             'acquired': False},
-                    {'id': 'whiskey',      'name': 'Bottle of Dan Jackiel whiskey','aliases': ['Whiskey'],          'count': 10, 'task': 'Ragman - Booze',             'acquired': False},
-                    {'id': 'beer',         'name': 'Bottle of Pevko Light beer',   'aliases': ['Pevko', 'Beer'],    'count': 20, 'task': 'Ragman - Booze',             'acquired': False},
-                    {'id': 'water',        'name': 'Canister purified water',      'aliases': ['Water'],            'count': 3,  'task': 'Ragman - Booze',             'acquired': False},
-                    {'id': 'fig_bear',     'name': 'BEAR operative figurine',      'aliases': [],                   'count': 1,  'task': 'Ragman - New Beginning',     'acquired': False},
-                    {'id': 'fig_usec',     'name': 'USEC operative figurine',      'aliases': [],                   'count': 1,  'task': 'Ragman - New Beginning',     'acquired': False},
-                    {'id': 'fig_killa',    'name': 'Killa figurine',               'aliases': ['Killa'],            'count': 1,  'task': 'Ragman - New Beginning',     'acquired': False},
-                    {'id': 'fig_reshala',  'name': 'Reshala figurine',             'aliases': ['Reshala'],          'count': 1,  'task': 'Ragman - New Beginning',     'acquired': False},
-                    {'id': 'fig_ryzhy',    'name': 'Ryzhy figurine',               'aliases': ['Ryzhy'],            'count': 1,  'task': 'Ragman - New Beginning',     'acquired': False},
-                    {'id': 'fig_scav',     'name': 'Scav figurine',                'aliases': ['Scav'],             'count': 1,  'task': 'Ragman - New Beginning',     'acquired': False},
-                    {'id': 'fig_tagilla',  'name': 'Tagilla figurine',             'aliases': ['Tagilla'],          'count': 1,  'task': 'Ragman - New Beginning',     'acquired': False},
-                    {'id': 'fig_cultist',  'name': 'Cultist figurine',             'aliases': ['Cultist'],          'count': 1,  'task': 'Ragman - New Beginning',     'acquired': False},
-                    {'id': 'fig_den',      'name': 'Den figurine',                 'aliases': ['Den'],              'count': 1,  'task': 'Ragman - New Beginning',     'acquired': False},
-                    {'id': 'fig_mutkevich','name': 'Politician Mutkevich figurine','aliases': ['Mutkevich'],        'count': 1,  'task': 'Ragman - New Beginning',     'acquired': False},
-                ]
+                'items': []
             }
         ]
     }
@@ -1456,21 +1629,120 @@ def fetch_kappa_names(force=False):
     return names
 
 
+# ---------------------------------------------------------------------------
+# Prestige requirements — synced from the wiki
+# ---------------------------------------------------------------------------
+
+def _parse_prestige_html(html):
+    """
+    Parse the wiki Prestige page's requirements table into a list of level
+    dicts. Factored out of fetch_prestige_requirements so tests can exercise
+    the parsing logic on a synthetic HTML fixture without hitting the network.
+
+    Locates the table whose header row contains a cell that casefold-contains
+    'prestige level' (not by position — some wiki tables have merged/leading
+    cells), then maps each data row's cells to that same row's headers BY
+    HEADER TEXT, so a reordered column can't silently scramble fields.
+
+    Cell values (quests/objectives/skills/hideout/items) are kept as display
+    strings — the items column mixes rouble figures and item lists, which
+    isn't worth structuring further here.
+
+    Raises ValueError if fewer than 5 data rows parse out (layout-drift guard).
+    """
+    p = _WikiTableParser()
+    p.feed(html)
+
+    def _get(rowmap, key_substr):
+        for h, v in rowmap.items():
+            if key_substr in h.casefold():
+                return v
+        return ''
+
+    for table in p.tables:
+        header_i = None
+        for i, row in enumerate(table):
+            if any('prestige level' in c.strip().casefold() for c in row):
+                header_i = i
+                break
+        if header_i is None:
+            continue
+        headers = [c.strip() for c in table[header_i]]
+        levels = []
+        for row in table[header_i + 1:]:
+            if not row or not any(c.strip() for c in row):
+                continue
+            rowmap = {headers[j]: row[j].strip()
+                     for j in range(min(len(headers), len(row)))}
+            level_txt = _get(rowmap, 'prestige level')
+            m = re.search(r'\d+', level_txt)
+            if not m:
+                continue
+            levels.append({
+                'level':      int(m.group()),
+                'pmc_level':  _get(rowmap, 'pmc level'),
+                'quests':     _get(rowmap, 'quests completed') or _get(rowmap, 'quest'),
+                'objectives': _get(rowmap, 'objectives'),
+                'skills':     _get(rowmap, 'skills'),
+                'hideout':    _get(rowmap, 'hideout'),
+                'items':      _get(rowmap, 'items'),
+            })
+        if len(levels) >= 5:
+            return levels
+    raise ValueError('Prestige requirements table not found (or suspiciously small) — '
+                     'wiki layout may have changed')
+
+
+def fetch_prestige_requirements(force=False):
+    """
+    Return the current Prestige requirements from the wiki, cached 7 days.
+    Mirrors fetch_kappa_names's caching shape. The cache file is NEVER
+    overwritten on a failed fetch/parse — on failure, the stale cache (if any)
+    is served instead; only when there's no cache at all does this raise.
+    """
+    if not force and os.path.exists(PRESTIGE_WIKI_PATH):
+        cache = load_json(PRESTIGE_WIKI_PATH, lambda: None)
+        if cache and time.time() - cache.get('timestamp', 0) < PRESTIGE_WIKI_TTL:
+            return cache['levels']
+    try:
+        r = http_requests.get(PRESTIGE_WIKI_API, timeout=30, headers={
+            'User-Agent': 'TarkovStashHelper/1.0 (github.com/josfire18/tarkov-stash-helper)',
+        })
+        r.raise_for_status()
+        levels = _parse_prestige_html(r.json()['parse']['text'])
+        save_json(PRESTIGE_WIKI_PATH, {'timestamp': time.time(), 'levels': levels})
+        return levels
+    except Exception:
+        if os.path.exists(PRESTIGE_WIKI_PATH):
+            cache = load_json(PRESTIGE_WIKI_PATH, lambda: None)
+            if cache and cache.get('levels'):
+                return cache['levels']
+        raise
+
+
 def merge_kappa_into_keep_list(keep_list, names, price_idx=None):
     """
     Merge fresh wiki names into the kappa category, preserving user state.
-      - name already present (exact or fuzzy ≥90) → keep the entry (acquired,
+      - name already present (exact or fuzzy ≥95) → keep the entry (acquired,
         aliases, id survive); fuzzy hits are renamed to the wiki spelling with
         the old name kept as an alias.
       - new wiki name → appended unchecked.
-      - entry no longer on the wiki (and not user-added) → flagged stale, never
-        deleted.
-    Idempotent. Returns {'added', 'stale', 'total'}.
+      - wiki-sourced entry (source != 'custom') no longer on the wiki → REMOVED
+        from the category outright (previously just flagged 'stale' and kept —
+        that left permanently-dead rows accumulating on every sync). User-added
+        ('custom') entries are never removed by this pass, matched or not.
+      - deletion is only ever reached with a wiki `names` list that already
+        cleared fetch_kappa_names's own >=20-name floor, and kappa_sync (the
+        only caller in the fetch→merge→save chain) aborts before this runs at
+        all if the fetch/parse failed — so a bad/short scrape can't wipe out
+        the category.
+    Idempotent. Returns {'added', 'removed', 'total'}.
     """
     cat = next((c for c in keep_list['categories'] if c['id'] == 'kappa'), None)
     if cat is None:
-        cat = {'id': 'kappa', 'label': 'Kappa (Collector)', 'items': []}
+        cat = {'id': 'kappa', 'label': KAPPA_LABEL, 'items': []}
         keep_list['categories'].insert(0, cat)
+    cat['label'] = KAPPA_LABEL   # migrate existing installs' category label too
 
     by_name = {it['name'].casefold(): it for it in cat['items']}
     claimed = set()   # entry ids already matched to a wiki name
@@ -1501,7 +1773,6 @@ def merge_kappa_into_keep_list(keep_list, names, price_idx=None):
         if entry is not None:
             claimed.add(entry['id'])
             entry['source'] = 'wiki'
-            entry.pop('stale', None)
         else:
             new = {'id': str(uuid.uuid4())[:8], 'name': n, 'aliases': [],
                    'acquired': False, 'source': 'wiki'}
@@ -1509,12 +1780,15 @@ def merge_kappa_into_keep_list(keep_list, names, price_idx=None):
             claimed.add(new['id'])
             added.append(n)
 
-    stale = []
+    removed = []
+    survivors = []
     for it in cat['items']:
-        if it['id'] in claimed or it.get('source') == 'custom':
+        it.pop('stale', None)   # legacy flag from the old flag-not-delete behaviour
+        if it['id'] not in claimed and it.get('source') != 'custom':
+            removed.append(it['name'])
             continue
-        it['stale'] = True
-        stale.append(it['name'])
+        survivors.append(it)
+    cat['items'] = survivors
 
     # Persist tarkov.dev ids so scans can map entries without alias guessing.
     if price_idx:
@@ -1530,12 +1804,15 @@ def merge_kappa_into_keep_list(keep_list, names, price_idx=None):
             if data:
                 it['tdev_id'] = data['id']
 
-    return {'added': added, 'stale': stale, 'total': len(cat['items'])}
+    return {'added': added, 'removed': removed, 'total': len(cat['items'])}
 
 
 def kappa_sync(force=False):
     """Fetch + merge + save. Returns the merge summary. Raises on failure
-    (keep_list.json is never touched when the fetch/parse fails)."""
+    (keep_list.json is never touched when the fetch/parse fails — merge only
+    ever runs after fetch_kappa_names succeeds). Wiki-sourced entries no
+    longer on the wiki are removed (not just flagged) from the kappa
+    category; user-added ('custom') entries are never removed."""
     names = fetch_kappa_names(force=force)
     keep_list = load_json(KEEPLIST_PATH, default_keep_list)
     price_idx = None
@@ -1546,7 +1823,8 @@ def kappa_sync(force=False):
     summary = merge_kappa_into_keep_list(keep_list, names, price_idx)
     save_json(KEEPLIST_PATH, keep_list)
     print(f"[kappa] synced {len(names)} wiki items — "
-          f"{len(summary['added'])} added, {len(summary['stale'])} stale")
+          f"{len(summary['added'])} added, {len(summary['removed'])} removed"
+          + (f" ({', '.join(summary['removed'])})" if summary['removed'] else ""))
     return summary
 
 
@@ -1590,11 +1868,17 @@ def get_tasks(allow_fetch=True):
 # stash items worth tracking — they'd bury real requirements in the aggregate.
 CURRENCY_NAMES = {'roubles', 'dollars', 'euros'}
 
-def compute_tasks_view(cache, progress):
+def compute_tasks_view(cache, progress, kappa_only=False):
     """
     Server-side merged view of what the player still needs.
     Only 'giveItem' objectives count as hand-ins; objectives with a null item
     are skipped (tarkov.dev is migrating TaskObjectiveItem.item → items).
+
+    `kappa_only` restricts which TASK objectives contribute to the aggregate
+    totals to those on tasks with `kappaRequired` — non-kappa tasks (e.g.
+    "Compensation for Damage") still appear in `tasks_out` (the client dims
+    them) but no longer inflate the aggregate/KEEP totals. Hideout
+    accumulation is untouched regardless, since it's needed for prestige.
     """
     done_tasks  = set(progress.get('completed_tasks', []))
     done_levels = set(progress.get('completed_hideout', []))
@@ -1628,9 +1912,11 @@ def compute_tasks_view(cache, progress):
             fir = bool(o.get('foundInRaid'))
             items.append({'item_id': it['id'], 'name': it.get('name') or '?',
                           'count': cnt, 'fir': fir})
+            active = (t['id'] not in done_tasks
+                      and (not kappa_only or bool(t.get('kappaRequired'))))
             _acc(it, cnt, fir, 'task',
                  f"{(t.get('trader') or {}).get('name', '?')} — {t['name']}",
-                 active=t['id'] not in done_tasks)
+                 active=active)
         if not items:
             continue   # only hand-in tasks are interesting here
         tasks_out.append({
@@ -1675,35 +1961,53 @@ def compute_tasks_view(cache, progress):
         'tasks':     tasks_out,
         'stations':  stations_out,
         'cache_age_minutes': round((time.time() - cache.get('timestamp', 0)) / 60, 1),
+        'kappa_only': bool(kappa_only),
     }
 
 
 def get_protected_ids(keep_list, price_idx):
     """
-    {tarkov.dev item id: reason} for everything the player should NOT sell:
-    unacquired keep-list entries + task/hideout items still short of their
-    required count.  Task data is cache-only here — a scan never waits on
-    the network for it.
+    {tarkov.dev item id: {'reason': str, 'fir_only': bool}} for everything the
+    player should NOT unconditionally sell: unacquired keep-list entries +
+    task/hideout items still short of their required count.  Task data is
+    cache-only here — a scan never waits on the network for it.
+
+    `fir_only` marks entries where a Found-in-Raid copy specifically is what's
+    required, meaning a NON-FiR copy of the same item is safe to sell instead:
+      - keep-list KAPPA (Collector) entries — Collector hand-ins require FiR.
+      - keep-list manual/task entries — not FiR-gated (fir_only=False), those
+        categories accept any copy.
+      - task/hideout aggregate items — fir_only only when EVERY remaining
+        need across all sources is FiR-specific (fir_needed >= total_needed);
+        if even one source accepts non-FiR, a non-FiR copy is still needed,
+        so fir_only must stay False.
     """
     protected = {}
+    entry_cat = {e['id']: cat['id']
+                 for cat in keep_list['categories'] for e in cat['items']}
     mapped, _unmapped = map_keep_entries_to_ids(keep_list, price_idx)
     for tid, entry in mapped.items():
         if not entry.get('acquired'):
-            protected[tid] = 'On keep list'
+            fir_only = entry_cat.get(entry['id']) == 'kappa'
+            protected[tid] = {'reason': 'On keep list', 'fir_only': fir_only}
     try:
         cache = get_tasks(allow_fetch=False)
         if cache:
             progress = load_json(PROGRESS_PATH, default_progress)
-            view = compute_tasks_view(cache, progress)
+            settings = load_json(SETTINGS_PATH, default_settings)
+            view = compute_tasks_view(cache, progress,
+                                      kappa_only=settings.get('kappa_only_tasks', True))
             for rec in view['aggregate']:
                 if rec['have'] >= rec['total_needed']:
                     continue
                 srcs = rec['sources']
                 first = srcs[0]['name'] if srcs else 'tasks'
                 more = f' +{len(srcs) - 1} more' if len(srcs) > 1 else ''
+                fir_only = rec['fir_needed'] >= rec['total_needed'] > 0
                 protected.setdefault(
                     rec['item_id'],
-                    f"Needed: {first} (×{rec['total_needed']}){more}")
+                    {'reason': f"Needed: {first} (×{rec['total_needed']}){more}",
+                     'fir_only': fir_only})
     except Exception as e:
         print(f"[tasks] protected-id pass skipped: {e}")
     return protected
@@ -1902,11 +2206,28 @@ def build_alias_map(keep_list):
     return entries
 
 
-def ocr_stash(img: Image.Image, alias_map, grid=None, cell_size=64):
+# PIL's ImageDraw takes RGB(A) tuples (the highlight overlay is composited
+# onto `img`, a PIL Image, throughout both the OCR and icon-DB passes below —
+# unlike the OpenCV/BGR pipeline the rest of this module uses for matching).
+# This is the RGB equivalent of the amber/orange (0,165,255) BGR the FiR
+# feature spec calls for, so it renders as amber rather than blue on screen.
+FIR_AMBER_RGB = (255, 165, 0)
+
+def ocr_stash(img: Image.Image, alias_map, grid=None, cell_size=64, img_bgr=None, entry_cat=None):
     """
     Run OCR on stash image.  When `grid` is provided (from detect_stash_grid),
     highlights snap precisely to cell boundaries with correct multi-slot sizing.
-    Returns (annotated_image, detections).
+
+    When `img_bgr` (the raw, un-blanked frame) is also given, each grid-snapped
+    match's Found-in-Raid state is read via detect_fir. A KAPPA-category match
+    (per `entry_cat`, entry id -> keep-list category id) confidently read as
+    NOT FiR is flagged `not_fir` and drawn amber instead of green/red — the
+    caller must exclude those from the one-click confirm bar, since a non-FiR
+    copy can't satisfy a Collector hand-in.  `fir is None` (indeterminate)
+    never sets `not_fir`.
+
+    Returns (annotated_image, detections); each detection carries `fir`
+    (True/False/None) and `not_fir` (bool).
     """
     if not tesseract_available():
         return img, []
@@ -1915,6 +2236,7 @@ def ocr_stash(img: Image.Image, alias_map, grid=None, cell_size=64):
     draw = ImageDraw.Draw(img, 'RGBA')
     detections = []
     seen_positions = set()
+    entry_cat = entry_cat or {}
 
     for i, text in enumerate(data['text']):
         text = text.strip()
@@ -1937,21 +2259,28 @@ def ocr_stash(img: Image.Image, alias_map, grid=None, cell_size=64):
         matched_alias, score, idx = match
         item = alias_map[idx][1]
 
-        color  = (80, 160, 80, 120) if item['acquired'] else (180, 50, 50, 140)
-        border = (80, 200, 80, 255) if item['acquired'] else (220, 60, 60, 255)
-
         # Text appears at the top-left of the item cell; snap to grid
         if grid:
             cx, cy = snap_to_cell(x, y, grid)
             rx1, ry1, rx2, ry2 = grid_rect(cx, cy, 1, 1, grid)
+            fir = detect_fir(img_bgr, grid, cx, cy, 1, 1) if img_bgr is not None else None
         else:
             rx1, ry1, rx2, ry2 = fallback_rect(x, y, w, h, 1, 1, cell_size)
+            fir = None
+
+        not_fir = entry_cat.get(item['id']) == 'kappa' and fir is False
+        if not_fir:
+            color, border = FIR_AMBER_RGB + (130,), FIR_AMBER_RGB + (255,)
+        else:
+            color  = (80, 160, 80, 120) if item['acquired'] else (180, 50, 50, 140)
+            border = (80, 200, 80, 255) if item['acquired'] else (220, 60, 60, 255)
 
         draw.rectangle([rx1, ry1, rx2, ry2], fill=color, outline=border, width=2)
         detections.append({
             'text': text, 'matched': item['name'], 'score': score,
             'acquired': item['acquired'], 'x': rx1, 'y': ry1,
             'w': rx2 - rx1, 'h': ry2 - ry1,
+            'fir': fir, 'not_fir': not_fir,
         })
 
     return img, detections
@@ -1967,11 +2296,15 @@ def _persist_grid(g):
     save_json(SETTINGS_PATH, s)
 
 
-def run_keep_scan():
+def run_keep_scan(from_calibration=False):
     """
     Capture → grid → OCR pass → icon-DB pass, annotated for the keep list.
-    Returns {image, detections, grid_src, warnings, checklist_matches}.
+    Returns {image, detections, grid, grid_src, warnings, checklist_matches}.
     Raises ScanError/Exception — callers decide how to surface it.
+
+    `from_calibration=True` reuses the region-picker's just-grabbed full-
+    monitor frame (cropped to the configured region) instead of live-
+    grabbing — see capture_for_scan.
     """
     _scan_state.update({'running': True, 'phase': 'capture',
                         'done': 0, 'total': 0, 'ts': time.time()})
@@ -1981,12 +2314,17 @@ def run_keep_scan():
         alias_map  = build_alias_map(keep_list)
         cell_size  = settings.get('cell_size', 64)
         warnings   = []
+        # entry id -> keep-list category id, so the FiR check below only ever
+        # gates KAPPA (Collector) entries — task/manual entries are unaffected.
+        entry_cat  = {e['id']: cat['id']
+                      for cat in keep_list['categories'] for e in cat['items']}
 
         if not tesseract_available():
             warnings.append('Tesseract OCR not installed — name reading disabled '
                             '(winget install UB-Mannheim.TesseractOCR)')
 
-        img, img_bgr = capture_stash_image(settings)
+        img, img_bgr = capture_for_scan(settings, from_calibration,
+                                        require_region=False, warnings=warnings)
 
         _scan_state['phase'] = 'grid'
         grid, grid_src = resolve_grid(img_bgr, settings, persist_fn=_persist_grid)
@@ -1994,12 +2332,17 @@ def run_keep_scan():
               f"origin=({grid['origin_x']},{grid['origin_y']})")
 
         # OCR pass — grid-snapped highlights for keep-list aliases
-        img, detections = ocr_stash(img, alias_map, grid=grid, cell_size=cell_size)
+        img, detections = ocr_stash(img, alias_map, grid=grid, cell_size=cell_size,
+                                    img_bgr=img_bgr, entry_cat=entry_cat)
 
         # Icon-DB pass (finds keep-list items OCR missed)
         _scan_state['phase'] = 'match'
         found_entries = {}   # entry_id -> entry, for the confirm-to-check bar
         for d in detections:
+            # A KAPPA match confidently read as non-FiR can't satisfy the
+            # Collector hand-in — never offer it on the one-click confirm bar.
+            if d.get('not_fir'):
+                continue
             for alias, entry in alias_map:
                 if entry['name'] == d['matched']:
                     found_entries[entry['id']] = entry
@@ -2037,14 +2380,24 @@ def run_keep_scan():
                 if pos_key in ocr_positions:
                     continue
                 ocr_positions.add(pos_key)
-                found_entries[entry['id']] = entry
-                color  = (80, 160, 80, 130) if entry['acquired'] else (180, 50, 50, 150)
-                border = (80, 200, 80, 255) if entry['acquired'] else (220, 60, 60, 255)
+
+                # Same FiR gate as the OCR pass above: a KAPPA entry whose
+                # detection reads confidently non-FiR is amber-flagged and
+                # kept off the confirm bar. `fir is None`/True → unchanged.
+                not_fir = entry_cat.get(entry['id']) == 'kappa' and d.get('fir') is False
+                if not_fir:
+                    color, border = FIR_AMBER_RGB + (130,), FIR_AMBER_RGB + (255,)
+                else:
+                    found_entries[entry['id']] = entry
+                    color  = (80, 160, 80, 130) if entry['acquired'] else (180, 50, 50, 150)
+                    border = (80, 200, 80, 255) if entry['acquired'] else (220, 60, 60, 255)
                 draw.rectangle([x, y, x + w, y + h], fill=color, outline=border, width=2)
+                name_suffix = ' (not FIR)' if not_fir else ''
                 detections.append({
-                    'text': f'[icon] {entry["name"]}', 'matched': entry['name'],
+                    'text': f'[icon] {entry["name"]}{name_suffix}', 'matched': entry['name'],
                     'score': d['score'], 'acquired': entry['acquired'],
                     'x': x, 'y': y, 'w': w, 'h': h,
+                    'fir': d.get('fir'), 'not_fir': not_fir,
                 })
 
         checklist_matches = [
@@ -2055,7 +2408,7 @@ def run_keep_scan():
         buf = BytesIO()
         img.save(buf, format='PNG')
         encoded = base64.b64encode(buf.getvalue()).decode()
-        return {'image': encoded, 'detections': detections, 'grid_src': grid_src,
+        return {'image': encoded, 'detections': detections, 'grid': grid, 'grid_src': grid_src,
                 'warnings': warnings, 'checklist_matches': checklist_matches}
     finally:
         _scan_state.update({'running': False, 'phase': None, 'ts': time.time()})
@@ -2153,6 +2506,22 @@ def last_scan():
 def scan_status():
     return jsonify(dict(_scan_state))
 
+def _exact_ids_status():
+    """Report the eft_hash validation-gate status for /api/health."""
+    try:
+        import eft_hash
+        status = eft_hash.get_status(DATA)
+        if not status:
+            return {'enabled': False}
+        return {
+            'enabled':   bool(status.get('enabled')),
+            'agreement': status.get('agreement'),
+            'provider':  status.get('provider'),
+        }
+    except Exception:
+        return {'enabled': False}
+
+
 @app.route('/api/health', methods=['GET'])
 def health():
     return jsonify({
@@ -2162,6 +2531,7 @@ def health():
         'icon_db_error':  _index_build_state.get('error') or _icon_db_error,
         'prices_cached':  os.path.exists(PRICES_PATH),
         'hotkey':         hotkey_manager.current,
+        'exact_ids':      _exact_ids_status(),
     })
 
 @app.route('/api/hotkey', methods=['POST'])
@@ -2178,8 +2548,10 @@ def set_hotkey():
 
 @app.route('/api/screenshot', methods=['POST'])
 def take_screenshot():
+    data = request.get_json(silent=True) or {}
+    from_calibration = bool(data.get('from_calibration'))
     try:
-        return jsonify(run_keep_scan())
+        return jsonify(run_keep_scan(from_calibration=from_calibration))
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
@@ -2216,7 +2588,7 @@ def add_item():
                 'name': data['name'],
                 'aliases': data.get('aliases', []),
                 'acquired': False,
-                'source': 'custom',   # wiki sync must never flag user items stale
+                'source': 'custom',   # wiki sync must never remove user-added items
             }
             if 'task' in data:
                 new_item['task'] = data['task']
@@ -2269,6 +2641,10 @@ def calibration_screenshot():
         monitor = sct.monitors[1]  # primary monitor
         raw = sct.grab(monitor)
         img = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX')
+    # Stash the full-monitor frame so a scan triggered right after the region
+    # save (from_calibration=True) can crop this instead of live-grabbing.
+    _last_calibration['bgr'] = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    _last_calibration['ts'] = time.time()
     buf = BytesIO()
     img.save(buf, format='JPEG', quality=75)
     encoded = base64.b64encode(buf.getvalue()).decode()
@@ -2310,7 +2686,12 @@ def api_tasks():
     except Exception as e:
         return jsonify({'error': str(e)}), 502
     progress = load_json(PROGRESS_PATH, default_progress)
-    return jsonify(compute_tasks_view(cache, progress))
+    settings = load_json(SETTINGS_PATH, default_settings)
+    kappa_only = settings.get('kappa_only_tasks', True)
+    qp = request.args.get('kappa_only')
+    if qp is not None:
+        kappa_only = qp not in ('0', 'false', 'False')
+    return jsonify(compute_tasks_view(cache, progress, kappa_only=kappa_only))
 
 @app.route('/api/tasks/refresh', methods=['POST'])
 def api_tasks_refresh():
@@ -2350,6 +2731,40 @@ def api_tasks_have():
     have[item_id] = max(0, int(have.get(item_id, 0)) + delta)
     save_json(PROGRESS_PATH, progress)
     return jsonify({'ok': True, 'have': have[item_id]})
+
+
+@app.route('/api/prestige', methods=['GET'])
+def api_prestige():
+    settings = load_json(SETTINGS_PATH, default_settings)
+    try:
+        levels = fetch_prestige_requirements()
+    except Exception as e:
+        return jsonify({'levels': [], 'current': settings.get('prestige', 3),
+                        'cache_age_minutes': None, 'error': str(e)})
+    cache = load_json(PRESTIGE_WIKI_PATH, lambda: None) if os.path.exists(PRESTIGE_WIKI_PATH) else None
+    age = round((time.time() - cache.get('timestamp', 0)) / 60, 1) if cache else None
+    return jsonify({'levels': levels, 'current': settings.get('prestige', 3),
+                    'cache_age_minutes': age})
+
+
+@app.route('/api/prestige/advance', methods=['POST'])
+def api_prestige_advance():
+    """New prestige: bumps settings['prestige'] (capped at 6), resets task/
+    hideout progress, and un-acquires every keep-list entry (kappa + manual).
+    Region/hotkey/grid/monitor and other settings fields are untouched."""
+    settings = load_json(SETTINGS_PATH, default_settings)
+    settings['prestige'] = min(6, settings.get('prestige', 0) + 1)
+    save_json(SETTINGS_PATH, settings)
+
+    save_json(PROGRESS_PATH, default_progress())
+
+    keep_list = load_json(KEEPLIST_PATH, default_keep_list)
+    for cat in keep_list['categories']:
+        for item in cat['items']:
+            item['acquired'] = False
+    save_json(KEEPLIST_PATH, keep_list)
+
+    return jsonify({'prestige': settings['prestige']})
 
 
 # ---------------------------------------------------------------------------
@@ -2462,14 +2877,16 @@ def icons_matcher_status():
 @app.route('/api/sell-scan', methods=['POST'])
 def sell_scan():
   try:
-    return _sell_scan_inner()
+    data = request.get_json(silent=True) or {}
+    from_calibration = bool(data.get('from_calibration'))
+    return _sell_scan_inner(from_calibration=from_calibration)
   except Exception as e:
     import traceback
     tb = traceback.format_exc()
     print(f"[sell_scan] ERROR:\n{tb}")
     return jsonify({'error': str(e), 'traceback': tb, 'image': None, 'results': [], 'grid': None})
 
-def _sell_scan_inner():
+def _sell_scan_inner(from_calibration=False):
     settings = load_json(SETTINGS_PATH, default_settings)
 
     # --- Icon DB required ----------------------------------------------------
@@ -2483,9 +2900,12 @@ def _sell_scan_inner():
     _scan_state.update({'running': True, 'phase': 'capture',
                         'done': 0, 'total': 0, 'ts': time.time()})
     try:
+        warnings = []
+
         # --- Screenshot (region required for sell scans) ----------------------
         try:
-            img, img_bgr = capture_stash_image(settings, require_region=True)
+            img, img_bgr = capture_for_scan(settings, from_calibration,
+                                            require_region=True, warnings=warnings)
         except ScanError as e:
             return jsonify({'image': None, 'results': [], 'grid': None,
                             'error': str(e)})
@@ -2505,7 +2925,6 @@ def _sell_scan_inner():
         keep_list = load_json(KEEPLIST_PATH, default_keep_list)
         protected = get_protected_ids(keep_list, price_idx)
 
-        warnings = []
         if not tesseract_available():
             warnings.append('Tesseract OCR not installed — name reading disabled '
                             '(winget install UB-Mannheim.TesseractOCR)')
@@ -2534,7 +2953,18 @@ def _sell_scan_inner():
             if not item_data:
                 continue
 
-            if d['item_id'] in protected:
+            prot = protected.get(d['item_id'])
+            # A FiR-only protection (Kappa hand-ins, or aggregate needs that
+            # are entirely FiR-gated) only holds for a FiR copy — a detection
+            # confidently read as non-FiR falls through to a normal sell rec
+            # instead of being force-kept.  `fir is None` (indeterminate) must
+            # never unprotect, so it still counts as protected here.
+            non_fir_note = False
+            if prot and prot['fir_only'] and d.get('fir') is False:
+                prot = None
+                non_fir_note = True
+
+            if prot:
                 # Cyan = KEEP: unmistakably different from flea-green and
                 # trader-gold so "do not sell" reads at a glance.
                 fx1 = grid['origin_x'] + d['col'] * grid['cell_w']
@@ -2551,16 +2981,23 @@ def _sell_scan_inner():
                     'col':          d['col'], 'row': d['row'],
                     'W':            d['W'],   'H':   d['H'],
                     'rotated':      d.get('rotated', False),
+                    'fir':          d.get('fir'),
                     'x': bx, 'y': by,
                     'recommend':    'keep',
                     'trader_name':  None, 'trader_price': None,
                     'flea_list':    None, 'flea_net':     None,
-                    'reason':       protected[d['item_id']],
+                    'reason':       prot['reason'],
                 })
                 continue
 
             rec = sell_recommendation(item_data)
-            bg  = (30, 150, 30, 230) if rec['recommend'] == 'flea' else (180, 120, 20, 230)
+            if non_fir_note:
+                rec['reason'] += ' - not FIR, cannot be handed in'
+            if rec['recommend'] == 'flea':
+                bg = (30, 150, 30, 230)
+            else:
+                trader_rgb = TRADER_COLORS_RGB.get(rec['trader_name'], DEFAULT_TRADER_BADGE_RGB)
+                bg = trader_rgb + (230,)
             draw_badge(draw, bx, by, str(num), bg=bg)
 
             results.append({
@@ -2570,6 +3007,8 @@ def _sell_scan_inner():
                 'col':          d['col'], 'row': d['row'],
                 'W':            d['W'],   'H':   d['H'],
                 'rotated':      d.get('rotated', False),
+                'fir':          d.get('fir'),
+                'non_fir_note': non_fir_note,
                 'x': bx, 'y': by,
                 **rec,
             })
