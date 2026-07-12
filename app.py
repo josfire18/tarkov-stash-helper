@@ -884,11 +884,26 @@ def save_icon_db(by_size_raw):
         }
     meta_bytes = json.dumps(meta).encode('utf-8')
     saves['META'] = np.frombuffer(meta_bytes, dtype=np.uint8)
-    np.savez_compressed(ICON_DB_PATH, **saves)
+    # Write-then-rename so no reader can ever observe a half-written archive:
+    # the compressed write takes tens of seconds for a full DB, and the status
+    # endpoints poll get_icon_db() the whole time — np.load on a partial zip
+    # raises BadZipFile ("File is not a zip file"). The tmp name must already
+    # end in .npz or numpy appends the extension and os.replace misses it.
+    tmp_path = ICON_DB_PATH + '.tmp.npz'
+    try:
+        np.savez_compressed(tmp_path, **saves)
+        os.replace(tmp_path, ICON_DB_PATH)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def load_icon_db():
     """Load the persisted icon DB, or None if missing/invalid/outdated."""
+    global _icon_db_error
     if not os.path.exists(ICON_DB_PATH):
         return None
     try:
@@ -915,9 +930,10 @@ def load_icon_db():
                 'tmpls':   [arr[i] for i in range(arr.shape[0])],
                 'masks':   [marr[i] for i in range(marr.shape[0])],
             }
-        return _finalize_db(by_size_raw)
+        db = _finalize_db(by_size_raw)
+        _icon_db_error = None   # a good load supersedes any earlier failure
+        return db
     except Exception as e:
-        global _icon_db_error
         _icon_db_error = f'Icon DB load failed: {e}'
         print(f"[icon_db] load failed: {e}")
         return None
@@ -929,9 +945,16 @@ _icon_db_error = None
 _icon_db_lock = threading.Lock()
 
 def get_icon_db():
-    """Return the runtime icon DB, loading from disk if needed."""
+    """Return the runtime icon DB, loading from disk if needed.
+
+    While a rebuild is in flight, don't touch the disk at all — the status
+    endpoints poll this several times a second, and each miss would re-read
+    (and re-log a version mismatch for) a file that's about to be replaced
+    anyway. The build thread publishes the fresh DB directly into _icon_db
+    when it finishes.
+    """
     global _icon_db
-    if _icon_db is None:
+    if _icon_db is None and not _index_build_state['running']:
         with _icon_db_lock:
             if _icon_db is None:
                 _icon_db = load_icon_db()
@@ -3027,7 +3050,7 @@ def icons_build_index():
         return jsonify({'ok': False, 'message': 'Build already in progress'})
 
     def _run():
-        global _icon_db
+        global _icon_db, _icon_db_error
         _index_build_state.update({'running': True, 'done': 0, 'total': 0,
                                    'ts': time.time(), 'error': None})
         try:
@@ -3039,6 +3062,7 @@ def icons_build_index():
             db = build_icon_db(prices, progress_cb=cb)
             with _icon_db_lock:
                 _icon_db = db
+                _icon_db_error = None   # fresh build supersedes any stale load error
             _index_build_state['done'] = _index_build_state['total']
             print(f"[icon_db] built: {sum(len(b['ids']) for b in db.values())} items")
         except Exception as e:
