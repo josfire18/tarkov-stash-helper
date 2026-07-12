@@ -360,6 +360,16 @@
   #health-banner.show { display: flex; }
   #health-banner code { background: #0d0f10; padding: 1px 6px; border-radius: 2px; }
 
+  /* ── Update banner ── */
+  #update-banner {
+    background: #0e1c20; border-bottom: 1px solid #1a4a5a;
+    padding: 7px 16px; font-size: 12px; color: #6ad4ee;
+    display: none; align-items: center; gap: 10px;
+  }
+  #update-banner.show { display: flex; }
+  #update-banner .spacer { flex: 1; }
+  #update-banner button { padding: 4px 10px; font-size: 11px; }
+
   /* ── Scan confirm bar ── */
   #confirm-bar {
     border-top: 1px solid #1a3a44;
@@ -412,11 +422,20 @@
   <span id="hotkey-badge" style="font-size:11px;color:#555;background:#131618;border:1px solid #2a2a2a;padding:4px 10px;border-radius:3px">
     Hotkey: <span id="hotkey-label" style="color:#c4a040">…</span> — press in-game to scan
   </span>
+  <span id="version-chip" style="font-size:10px;color:#555" title="Current version"></span>
   <button id="btn-calibrate" class="active">Set Stash Region</button>
   <button id="btn-settings" title="Settings">&#9881; Settings</button>
   <button id="btn-help">? Help</button>
   <button id="btn-reset" class="danger">Reset List</button>
 </header>
+
+<div id="update-banner">
+  <span id="update-banner-text"></span>
+  <div class="spacer"></div>
+  <button id="btn-update-apply" class="primary" style="display:none">Update &amp; restart</button>
+  <button id="btn-update-notes">Release notes</button>
+  <button id="btn-update-later">Later</button>
+</div>
 
 <div id="health-banner">
   <span id="health-banner-text"></span>
@@ -1250,7 +1269,60 @@ async function checkHealth() {
     } else {
       banner.classList.remove('show');
     }
+    if (h.app_version) {
+      document.getElementById('version-chip').textContent = `v${h.app_version}`;
+    }
   } catch (_) {}
+}
+
+// ---------------------------------------------------------------------------
+// Self-update — checks GitHub for a newer release, offers a one-click install
+// ---------------------------------------------------------------------------
+async function checkUpdate() {
+  let res;
+  try {
+    res = await api('GET', '/api/update-check');
+  } catch (_) { return; }
+  if (!res || !res.update_available) return;
+  if (localStorage.getItem('dismissed_update') === res.latest) return;
+
+  const banner = document.getElementById('update-banner');
+  // tag_name already carries the 'v' prefix (e.g. "v0.3.2") — strip before re-prefixing
+  document.getElementById('update-banner-text').textContent =
+    `⬆ v${String(res.latest).replace(/^v/, '')} available`;
+  const applyBtn = document.getElementById('btn-update-apply');
+  applyBtn.style.display = res.can_auto ? '' : 'none';
+  applyBtn.disabled = false;
+  applyBtn.textContent = 'Update & restart';
+
+  document.getElementById('btn-update-notes').onclick = () => {
+    if (res.notes_url) window.open(res.notes_url, '_blank');
+  };
+  document.getElementById('btn-update-later').onclick = () => {
+    localStorage.setItem('dismissed_update', res.latest);
+    banner.classList.remove('show');
+  };
+  applyBtn.onclick = async () => {
+    applyBtn.disabled = true;
+    try {
+      const r = await api('POST', '/api/update-apply');
+      if (r && r.ok) {
+        document.getElementById('update-banner-text').textContent =
+          'Downloading update — the app will close and restart itself…';
+        document.getElementById('btn-update-notes').style.display = 'none';
+        document.getElementById('btn-update-later').style.display = 'none';
+        applyBtn.style.display = 'none';
+      } else {
+        toast('✗ Update failed: ' + (r && r.error || 'unknown error'), 4500);
+        applyBtn.disabled = false;
+      }
+    } catch (e) {
+      toast('✗ Update failed: ' + e.message, 4500);
+      applyBtn.disabled = false;
+    }
+  };
+
+  banner.classList.add('show');
 }
 
 async function initSettings() {
@@ -1268,6 +1340,7 @@ initSettings();
 initRegionChip();
 checkHealth();
 pollHotkey();
+setTimeout(checkUpdate, 3000);
 </script>
 </body>
 </html>
