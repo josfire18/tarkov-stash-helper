@@ -64,8 +64,6 @@ if not shutil.which(pytesseract.pytesseract.tesseract_cmd):
     if os.path.exists(_default_tesseract):
         pytesseract.pytesseract.tesseract_cmd = _default_tesseract
 
-OCR_THRESHOLD        = 65    # fuzzy match score cutoff
-OCR_SCALE            = 2     # scale factor applied to image before OCR (larger = better accuracy)
 PRICE_CACHE_TTL      = 1800  # seconds (30 min)
 KAPPA_WIKI_TTL       = 86400 # seconds (24 h) — Collector list changes rarely
 PRESTIGE_WIKI_TTL    = 7 * 86400 # seconds (7 d) — Prestige requirements change only per major patch
@@ -100,7 +98,7 @@ NCC_MARGIN_MIN       = 0.04  # require top-1 NCC to beat top-2 by this much (rej
 ICON_DB_PATH         = os.path.join(DATA, 'icon_db.npz')
 DB_VERSION           = 6     # bump whenever the vector format changes; forces a rebuild
 _STASH_BG_BGR        = (38, 42, 44)  # Tarkov stash cell background colour (BGR) — used for blanked (masked-out) regions
-GRID_PITCH_1080P     = 63    # px per slot in-game @ 1080p (NOT 64 — verified from the icon cache geometry)
+GRID_PITCH_1080P     = 63    # px per slot in-game @ 1080p reference (icon-cache geometry); captures may be ANY pitch
 
 # EFT rarity background tints (BGR), calibrated by diffing tarkov.dev grid-image
 # (background baked) against base-image (transparent alpha) over 6 items/colour.
@@ -536,10 +534,10 @@ def download_base_image(item_id, url):
     except Exception:
         return None
 
-def _apply_label_blank(img_bgr):
+def _apply_label_blank(img_bgr, slot=None):
     """
     Overwrite Tarkov UI overlay regions with the stash background colour:
-      - top LABEL_BLANK_PX rows  → erases the white item-name label
+      - top label strip          → erases the white item-name label
       - top-right corner         → erases the Found-in-Raid ✓
       - bottom-right corner      → erases the white stack-count digits
 
@@ -547,15 +545,27 @@ def _apply_label_blank(img_bgr):
     Icon templates: those regions are already transparent-composited to bg,
                     so this is effectively a no-op (kept for symmetry).
 
+    `slot` is the px-per-slot of the image being blanked.  When given, the
+    blank regions scale as LABEL_BLANK_PX/CORNER_BLANK_PX fractions of the
+    canonical slot — so a 42px screen cell blanks the same *fraction* the
+    template masks blank at canonical resolution (floor'd, to stay inside the
+    mask-zeroed region).  When None (template-build path, ~63px sources), the
+    legacy fixed-pixel constants apply unchanged.
+
     Overwriting (not cropping) preserves image dimensions so the downstream
     resize step has no geometry distortion.
     """
     h, w = img_bgr.shape[:2]
     out = img_bgr.copy()
-    n = min(LABEL_BLANK_PX, h // 4)
+    if slot is None:
+        blank_px, corner_px = LABEL_BLANK_PX, CORNER_BLANK_PX
+    else:
+        blank_px  = int(LABEL_BLANK_PX  * slot / CANONICAL_PER_SLOT)
+        corner_px = int(CORNER_BLANK_PX * slot / CANONICAL_PER_SLOT)
+    n = min(blank_px, h // 4)
     if n > 0:
         out[:n, :] = _STASH_BG_BGR
-    c = min(CORNER_BLANK_PX, h // 3, w // 3)
+    c = min(corner_px, h // 3, w // 3)
     if c > 0:
         # top-right corner (FiR check mark)
         out[:c, w - c:] = _STASH_BG_BGR
@@ -584,8 +594,8 @@ def detect_fir(img_bgr, grid, col, row, W, H):
               risks incorrectly letting a real FiR item be sold or excluding
               it from a Kappa checklist it actually satisfies.
     """
-    x2 = grid['origin_x'] + (col + W) * grid['cell_w']
-    y1 = grid['origin_y'] + row * grid['cell_h']
+    x2 = int(round(grid['origin_x'] + (col + W) * grid['cell_w']))
+    y1 = int(round(grid['origin_y'] + row * grid['cell_h']))
     c = round(18 * grid['cell_w'] / 63)
     if c < 1:
         return None
@@ -610,8 +620,13 @@ def detect_fir(img_bgr, grid, col, row, W, H):
     n = int(bright_mask.sum())
     if n == 0:
         return False
+    # FIR_MIN_PX was calibrated on 63px cells (18px corner window); the ✓
+    # glyph's pixel count shrinks with the window AREA, so scale quadratically
+    # for low-pitch captures (floor 2 keeps a couple of stray bright px from
+    # reading as a checkmark).
+    min_px = max(2, round(FIR_MIN_PX * (grid['cell_w'] / 63.0) ** 2))
     max_px = FIR_MAX_FRAC * window.shape[0] * window.shape[1]
-    if FIR_MIN_PX <= n <= max_px:
+    if min_px <= n <= max_px:
         return True
     return None
 
@@ -756,42 +771,131 @@ def _build_one_template(item):
     return records
 
 
-def _finalize_db(by_size_raw):
+def _stack_raw(by_size_raw):
     """
-    Convert {(w,h): {'ids': [...], 'names': [...], 'tmpls': [uint8 vec, ...],
-                     'masks': [uint8 vec, ...]}} into runtime form with
-    precomputed masked-NCC vectors.
+    Convert {(w,h): {'ids': [...], ..., 'tmpls': [uint8 vec, ...], 'masks': [...]}}
+    into the compact RAW runtime form kept in memory:
+        {(w,h): {'ids','names','sources','rotated', 'T': (N,D) uint8, 'M': (N,D) uint8}}
+    Templates stay at canonical resolution (CANONICAL_PER_SLOT px/slot); the
+    matcher-ready float vectors are derived per screen pitch by get_db_at_pitch.
+    """
+    out = {}
+    for (w, h), b in by_size_raw.items():
+        if not b['tmpls']:
+            continue
+        n = len(b['ids'])
+        out[(w, h)] = {
+            'ids':     b['ids'],
+            'names':   b['names'],
+            'sources': b.get('sources', ['api'] * n),
+            'rotated': b.get('rotated', [False] * n),
+            'T':       np.vstack(b['tmpls']).astype(np.uint8),
+            'M':       np.vstack(b['masks']).astype(np.uint8),
+        }
+    return out
+
+
+def _finalize_arrays(tmpls, masks):
+    """
+    Precompute masked-NCC vectors from float32 (N, D) template/mask matrices.
 
     Each template is masked-mean-centred and unit-normed using ITS OWN mask,
     so at match time:
         scores = (tmpls_unit @ cell) / sqrt(masks @ cell² - (masks @ cell)² / mask_counts)
     correctly computes NCC restricted to each template's foreground region.
     """
-    out = {}
-    for (w, h), b in by_size_raw.items():
-        if not b['tmpls']:
-            continue
-        tmpls = np.vstack(b['tmpls']).astype(np.float32)    # (N, D)
-        masks = np.vstack(b['masks']).astype(np.float32)     # (N, D), 0/1
-        mask_counts = masks.sum(axis=1)                      # (N,)
-        # Per-template masked mean = Σ(mask * tmpl) / Σ(mask)
-        masked_means = (masks * tmpls).sum(axis=1) / np.maximum(mask_counts, 1.0)  # (N,)
-        # Mean-centre INSIDE the mask, zero OUTSIDE — multiply-by-mask handles both
-        centered = (tmpls - masked_means[:, None]) * masks
-        norms = np.linalg.norm(centered, axis=1, keepdims=True)
-        norms = np.where(norms > 1e-6, norms, 1.0)
-        tmpls_unit = (centered / norms).astype(np.float32)
-        n = len(b['ids'])
-        out[(w, h)] = {
-            'ids':         b['ids'],
-            'names':       b['names'],
-            'sources':     b.get('sources', ['api'] * n),
-            'rotated':     b.get('rotated', [False] * n),
-            'tmpls_unit':  tmpls_unit,
-            'masks':       masks.astype(np.float32),
-            'mask_counts': mask_counts.astype(np.float32),
-        }
-    return out
+    mask_counts = masks.sum(axis=1)                      # (N,)
+    # Per-template masked mean = Σ(mask * tmpl) / Σ(mask)
+    masked_means = (masks * tmpls).sum(axis=1) / np.maximum(mask_counts, 1.0)  # (N,)
+    # Mean-centre INSIDE the mask, zero OUTSIDE — multiply-by-mask handles both
+    centered = (tmpls - masked_means[:, None]) * masks
+    norms = np.linalg.norm(centered, axis=1, keepdims=True)
+    norms = np.where(norms > 1e-6, norms, 1.0)
+    tmpls_unit = (centered / norms).astype(np.float32)
+    return tmpls_unit, masks.astype(np.float32), mask_counts.astype(np.float32)
+
+
+def _slot_px(grid):
+    """
+    Matching slot size (px/slot) for a detected grid: the screen's own pitch,
+    capped at canonical (matching above canonical adds no information, only
+    memory), floored to keep degenerate grids from producing empty templates.
+    """
+    spw = max(16, min(CANONICAL_PER_SLOT, int(round(grid['cell_w']))))
+    sph = max(16, min(CANONICAL_PER_SLOT, int(round(grid['cell_h']))))
+    return spw, sph
+
+
+_pitch_db_cache = {}          # (spw, sph) -> matcher db; only most recent kept
+_pitch_db_lock = threading.Lock()
+
+
+def _invalidate_pitch_cache():
+    with _pitch_db_lock:
+        _pitch_db_cache.clear()
+
+
+def get_db_at_pitch(raw_db, spw, sph):
+    """
+    Matcher-ready DB at slot size (spw, sph): templates and masks resampled
+    from canonical resolution to the screen's own pitch (INTER_AREA — mirrors
+    the game's own downscale when it renders 63px cache icons in a smaller
+    window), then masked-NCC finalized.  Cached; a pitch change (rare) evicts
+    the previous pitch's arrays.
+    """
+    key = (spw, sph)
+    with _pitch_db_lock:
+        if key in _pitch_db_cache:
+            return _pitch_db_cache[key]
+        canonical = (spw == CANONICAL_PER_SLOT and sph == CANONICAL_PER_SLOT)
+        t0 = time.time()
+        out = {}
+        for (w, h), b in raw_db.items():
+            T, M = b['T'], b['M']
+            if canonical:
+                tmpls = T.astype(np.float32)
+                masks = (M > 0).astype(np.float32)
+            else:
+                n = T.shape[0]
+                src_h, src_w = h * CANONICAL_PER_SLOT, w * CANONICAL_PER_SLOT
+                dst_h, dst_w = h * sph, w * spw
+                D = dst_h * dst_w * 3
+                tmpls = np.empty((n, D), dtype=np.float32)
+                masks = np.empty((n, D), dtype=np.float32)
+                for i in range(n):
+                    img = T[i].reshape(src_h, src_w, 3)
+                    tmpls[i] = cv2.resize(img, (dst_w, dst_h),
+                                          interpolation=cv2.INTER_AREA).reshape(-1)
+                    m = M[i].reshape(src_h, src_w, 3)
+                    masks[i] = cv2.resize(m, (dst_w, dst_h),
+                                          interpolation=cv2.INTER_NEAREST).reshape(-1)
+                masks = (masks > 0).astype(np.float32)
+            tmpls_unit, masks_f, mask_counts = _finalize_arrays(tmpls, masks)
+            out[(w, h)] = {
+                'ids':         b['ids'],
+                'names':       b['names'],
+                'sources':     b['sources'],
+                'rotated':     b['rotated'],
+                'tmpls_unit':  tmpls_unit,
+                'masks':       masks_f,
+                'mask_counts': mask_counts,
+            }
+        if not canonical:
+            total = sum(len(b['ids']) for b in out.values())
+            print(f"[icon_db] resampled {total} templates to {spw}×{sph}px/slot "
+                  f"in {time.time() - t0:.1f}s")
+        _pitch_db_cache.clear()          # keep only the active pitch in RAM
+        _pitch_db_cache[key] = out
+        return out
+
+
+def get_matcher_db(grid):
+    """Raw DB → matcher DB at the grid's own pitch (None if no DB built)."""
+    raw = get_icon_db()
+    if not raw:
+        return None
+    spw, sph = _slot_px(grid)
+    return get_db_at_pitch(raw, spw, sph)
 
 
 def _append_record(by_size_raw, wh, item_id, name, source, rotated, vec, mask):
@@ -862,7 +966,7 @@ def build_icon_db(price_cache, progress_cb=None, workers=24, use_cache=True):
         progress_cb(done, total)
 
     save_icon_db(by_size_raw)
-    return _finalize_db(by_size_raw)
+    return _stack_raw(by_size_raw)
 
 
 def save_icon_db(by_size_raw):
@@ -930,7 +1034,7 @@ def load_icon_db():
                 'tmpls':   [arr[i] for i in range(arr.shape[0])],
                 'masks':   [marr[i] for i in range(marr.shape[0])],
             }
-        db = _finalize_db(by_size_raw)
+        db = _stack_raw(by_size_raw)
         _icon_db_error = None   # a good load supersedes any earlier failure
         return db
     except Exception as e:
@@ -965,15 +1069,24 @@ def get_icon_db():
 # Grid-cell identification using the canonical-template DB
 # ---------------------------------------------------------------------------
 
-def _cell_block(img_bgr, col, row, W, H, grid, pad=0):
-    """Pixel rect of a W×H cell block starting at (col, row), optionally padded."""
-    x = grid['origin_x'] + col * grid['cell_w'] - pad
-    y = grid['origin_y'] + row * grid['cell_h'] - pad
-    w = W * grid['cell_w'] + 2 * pad
-    h = H * grid['cell_h'] + 2 * pad
+def _cell_block(img_bgr, col, row, W, H, grid, pad=0, dx=0, dy=0):
+    """
+    Pixel rect of a W×H cell block starting at (col, row), optionally padded
+    and shifted by (dx, dy) whole pixels (alignment-refinement search).
+
+    Grid pitch/origin are floats (non-integer pitch is the norm for windowed
+    captures — 63·900/1080 = 52.5); each edge is rounded independently off the
+    accumulated float position so rounding error never drifts across the panel.
+    """
+    ox, oy = grid['origin_x'], grid['origin_y']
+    cw, ch = grid['cell_w'], grid['cell_h']
+    x1 = int(round(ox + col * cw)) + dx - pad
+    y1 = int(round(oy + row * ch)) + dy - pad
+    x2 = int(round(ox + (col + W) * cw)) + dx + pad
+    y2 = int(round(oy + (row + H) * ch)) + dy + pad
     sh, sw = img_bgr.shape[:2]
-    x1, y1 = max(0, x), max(0, y)
-    x2, y2 = min(sw, x + w), min(sh, y + h)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(sw, x2), min(sh, y2)
     if x2 <= x1 or y2 <= y1:
         return None
     return img_bgr[y1:y2, x1:x2]
@@ -998,28 +1111,39 @@ def _cell_is_empty(img_bgr, col, row, grid):
     return float(gray.std()) < 5.0 and above_bg < 0.04
 
 
-def _canonical_cell_vec(img_bgr, col, row, W, H, grid):
+def _native_cell_vec(img_bgr, col, row, W, H, grid, spw, sph, dx=0, dy=0):
     """
     Extract the (W×H) cell block from the screenshot and return a flat
-    float32 BGR vector at canonical resolution, ready for masked NCC.
+    float32 BGR vector at the matching slot size (spw×sph px/slot — the
+    screen's own pitch, capped at canonical), ready for masked NCC against
+    a get_db_at_pitch DB of the same slot size.
 
     Preprocessing:
-      1. _apply_label_blank — overwrites top rows + right corners with bg
-         colour to remove Tarkov's label, FiR ✓, and stack-count overlays.
-      2. Clip [0, 210] — suppresses residual white UI artefacts that have
+      1. Resize to the exact bucket dims (±1px rounding normalization; a
+         no-op when the pitch is integral).
+      2. _apply_label_blank(slot=sph) — overwrites top rows + right corners
+         with bg colour to remove Tarkov's label, FiR ✓, and stack-count
+         overlays, scaled to the slot size.
+      3. Clip [0, 210] — suppresses residual white UI artefacts that have
          no equivalent in the clean icon templates.
 
-    Per-template masked-mean-centring + unit-norming is done at match time
-    inside `identify_items_by_icon`, since each template uses its own mask.
+    (dx, dy) shifts the source crop by whole pixels for the alignment-
+    refinement search.  Per-template masked-mean-centring + unit-norming is
+    done at match time, since each template uses its own mask.
     """
-    crop = _cell_block(img_bgr, col, row, W, H, grid)
-    if crop is None or crop.shape[0] < 16 or crop.shape[1] < 16:
+    crop = _cell_block(img_bgr, col, row, W, H, grid, dx=dx, dy=dy)
+    if crop is None or crop.shape[0] < 8 or crop.shape[1] < 8:
         return None
-    crop = _apply_label_blank(crop)
-    canon = _canonical_bgr_flat(crop, W, H)   # clip + chroma-weighted Lab applied inside
-    return canon
+    tw, th = W * spw, H * sph
+    if crop.shape[1] != tw or crop.shape[0] != th:
+        crop = cv2.resize(crop, (tw, th), interpolation=cv2.INTER_AREA)
+    crop = _apply_label_blank(crop, slot=sph)
+    crop = np.clip(crop, 0, 210)
+    return crop.astype(np.float32).reshape(-1)
 
 
+OCR_FULL_MIN_PITCH  = 40  # px/slot at/above which the OCR label may override NCC identity
+OCR_AGREE_MIN_PITCH = 30  # px/slot at/above which the OCR label may confirm (never override) NCC
 OCR_LABEL_BASE   = 78   # rapidfuzz WRatio floor to consider an OCR name candidate at all
 OCR_AGREE_CUTOFF = 78   # OCR agrees with NCC → accept (mutual confirmation)
 OCR_OVER_CUTOFF  = 84   # OCR overrides a *different* NCC identity → needs this
@@ -1055,9 +1179,9 @@ def _ocr_cell_label(img_bgr, col, row, W, grid):
     like L1 / SJ12 / eTG-c that share one injector silhouette.
     Returns cleaned text (leading UI junk stripped) or ''.
     """
-    x = grid['origin_x'] + col * grid['cell_w']
-    y = grid['origin_y'] + row * grid['cell_h']
-    w = W * grid['cell_w']
+    x = int(round(grid['origin_x'] + col * grid['cell_w']))
+    y = int(round(grid['origin_y'] + row * grid['cell_h']))
+    w = int(round(W * grid['cell_w']))
     lh = max(12, int(round(grid['cell_h'] * 0.30)))
     sh, sw = img_bgr.shape[:2]
     x1, y1 = max(0, x), max(0, y)
@@ -1067,7 +1191,11 @@ def _ocr_cell_label(img_bgr, col, row, W, grid):
     if not tesseract_available():
         return ''
     strip = cv2.cvtColor(img_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-    strip = cv2.resize(strip, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+    # Upscale to a fixed ~80px strip height (min 4×): low-pitch captures need
+    # proportionally more magnification for Tesseract to resolve the label
+    # (measured +2–4% accuracy at 42–52px/slot over the flat 4×).
+    f = max(4, int(round(80.0 / strip.shape[0])))
+    strip = cv2.resize(strip, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC)
     try:
         txt = pytesseract.image_to_string(strip, config='--psm 7')
     except Exception:
@@ -1188,37 +1316,82 @@ def _best_with_margin(scores, ids):
     return i, top1, top1 - top2
 
 
-def validate_grid(grid, ui_scale=1.0, tol=0.12):
+GRID_ASPECT_TOL   = 0.10  # max |cell_w - cell_h| / max(...) — EFT slots are square on-screen
+GRID_MIN_STRENGTH = 1.6   # autocorr peak decisiveness floor (≈1 = no periodicity at all)
+
+
+def validate_grid(grid):
     """
-    True if the detected cell pitch is consistent with EFT's 63px/slot @1080p
-    (scaled by ui_scale).  Rejects autocorrelation locks onto 2× the true pitch
-    or on UI chrome.
+    True if a detected/persisted grid is internally plausible.
+
+    Deliberately does NOT compare against 63px or any absolute pitch: the
+    captured game window can be any resolution (windowed, Lossless Scaling,
+    stretched res), so the pitch is whatever it is.  Checks instead:
+      - pitch within the supported range on both axes,
+      - near-square cells (EFT slots are square on-screen),
+      - a decisive autocorrelation peak when the detection carries one
+        (persisted grids were validated when saved and carry none).
     """
     if not grid:
         return False
-    expected = GRID_PITCH_1080P * ui_scale
-    lo, hi = expected * (1 - tol) - 1, expected * (1 + tol) + 1
-    return lo <= grid['cell_w'] <= hi and lo <= grid['cell_h'] <= hi
+    cw, ch = grid.get('cell_w', 0), grid.get('cell_h', 0)
+    if not (GRID_PITCH_LO - 1 <= cw <= GRID_PITCH_HI + 1
+            and GRID_PITCH_LO - 1 <= ch <= GRID_PITCH_HI + 1):
+        return False
+    if abs(cw - ch) / max(cw, ch) > GRID_ASPECT_TOL:
+        return False
+    strength = grid.get('strength')
+    if strength is not None and strength < GRID_MIN_STRENGTH:
+        return False
+    return True
 
 
 def resolve_grid(img_bgr, settings, persist_fn=None):
     """
-    Detect the stash grid, validate it against the expected 63px pitch, and fall
-    back to the last-good persisted grid (settings['grid']) or the flat cell_size
-    when detection is noisy.  On a fresh valid detection, persist it via
-    persist_fn(grid) so one bad frame can't derail future scans.
+    Detect the stash grid at whatever pitch the capture actually has, validate
+    it for internal plausibility, and fall back to the last-good persisted grid
+    (settings['grid']) or the flat cell_size when detection is noisy.  On a
+    fresh valid detection, persist it via persist_fn(grid) so one bad frame
+    can't derail future scans.
     """
-    ui_scale = settings.get('ui_scale', 1.0)
     grid = detect_stash_grid(img_bgr)
-    if validate_grid(grid, ui_scale):
+    if validate_grid(grid):
         if persist_fn:
             persist_fn(grid)
         return grid, 'detected'
     saved = settings.get('grid')
-    if validate_grid(saved, ui_scale):
+    if validate_grid(saved):
         return dict(saved), 'persisted'
     cs = settings.get('cell_size', 64)
-    return {'cell_w': cs, 'cell_h': cs, 'origin_x': 0, 'origin_y': 0}, 'fallback'
+    return {'cell_w': float(cs), 'cell_h': float(cs),
+            'origin_x': 0.0, 'origin_y': 0.0}, 'fallback'
+
+
+def resolve_panels(img_bgr, settings, persist_fn=None):
+    """
+    Panel-aware grid resolution: detect every container/stash panel with its
+    own origin (see detect_panels).  Falls back to the single-grid chain
+    (resolve_grid: detect → persisted → flat cell_size) wrapped as one
+    full-frame panel, so it is never worse than the old behaviour.
+
+    Panels themselves are NOT persisted — open container windows move
+    between scans; only the pitch-bearing single grid persists (via
+    resolve_grid's persist_fn on the fallback path, or the first panel here).
+
+    Returns (panels, src) — panels is a non-empty list of grid dicts with
+    x0/y0/x1/y1 span bounds.
+    """
+    panels = detect_panels(img_bgr)
+    if panels:
+        if persist_fn:
+            # Persist the first panel as the last-good single grid: its pitch
+            # is frame-global, so it keeps the fallback chain plausible.
+            persist_fn({k: panels[0][k] for k in
+                        ('cell_w', 'cell_h', 'origin_x', 'origin_y')})
+        return panels, 'panels'
+    grid, src = resolve_grid(img_bgr, settings, persist_fn=persist_fn)
+    sh, sw = img_bgr.shape[:2]
+    return [{**grid, 'x0': 0, 'y0': 0, 'x1': sw, 'y1': sh}], src
 
 
 def _masked_ncc_scores(cell_vec, bucket):
@@ -1246,6 +1419,57 @@ def _masked_ncc_scores(cell_vec, bucket):
     denom      = np.sqrt(np.maximum(var_c, 1e-6))
     num        = tmpls_unit @ cell_vec          # (N,)
     return num / denom
+
+
+def _masked_ncc_scores_multi(cell_mat, masks, mask_counts, tmpls_unit):
+    """
+    Masked NCC of several cell vectors at once against a (sub)set of templates.
+    `cell_mat` is (S, D); returns (N, S) scores — same math as
+    _masked_ncc_scores, batched over the S candidate crops.
+    """
+    cm      = cell_mat.T                          # (D, S)
+    sums_c  = masks @ cm                          # (N, S)
+    sums_c2 = masks @ (cm * cm)                   # (N, S)
+    var_c   = sums_c2 - (sums_c * sums_c) / np.maximum(mask_counts, 1.0)[:, None]
+    denom   = np.sqrt(np.maximum(var_c, 1e-6))
+    num     = tmpls_unit @ cm                     # (N, S)
+    return num / denom
+
+
+SHIFT_RESCUE_TOP = 64    # templates re-scored against shifted crops
+SHIFT_RESCUE_PX  = 2     # ± whole-pixel alignment search radius
+SHIFT_GOOD_SCORE = 0.90  # unshifted match at/above this skips the rescue
+
+
+def _shift_rescue(img_bgr, col, row, W, H, grid, spw, sph, bucket, scores):
+    """
+    Re-score the current top templates against crops shifted ±SHIFT_RESCUE_PX
+    in x/y, keeping each template's best score over all shifts.  Absorbs the
+    residual grid-phase error that survives detection (sub-pixel pitch,
+    panel-edge rounding) — exactly the error that otherwise depresses the
+    correct template's NCC below its rivals'.
+    Returns an updated copy of `scores` (never lower than the input).
+    """
+    top = np.argsort(scores)[::-1][:SHIFT_RESCUE_TOP]
+    mats = []
+    for dy in range(-SHIFT_RESCUE_PX, SHIFT_RESCUE_PX + 1):
+        for dx in range(-SHIFT_RESCUE_PX, SHIFT_RESCUE_PX + 1):
+            if dx == 0 and dy == 0:
+                continue
+            v = _native_cell_vec(img_bgr, col, row, W, H, grid, spw, sph,
+                                 dx=dx, dy=dy)
+            if v is not None:
+                mats.append(v)
+    if not mats:
+        return scores
+    cell_mat = np.stack(mats)
+    shifted = _masked_ncc_scores_multi(cell_mat,
+                                       bucket['masks'][top],
+                                       bucket['mask_counts'][top],
+                                       bucket['tmpls_unit'][top])
+    out = scores.copy()
+    out[top] = np.maximum(out[top], shifted.max(axis=1))
+    return out
 
 
 def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCORE,
@@ -1277,10 +1501,25 @@ def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCOR
     sh, sw = img_bgr.shape[:2]
     cw, ch = grid['cell_w'], grid['cell_h']
     ox, oy = grid['origin_x'], grid['origin_y']
-    n_cols = max(0, (sw - ox) // cw)
-    n_rows = max(0, (sh - oy) // ch)
+    n_cols = max(0, int((sw - ox) // cw))
+    n_rows = max(0, int((sh - oy) // ch))
     if n_cols == 0 or n_rows == 0:
         return []
+
+    spw, sph = _slot_px(grid)
+    # OCR legibility gate: the printed label shrinks with the capture pitch.
+    # Below OCR_AGREE_MIN_PITCH Tesseract output is noise — overriding NCC with
+    # it is exactly the failure mode this gate exists to stop; between the two
+    # thresholds it may only *confirm* an NCC identity, never overturn one.
+    pitch = min(cw, ch)
+    if pitch >= OCR_FULL_MIN_PITCH:
+        ocr_mode = 'full'
+    elif pitch >= OCR_AGREE_MIN_PITCH:
+        ocr_mode = 'agree'
+    else:
+        ocr_mode = 'off'
+    if label_matcher is not None and ocr_mode == 'off':
+        label_matcher = None
 
     occ = _build_occupancy(img_bgr, grid, n_rows, n_cols)
     claimed = np.zeros((n_rows, n_cols), dtype=bool)
@@ -1311,7 +1550,7 @@ def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCOR
                 if frac < 0:
                     continue
 
-                vec = _canonical_cell_vec(img_bgr, col, row, W, H, grid)
+                vec = _native_cell_vec(img_bgr, col, row, W, H, grid, spw, sph)
                 if vec is None:
                     continue
                 bucket = icon_db[(W, H)]
@@ -1325,11 +1564,17 @@ def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCOR
                 if bucket['sources'][i] == 'cache-exact':
                     adj += CACHE_EXACT_BONUS
                 if best is None or adj > best[0]:
-                    best = (adj, sc, margin, i, W, H, bucket)
+                    best = (adj, sc, margin, i, W, H, bucket, scores)
 
             # Footprint / NCC identity (may be None if no vector could be built).
             if best is not None:
-                _, sc, margin, i, W, H, bucket = best
+                _, sc, margin, i, W, H, bucket, scores = best
+                # Alignment rescue: a weak or ambiguous winner is retried with
+                # ±2px-shifted crops before we trust (or reject) it.
+                if sc < SHIFT_GOOD_SCORE or margin < NCC_MARGIN_MIN:
+                    scores = _shift_rescue(img_bgr, col, row, W, H, grid,
+                                           spw, sph, bucket, scores)
+                    i, sc, margin = _best_with_margin(scores, bucket['ids'])
                 ncc_id, ncc_name = bucket['ids'][i], bucket['names'][i]
                 rotated, ncc_src = bool(bucket['rotated'][i]), bucket['sources'][i]
             else:
@@ -1348,6 +1593,10 @@ def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCOR
                     agrees = ncc_id is not None and o_id == ncc_id
                     if agrees:
                         passes = o_sc >= OCR_AGREE_CUTOFF
+                    elif ocr_mode != 'full':
+                        # Agree-only tier (45–55px pitch): a barely-legible label
+                        # may confirm the NCC identity but never overturn it.
+                        passes = False
                     elif len(text) <= 3:
                         passes = o_sc >= OCR_SHORT_OVER
                     else:
@@ -1378,7 +1627,8 @@ def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCOR
 
             # Over-sizing rescue: NCC's area bias can pick W>1 for a 1×1 item,
             # which garbles the OCR crop.  If nothing matched, retry OCR at 1×1.
-            if (label_matcher is not None and (W > 1 or H > 1)
+            # Override-class action, so it needs the full-legibility OCR tier.
+            if (label_matcher is not None and ocr_mode == 'full' and (W > 1 or H > 1)
                     and _footprint_fits(occ, claimed, col, row, 1, 1, n_cols, n_rows) >= 0):
                 text1 = _ocr_cell_label(img_bgr, col, row, 1, grid)
                 cand1 = label_matcher(text1, 1, 1)
@@ -1432,6 +1682,34 @@ def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCOR
     for d in detections:
         d['fir'] = detect_fir(img_bgr, grid, d['col'], d['row'], d['W'], d['H'])
     return detections
+
+
+def scan_all_panels(img_bgr, panels, matcher_db, label_matcher=None,
+                    progress_cb=None):
+    """
+    Run identify_items_by_icon over each detected panel's sub-image (so a
+    panel's occupancy/OCR/FiR never bleeds into a neighbour) and return one
+    flat detection list.  Each detection keeps its panel-local col/row and
+    gains `panel` (index) plus the absolute pixel rect `px, py, pw, ph` —
+    callers draw and hit-test with those and never need panel awareness.
+    """
+    all_dets = []
+    for pi, p in enumerate(panels):
+        crop = img_bgr[p['y0']:p['y1'], p['x0']:p['x1']]
+        local = {'cell_w': p['cell_w'], 'cell_h': p['cell_h'],
+                 'origin_x': p['origin_x'] - p['x0'],
+                 'origin_y': p['origin_y'] - p['y0']}
+        dets = identify_items_by_icon(crop, local, matcher_db,
+                                      label_matcher=label_matcher,
+                                      progress_cb=progress_cb)
+        for d in dets:
+            x1, y1, x2, y2 = grid_rect(d['col'], d['row'], d['W'], d['H'],
+                                       local, pad=0)
+            d['panel'] = pi
+            d['px'], d['py'] = x1 + p['x0'], y1 + p['y0']
+            d['pw'], d['ph'] = x2 - x1, y2 - y1
+        all_dets.extend(dets)
+    return all_dets
 
 
 
@@ -1541,10 +1819,10 @@ def default_settings():
         'scan_countdown': 3,   # seconds before the manual Scan button captures (0 = instant)
         'cell_size': 64,    # fallback: pixels per slot when grid auto-detect fails
         'icon_scale': 2.0,  # scale applied to tarkov.dev icons for template matching
-        'ui_scale': 1.0,    # EFT UI scale — expected grid pitch = 63 * ui_scale px/slot
         'icon_cache_path': None,  # override for the EFT icon-cache folder (auto-discovered if null)
         'grid': None,       # last-good detected grid, persisted so a noisy frame can't derail a scan
         'kappa_only_tasks': True,  # only kappaRequired tasks count toward task aggregate/KEEP totals
+        'debug_dumps': True,  # save raw frame + detections of the last few scans under data/debug/
     }
 
 def default_keep_list():
@@ -2096,32 +2374,68 @@ def get_protected_ids(keep_list, price_idx):
 # Grid detection helpers
 # ---------------------------------------------------------------------------
 
-def _dominant_period(sig, lo=35, hi=200):
+GRID_PITCH_LO = 24    # smallest supported px/slot (~720p windowed capture)
+GRID_PITCH_HI = 200   # largest supported px/slot (4K + UI scale headroom)
+
+
+def _dominant_period(sig, lo=GRID_PITCH_LO, hi=GRID_PITCH_HI):
     """
     Find the dominant repeating period in `sig` (1-D numpy array) using FFT
-    autocorrelation.  Returns an int period in [lo, hi] or None.
+    autocorrelation.  Returns (float period, strength) — the period is
+    parabola-interpolated around the integer peak (true pitch is non-integer
+    for arbitrary window sizes), strength is the peak-vs-median decisiveness
+    of the autocorrelation window (≈1 = no periodicity).  (None, 0.0) on
+    failure.
     """
     sig = np.asarray(sig, dtype=float)
     sig -= sig.mean()
     n = len(sig)
     if n < hi * 2:
-        return None
+        hi = max(lo + 1, n // 2 - 1)
+        if n < hi * 2:
+            return None, 0.0
     nfft = 1 << int(np.ceil(np.log2(2 * n)))
     S = np.fft.rfft(sig, n=nfft)
     acorr = np.fft.irfft(S * np.conj(S), n=nfft)[:n].real
     acorr[0] = 0
     window = acorr[lo:hi + 1]
     if window.max() <= 0:
-        return None
-    return int(lo + int(np.argmax(window)))
+        return None, 0.0
+    k = int(np.argmax(window))
+    # Harmonic disambiguation: a periodic grid also autocorrelates at 2×, 3×…
+    # its pitch, and a harmonic can edge out the fundamental (measured: 105px
+    # scoring 7.3 vs the true 52.5px at 6.8).  If a subharmonic of the peak
+    # also shows a strong local peak, the true pitch is the smallest such —
+    # without this, everything downstream runs on doubled cells.
+    peak = window[k]
+    for m in (4, 3, 2):
+        q = (lo + k) / m
+        if q < lo:
+            continue
+        qi = int(round(q)) - lo
+        a, b = max(0, qi - 3), min(len(window), qi + 4)
+        if window[a:b].max() >= 0.6 * peak:
+            k = a + int(np.argmax(window[a:b]))
+            break
+    p = lo + k
+    # Parabolic interpolation on the peak and its neighbours → sub-px period.
+    if 0 < k < len(window) - 1:
+        y0, y1, y2 = window[k - 1], window[k], window[k + 1]
+        denom = y0 - 2 * y1 + y2
+        if abs(denom) > 1e-9:
+            p += 0.5 * (y0 - y2) / denom
+    med = float(np.median(np.abs(window)))
+    strength = float(window[k] / med) if med > 0 else 0.0
+    return float(p), strength
 
 
 def _grid_phase(sig, period):
     """
-    Given a signal and a known period, find the offset (0..period-1) where
-    the repeating grid lines fall — i.e. the origin coordinate mod period.
+    Given a signal and a known (int) period, find the offset (0..period-1)
+    where the repeating grid lines fall — i.e. the origin coordinate mod period.
     """
     sig = np.asarray(sig, dtype=float)
+    period = int(round(period))
     n = len(sig)
     # Pad to a multiple of period then fold and sum
     r = n % period
@@ -2130,12 +2444,44 @@ def _grid_phase(sig, period):
     return int(np.argmax(folded))
 
 
-def detect_stash_grid(img_bgr, lo=35, hi=200):
+def _comb_score(proj, origin, period):
+    """Mean projection energy sampled at the comb origin + k·period."""
+    n = len(proj)
+    ks = np.arange(int((n - origin) / period) + 1)
+    idx = np.round(origin + ks * period).astype(int)
+    idx = idx[(idx >= 0) & (idx < n)]
+    if len(idx) < 3:
+        return -1.0
+    return float(proj[idx].mean())
+
+
+def _refine_axis(proj, period, phase):
+    """
+    Jointly refine (origin, period) as floats around the coarse estimates by
+    maximizing the grid-line comb response.  A fraction-of-a-pixel period
+    error accumulates to whole pixels across a 10+ cell panel, so this is
+    what keeps far cells aligned.
+    """
+    best = (float(phase), float(period), _comb_score(proj, phase, period))
+    for p in np.arange(period - 0.75, period + 0.751, 0.125):
+        if p < GRID_PITCH_LO * 0.8:
+            continue
+        for o in np.arange(phase - 3.0, phase + 3.01, 0.5):
+            s = _comb_score(proj, o, p)
+            if s > best[2]:
+                best = (float(o), float(p), s)
+    return best[0], best[1]
+
+
+def detect_stash_grid(img_bgr, lo=GRID_PITCH_LO, hi=GRID_PITCH_HI):
     """
     Auto-detect the Tarkov stash grid parameters from the screenshot.
-    Uses the repeating edge pattern (cell borders) via autocorrelation.
+    Uses the repeating edge pattern (cell borders) via autocorrelation, then
+    refines pitch+origin to sub-pixel precision via the comb response.
 
-    Returns dict {cell_w, cell_h, origin_x, origin_y} or None on failure.
+    Returns dict {cell_w, cell_h, origin_x, origin_y (floats), strength}
+    or None on failure.  Pitch is NOT assumed to be 63px — windowed captures
+    render the grid at whatever the game window's resolution dictates.
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
@@ -2145,52 +2491,201 @@ def detect_stash_grid(img_bgr, lo=35, hi=200):
     h_proj = np.sum(np.abs(gy), axis=1)   # rows → horizontal line positions
     v_proj = np.sum(np.abs(gx), axis=0)   # cols → vertical line positions
 
-    cell_h = _dominant_period(h_proj, lo, hi)
-    cell_w = _dominant_period(v_proj, lo, hi)
+    cell_h, strength_h = _dominant_period(h_proj, lo, hi)
+    cell_w, strength_w = _dominant_period(v_proj, lo, hi)
     if not cell_h or not cell_w:
         return None
 
     origin_y = _grid_phase(h_proj, cell_h)
     origin_x = _grid_phase(v_proj, cell_w)
+    origin_x, cell_w = _refine_axis(v_proj, cell_w, origin_x)
+    origin_y, cell_h = _refine_axis(h_proj, cell_h, origin_y)
+
+    # Origins are phases (mod pitch): shift into the first full cell.
+    while origin_x >= cell_w:
+        origin_x -= cell_w
+    while origin_y >= cell_h:
+        origin_y -= cell_h
 
     return {
-        'cell_w': int(cell_w), 'cell_h': int(cell_h),
-        'origin_x': int(origin_x), 'origin_y': int(origin_y),
+        'cell_w': float(cell_w), 'cell_h': float(cell_h),
+        'origin_x': float(origin_x), 'origin_y': float(origin_y),
+        'strength': round(min(strength_w, strength_h), 2),
     }
 
 
-def snap_to_cell(px, py, grid):
-    """Return the (col, row) grid cell index nearest to pixel (px, py)."""
-    cx = max(0, round((px - grid['origin_x']) / grid['cell_w']))
-    cy = max(0, round((py - grid['origin_y']) / grid['cell_h']))
-    return cx, cy
+PANEL_COMB_MIN  = 1.6  # folded comb peak/median floor to START a span
+PANEL_COMB_CONT = 1.5  # response floor AT THE RUN'S OWN PHASE to continue a span
+
+
+def _phase_spans(proj, pitch):
+    """
+    Segment a Sobel line projection into spans of stable grid-line phase.
+
+    Slides a 3-pitch window along `proj` in 1-pitch steps; each window folds
+    to a per-phase comb response.  A span starts at a window whose peak is
+    decisive, and CONTINUES for as long as later windows still respond at the
+    span's own phase (±2px, circular) — even when their argmax phase is
+    elsewhere.  That distinction matters: rows filled with multi-cell items
+    hide the interior grid lines, and overlay text (stack counts sit a fixed
+    ~13px above each cell bottom) then wins the argmax with a bogus phase,
+    while the true lines still respond well above background.  A window with
+    no response at the span phase (panel gap, chrome, world background, a
+    different panel) ends the span.
+
+    Two adjacent panels that happen to share a phase merge — harmless, since
+    a single grid then fits both by construction.
+
+    Returns [(start_px, end_px), ...].
+    """
+    p = int(round(pitch))
+    n = len(proj)
+    win = 3 * p
+    if n < win:
+        return [(0, n)] if n >= 2 * p else []
+    spans, cur = [], None          # cur = [start, end, phase]
+    for a in range(0, n - win + 1, p):
+        folded = proj[a:a + win].reshape(3, p).sum(axis=0)
+        med = float(np.median(folded))
+        if med <= 0:
+            med = 1.0
+        k = int(np.argmax(folded))
+        st = float(folded[k]) / med
+        if cur is not None:
+            j = int(cur[2] - a) % p
+            at_run = max(float(folded[(j + o) % p]) for o in (-2, -1, 0, 1, 2)) / med
+            if at_run >= PANEL_COMB_CONT:
+                cur[1] = a + win
+                continue
+            spans.append(cur)
+            cur = None
+        if st >= PANEL_COMB_MIN:
+            cur = [a, a + win, (a + k) % p]
+    if cur:
+        spans.append(cur)
+    return [(s, min(e, n)) for s, e, _ in spans if e - s >= 2 * p]
+
+
+def detect_panels(img_bgr):
+    """
+    Find every stash/container grid panel in the frame, each with its own
+    origin (pitch is shared — the whole frame renders at one UI scale, but
+    side-by-side container windows sit at arbitrary offsets, so a single
+    global phase misaligns all but one of them).
+
+    Two-level phase segmentation: split the x-axis into spans of stable
+    vertical-line phase, then split each span's y-axis the same way; each
+    (x-span × y-span) rectangle gets its own detect_stash_grid pass on the
+    sub-image (clean single-phase projections), keeping only validated grids
+    covering ≥2×2 cells.  Cells outside every panel never enter matching.
+
+    Returns [{cell_w, cell_h, origin_x, origin_y, strength, x0, y0, x1, y1}, ...]
+    (origins in full-frame coordinates); [] when nothing panel-like is found.
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+    gy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+    v_proj = gx.sum(axis=0)
+    pitch_x, _ = _dominant_period(v_proj)
+    if not pitch_x:
+        return []
+
+    sh, sw = img_bgr.shape[:2]
+    px_i = int(round(pitch_x))
+    candidates = []
+    for (sx0, sx1) in _phase_spans(v_proj, pitch_x):
+        h_local = gy[:, sx0:sx1].sum(axis=1)
+        pitch_y, _ = _dominant_period(h_local)
+        if not pitch_y:
+            continue
+        py_i = int(round(pitch_y))
+        for (sy0, sy1) in _phase_spans(h_local, pitch_y):
+            # Span boundaries are window-quantized (1-pitch steps) and can cut
+            # a panel's first/last row or column — expand by one pitch each
+            # way so the sub-detection sees the true edge lines; overlaps into
+            # a neighbour are trimmed at its first grid line below.
+            x0, x1 = max(0, sx0 - px_i), min(sw, sx1 + px_i)
+            y0, y1 = max(0, sy0 - py_i), min(sh, sy1 + py_i)
+            sub = img_bgr[y0:y1, x0:x1]
+            g = detect_stash_grid(sub)
+            if not g or not validate_grid(g):
+                continue
+            # One frame renders at one UI scale, so every real panel shares
+            # the frame-global pitch — a sub-crop straddling a panel seam
+            # "detects" some other periodicity and gets rejected here.  Both
+            # axes compare against the x pitch: a full-frame y reference is
+            # poisoned by cross-panel correlation when panels sit at offset
+            # heights (measured: two panels 27px apart → global y "pitch" 27),
+            # and validate_grid enforces near-square cells anyway.
+            if (abs(g['cell_w'] - pitch_x) / pitch_x > 0.06
+                    or abs(g['cell_h'] - pitch_x) / pitch_x > 0.10):
+                continue
+            if (x1 - x0) < 2 * g['cell_w'] or (y1 - y0) < 2 * g['cell_h']:
+                continue
+            g['origin_x'] += x0
+            g['origin_y'] += y0
+            candidates.append({**g, 'x0': int(x0), 'y0': int(y0),
+                               'x1': int(x1), 'y1': int(y1)})
+
+    # Containment dedupe: a seam window can survive the pitch check when its
+    # junk period lands near-global, but such candidates sit almost entirely
+    # INSIDE a stronger panel (measured ~100% contained) — whereas a true
+    # neighbouring panel only overlaps by the one-pitch span expansion
+    # (measured ~27%).  Drop only the mostly-contained ones.
+    candidates.sort(key=lambda p: -p.get('strength', 0.0))
+    panels = []
+    for c in candidates:
+        area = (c['x1'] - c['x0']) * (c['y1'] - c['y0'])
+        contested = False
+        for k in panels:
+            ix = max(0, min(c['x1'], k['x1']) - max(c['x0'], k['x0']))
+            iy = max(0, min(c['y1'], k['y1']) - max(c['y0'], k['y0']))
+            if ix * iy > 0.6 * area:
+                contested = True
+                break
+        if not contested:
+            panels.append(c)
+
+    # Trim residual pairwise overlap (from the one-pitch span expansion) at
+    # the downstream panel's first grid line, so every cell is scanned by
+    # exactly one panel — a neighbour's grid running misaligned over this
+    # panel's cells is how false "extra" detections are born.
+    for i in range(len(panels)):
+        for j in range(i + 1, len(panels)):
+            a, b = panels[i], panels[j]
+            ix = min(a['x1'], b['x1']) - max(a['x0'], b['x0'])
+            iy = min(a['y1'], b['y1']) - max(a['y0'], b['y0'])
+            if ix <= 0 or iy <= 0:
+                continue
+            if ix <= iy:   # side-by-side → split along x
+                left, right = (a, b) if a['x0'] <= b['x0'] else (b, a)
+                cut = int(max(left['x0'] + 1, right['origin_x'] - 2))
+                left['x1'] = min(left['x1'], cut)
+                right['x0'] = max(right['x0'], min(cut, int(right['origin_x'])))
+            else:          # stacked → split along y
+                top, bot = (a, b) if a['y0'] <= b['y0'] else (b, a)
+                cut = int(max(top['y0'] + 1, bot['origin_y'] - 2))
+                top['y1'] = min(top['y1'], cut)
+                bot['y0'] = max(bot['y0'], min(cut, int(bot['origin_y'])))
+    panels = [p for p in panels
+              if p['x1'] - p['x0'] >= 2 * p['cell_w']
+              and p['y1'] - p['y0'] >= 2 * p['cell_h']]
+    panels.sort(key=lambda p: (p['y0'], p['x0']))
+    return panels
 
 
 def grid_rect(cx, cy, slots_w, slots_h, grid, pad=2):
     """Pixel bounding rect for a grid region starting at (cx,cy), spanning slots."""
     ox, oy = grid['origin_x'], grid['origin_y']
     cw, ch = grid['cell_w'], grid['cell_h']
-    return (ox + cx * cw - pad,
-            oy + cy * ch - pad,
-            ox + (cx + slots_w) * cw + pad,
-            oy + (cy + slots_h) * ch + pad)
-
-
-def fallback_rect(x, y, w, h, slots_w, slots_h, cell_size, pad=2):
-    """
-    When grid detection fails, snap to a cell_size grid and extend by slot count.
-    Tarkov item labels appear at the TOP of the icon cell, so we expand downward.
-    """
-    snapped_x = round(x / cell_size) * cell_size
-    snapped_y = round(y / cell_size) * cell_size
-    return (snapped_x - pad,
-            snapped_y - pad,
-            snapped_x + slots_w * cell_size + pad,
-            snapped_y + slots_h * cell_size + pad)
+    return (int(round(ox + cx * cw)) - pad,
+            int(round(oy + cy * ch)) - pad,
+            int(round(ox + (cx + slots_w) * cw)) + pad,
+            int(round(oy + (cy + slots_h) * ch)) + pad)
 
 
 # ---------------------------------------------------------------------------
-# OCR helpers
+# Overlay helpers
 # ---------------------------------------------------------------------------
 
 _badge_font_cache = {}
@@ -2220,149 +2715,12 @@ def draw_badge(draw, x, y, label, bg=(30, 160, 30, 230)):
     draw.text((x + pad, y + pad), label, fill=(255, 255, 255, 255), font=font)
 
 
-def preprocess_for_ocr(img: Image.Image):
-    """
-    Scale the image up OCR_SCALE× and convert to grayscale.
-    Larger text is dramatically more accurate for Tesseract.
-    Returns (upscaled_pil_image, scale_factor).
-    """
-    arr = np.array(img)
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    h, w = gray.shape
-    up = cv2.resize(gray, (w * OCR_SCALE, h * OCR_SCALE), interpolation=cv2.INTER_LANCZOS4)
-    return Image.fromarray(up), float(OCR_SCALE)
-
-
-def group_ocr_by_lines(ocr_data, scale=1.0):
-    """
-    Aggregate Tesseract word-level results into line-level phrases.
-    Coordinates are divided by `scale` to map back to original image space.
-    Returns list of {'text', 'x', 'y', 'w', 'h', 'conf'}.
-    """
-    from collections import defaultdict
-    lines = defaultdict(list)
-    for i, text in enumerate(ocr_data['text']):
-        text = text.strip()
-        if not text or ocr_data['level'][i] != 5:   # word level only
-            continue
-        conf = int(ocr_data['conf'][i])
-        if conf < 15:
-            continue
-        key = (ocr_data['block_num'][i], ocr_data['par_num'][i], ocr_data['line_num'][i])
-        lines[key].append({
-            'text': text,
-            'x': ocr_data['left'][i],   'y': ocr_data['top'][i],
-            'w': ocr_data['width'][i],  'h': ocr_data['height'][i],
-            'conf': conf,
-        })
-
-    result = []
-    for words in lines.values():
-        if not words:
-            continue
-        full_text = ' '.join(w['text'] for w in words)
-        x1 = min(w['x'] for w in words)
-        y1 = min(w['y'] for w in words)
-        x2 = max(w['x'] + w['w'] for w in words)
-        y2 = max(w['y'] + w['h'] for w in words)
-        result.append({
-            'text': full_text,
-            'x': int(x1 / scale), 'y': int(y1 / scale),
-            'w': int((x2 - x1) / scale), 'h': int((y2 - y1) / scale),
-            'conf': sum(w['conf'] for w in words) / len(words),
-        })
-    return result
-
-
-def build_alias_map(keep_list):
-    """Returns list of (alias_lower, item) for fuzzy matching."""
-    entries = []
-    for cat in keep_list['categories']:
-        for item in cat['items']:
-            entries.append((item['name'].lower(), item))
-            for alias in item.get('aliases', []):
-                entries.append((alias.lower(), item))
-    return entries
-
-
 # PIL's ImageDraw takes RGB(A) tuples (the highlight overlay is composited
-# onto `img`, a PIL Image, throughout both the OCR and icon-DB passes below —
-# unlike the OpenCV/BGR pipeline the rest of this module uses for matching).
+# onto `img`, a PIL Image, in the icon-DB pass below — unlike the OpenCV/BGR
+# pipeline the rest of this module uses for matching).
 # This is the RGB equivalent of the amber/orange (0,165,255) BGR the FiR
 # feature spec calls for, so it renders as amber rather than blue on screen.
 FIR_AMBER_RGB = (255, 165, 0)
-
-def ocr_stash(img: Image.Image, alias_map, grid=None, cell_size=64, img_bgr=None, entry_cat=None):
-    """
-    Run OCR on stash image.  When `grid` is provided (from detect_stash_grid),
-    highlights snap precisely to cell boundaries with correct multi-slot sizing.
-
-    When `img_bgr` (the raw, un-blanked frame) is also given, each grid-snapped
-    match's Found-in-Raid state is read via detect_fir. A KAPPA-category match
-    (per `entry_cat`, entry id -> keep-list category id) confidently read as
-    NOT FiR is flagged `not_fir` and drawn amber instead of green/red — the
-    caller must exclude those from the one-click confirm bar, since a non-FiR
-    copy can't satisfy a Collector hand-in.  `fir is None` (indeterminate)
-    never sets `not_fir`.
-
-    Returns (annotated_image, detections); each detection carries `fir`
-    (True/False/None) and `not_fir` (bool).
-    """
-    if not tesseract_available():
-        return img, []
-    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT,
-                                     config='--psm 11 --oem 3')
-    draw = ImageDraw.Draw(img, 'RGBA')
-    detections = []
-    seen_positions = set()
-    entry_cat = entry_cat or {}
-
-    for i, text in enumerate(data['text']):
-        text = text.strip()
-        if not text or len(text) < 3:
-            continue
-        if int(data['conf'][i]) < 20:
-            continue
-
-        x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-        pos_key = (x // 10, y // 10)
-        if pos_key in seen_positions:
-            continue
-        seen_positions.add(pos_key)
-
-        aliases = [a for a, _ in alias_map]
-        match = rfuzz.extractOne(text.lower(), aliases, score_cutoff=OCR_THRESHOLD)
-        if not match:
-            continue
-
-        matched_alias, score, idx = match
-        item = alias_map[idx][1]
-
-        # Text appears at the top-left of the item cell; snap to grid
-        if grid:
-            cx, cy = snap_to_cell(x, y, grid)
-            rx1, ry1, rx2, ry2 = grid_rect(cx, cy, 1, 1, grid)
-            fir = detect_fir(img_bgr, grid, cx, cy, 1, 1) if img_bgr is not None else None
-        else:
-            rx1, ry1, rx2, ry2 = fallback_rect(x, y, w, h, 1, 1, cell_size)
-            fir = None
-
-        not_fir = entry_cat.get(item['id']) == 'kappa' and fir is False
-        if not_fir:
-            color, border = FIR_AMBER_RGB + (130,), FIR_AMBER_RGB + (255,)
-        else:
-            color  = (80, 160, 80, 120) if item['acquired'] else (180, 50, 50, 140)
-            border = (80, 200, 80, 255) if item['acquired'] else (220, 60, 60, 255)
-
-        draw.rectangle([rx1, ry1, rx2, ry2], fill=color, outline=border, width=2)
-        detections.append({
-            'text': text, 'matched': item['name'], 'score': score,
-            'acquired': item['acquired'], 'x': rx1, 'y': ry1,
-            'w': rx2 - rx1, 'h': ry2 - ry1,
-            'fir': fir, 'not_fir': not_fir,
-        })
-
-    return img, detections
 
 
 # ---------------------------------------------------------------------------
@@ -2375,9 +2733,43 @@ def _persist_grid(g):
     save_json(SETTINGS_PATH, s)
 
 
+DEBUG_DIR  = os.path.join(DATA, 'debug')
+DEBUG_KEEP = 3   # scan bundles kept (ring buffer)
+
+
+def _save_debug_bundle(img_bgr, panels, detections, kind):
+    """
+    Persist the raw frame + detected panels + every raw detection for the
+    last few scans under data/debug/scan-<ts>-<kind>/.  This is what turns
+    "that scan looked wrong" into an actionable report: the frame doubles as
+    an eval image (test_scan.py --label data/debug/.../frame.png) and the
+    JSON shows exactly what the matcher decided.  Best-effort — a failed
+    dump must never break a scan.
+    """
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        name = f'scan-{int(time.time() * 1000)}-{kind}'
+        d = os.path.join(DEBUG_DIR, name)
+        os.makedirs(d, exist_ok=True)
+        cv2.imwrite(os.path.join(d, 'frame.png'), img_bgr)
+        with open(os.path.join(d, 'scan.json'), 'w', encoding='utf-8') as f:
+            json.dump({'kind': kind, 'panels': panels, 'detections': detections},
+                      f, indent=1, ensure_ascii=False, default=str)
+        old = sorted(p for p in os.listdir(DEBUG_DIR) if p.startswith('scan-'))
+        for stale in old[:-DEBUG_KEEP]:
+            shutil.rmtree(os.path.join(DEBUG_DIR, stale), ignore_errors=True)
+    except Exception as e:
+        print(f'[debug] bundle save failed: {e}')
+
+
 def run_keep_scan(from_calibration=False):
     """
-    Capture → grid → OCR pass → icon-DB pass, annotated for the keep list.
+    Capture → panel grids → icon-DB identification, annotated for the keep
+    list.  Identity comes exclusively from the icon matcher (OCR participates
+    only as the label-fusion layer inside identify_items_by_icon) — the old
+    whole-image OCR sweep drew fuzzy-matched boxes on essentially random
+    cells and suppressed correct icon matches at those spots, so it is gone.
+
     Returns {image, detections, grid, grid_src, warnings, checklist_matches}.
     Raises ScanError/Exception — callers decide how to surface it.
 
@@ -2390,8 +2782,6 @@ def run_keep_scan(from_calibration=False):
     try:
         settings   = load_json(SETTINGS_PATH, default_settings)
         keep_list  = load_json(KEEPLIST_PATH, default_keep_list)
-        alias_map  = build_alias_map(keep_list)
-        cell_size  = settings.get('cell_size', 64)
         warnings   = []
         # entry id -> keep-list category id, so the FiR check below only ever
         # gates KAPPA (Collector) entries — task/manual entries are unaffected.
@@ -2399,33 +2789,21 @@ def run_keep_scan(from_calibration=False):
                       for cat in keep_list['categories'] for e in cat['items']}
 
         if not tesseract_available():
-            warnings.append('Tesseract OCR not installed — name reading disabled '
+            warnings.append('Tesseract OCR not installed — label reading disabled '
                             '(winget install UB-Mannheim.TesseractOCR)')
 
         img, img_bgr = capture_for_scan(settings, from_calibration,
                                         require_region=False, warnings=warnings)
 
         _scan_state['phase'] = 'grid'
-        grid, grid_src = resolve_grid(img_bgr, settings, persist_fn=_persist_grid)
-        print(f"Grid[{grid_src}]: cell={grid['cell_w']}×{grid['cell_h']} "
-              f"origin=({grid['origin_x']},{grid['origin_y']})")
+        panels, grid_src = resolve_panels(img_bgr, settings, persist_fn=_persist_grid)
+        grid = panels[0]
+        print(f"Grid[{grid_src}]: {len(panels)} panel(s), "
+              f"cell={grid['cell_w']:.2f}×{grid['cell_h']:.2f} "
+              f"origin=({grid['origin_x']:.1f},{grid['origin_y']:.1f})")
 
-        # OCR pass — grid-snapped highlights for keep-list aliases
-        img, detections = ocr_stash(img, alias_map, grid=grid, cell_size=cell_size,
-                                    img_bgr=img_bgr, entry_cat=entry_cat)
-
-        # Icon-DB pass (finds keep-list items OCR missed)
-        _scan_state['phase'] = 'match'
+        detections    = []
         found_entries = {}   # entry_id -> entry, for the confirm-to-check bar
-        for d in detections:
-            # A KAPPA match confidently read as non-FiR can't satisfy the
-            # Collector hand-in — never offer it on the one-click confirm bar.
-            if d.get('not_fir'):
-                continue
-            for alias, entry in alias_map:
-                if entry['name'] == d['matched']:
-                    found_entries[entry['id']] = entry
-                    break
 
         prices    = get_prices()
         price_idx = build_price_index(prices)
@@ -2440,29 +2818,27 @@ def run_keep_scan(from_calibration=False):
             warnings.append('Icon DB not built — icon matching skipped '
                             '(build it from the Sell Advisor page)')
         if icon_db and keepid_to_entry:
+            _scan_state['phase'] = 'resample'
+            matcher_db = get_matcher_db(grid)
+            _scan_state['phase'] = 'match'
             draw = ImageDraw.Draw(img, 'RGBA')
             label_matcher = build_label_matcher(prices)
             def _cb(done, total):
                 _scan_state['done'], _scan_state['total'] = done, total
-            ocr_positions = {(d['x'] // 20, d['y'] // 20) for d in detections}
-            for d in identify_items_by_icon(img_bgr, grid, icon_db,
-                                            label_matcher=label_matcher,
-                                            progress_cb=_cb):
+            all_dets = scan_all_panels(img_bgr, panels, matcher_db,
+                                       label_matcher=label_matcher,
+                                       progress_cb=_cb)
+            if settings.get('debug_dumps', True):
+                _save_debug_bundle(img_bgr, panels, all_dets, 'keep')
+            for d in all_dets:
                 entry = keepid_to_entry.get(d['item_id'])
                 if not entry:
                     continue
-                x = grid['origin_x'] + d['col'] * grid['cell_w']
-                y = grid['origin_y'] + d['row'] * grid['cell_h']
-                w = d['W'] * grid['cell_w']
-                h = d['H'] * grid['cell_h']
-                pos_key = (x // 20, y // 20)
-                if pos_key in ocr_positions:
-                    continue
-                ocr_positions.add(pos_key)
+                x, y, w, h = d['px'], d['py'], d['pw'], d['ph']
 
-                # Same FiR gate as the OCR pass above: a KAPPA entry whose
-                # detection reads confidently non-FiR is amber-flagged and
-                # kept off the confirm bar. `fir is None`/True → unchanged.
+                # A KAPPA entry whose detection reads confidently non-FiR
+                # can't satisfy the Collector hand-in: amber-flag it and keep
+                # it off the confirm bar. `fir is None`/True → unchanged.
                 not_fir = entry_cat.get(entry['id']) == 'kappa' and d.get('fir') is False
                 if not_fir:
                     color, border = FIR_AMBER_RGB + (130,), FIR_AMBER_RGB + (255,)
@@ -2473,7 +2849,7 @@ def run_keep_scan(from_calibration=False):
                 draw.rectangle([x, y, x + w, y + h], fill=color, outline=border, width=2)
                 name_suffix = ' (not FIR)' if not_fir else ''
                 detections.append({
-                    'text': f'[icon] {entry["name"]}{name_suffix}', 'matched': entry['name'],
+                    'text': f'{entry["name"]}{name_suffix}', 'matched': entry['name'],
                     'score': d['score'], 'acquired': entry['acquired'],
                     'x': x, 'y': y, 'w': w, 'h': h,
                     'fir': d.get('fir'), 'not_fir': not_fir,
@@ -3021,11 +3397,13 @@ def prices_refresh():
 
 @app.route('/api/debug/grid', methods=['POST'])
 def debug_grid():
-    """Capture the configured region and return detected grid parameters."""
+    """Capture the configured region and return detected grid/panel parameters."""
     settings = load_json(SETTINGS_PATH, default_settings)
     img, img_bgr = capture_stash_image(settings)
     grid = detect_stash_grid(img_bgr)
-    return jsonify({'grid': grid, 'img_size': [img.width, img.height]})
+    panels = detect_panels(img_bgr)
+    return jsonify({'grid': grid, 'panels': panels,
+                    'img_size': [img.width, img.height]})
 
 @app.route('/api/icons/prefetch', methods=['POST'])
 def icons_prefetch():
@@ -3063,6 +3441,7 @@ def icons_build_index():
             with _icon_db_lock:
                 _icon_db = db
                 _icon_db_error = None   # fresh build supersedes any stale load error
+            _invalidate_pitch_cache()   # pitch-resampled copies of the old DB are stale
             _index_build_state['done'] = _index_build_state['total']
             print(f"[icon_db] built: {sum(len(b['ids']) for b in db.values())} items")
         except Exception as e:
@@ -3139,11 +3518,13 @@ def _sell_scan_inner(from_calibration=False):
             return jsonify({'image': None, 'results': [], 'grid': None,
                             'error': str(e)})
 
-        # --- Grid detection (constrained to the 63px pitch, persisted) -------
+        # --- Grid detection (any pitch, per-panel origins, persisted) --------
         _scan_state['phase'] = 'grid'
-        grid, grid_src = resolve_grid(img_bgr, settings, persist_fn=_persist_grid)
-        print(f"Grid[{grid_src}]: cell={grid['cell_w']}×{grid['cell_h']} "
-              f"origin=({grid['origin_x']},{grid['origin_y']})")
+        panels, grid_src = resolve_panels(img_bgr, settings, persist_fn=_persist_grid)
+        grid = panels[0]
+        print(f"Grid[{grid_src}]: {len(panels)} panel(s), "
+              f"cell={grid['cell_w']:.2f}×{grid['cell_h']:.2f} "
+              f"origin=({grid['origin_x']:.1f},{grid['origin_y']:.1f})")
 
         prices     = get_prices()
         price_idx  = build_price_index(prices)
@@ -3159,24 +3540,27 @@ def _sell_scan_inner(from_calibration=False):
                             '(winget install UB-Mannheim.TesseractOCR)')
 
         # --- NCC + OCR-label identification (uses existing icon DB) ----------
+        _scan_state['phase'] = 'resample'
+        matcher_db = get_matcher_db(grid)
         _scan_state['phase'] = 'match'
         def _cb(done, total):
             _scan_state['done'], _scan_state['total'] = done, total
         label_matcher = build_label_matcher(prices)
-        raw_detections = identify_items_by_icon(img_bgr, grid, icon_db,
-                                                label_matcher=label_matcher,
-                                                progress_cb=_cb)
+        raw_detections = scan_all_panels(img_bgr, panels, matcher_db,
+                                         label_matcher=label_matcher,
+                                         progress_cb=_cb)
         print(f"[sell_scan] matches: {len(raw_detections)}")
+        if settings.get('debug_dumps', True):
+            _save_debug_bundle(img_bgr, panels, raw_detections, 'sell')
 
-        # --- Number items in row-major order, KEEP items highlighted cyan ----
+        # --- Number items in reading order, KEEP items highlighted cyan ------
         draw    = ImageDraw.Draw(img, 'RGBA')
         results = []
         num     = 1
 
         keep_results = []   # KEEP items — appended after numbered items
-        for d in sorted(raw_detections, key=lambda r: (r['row'], r['col'])):
-            bx = grid['origin_x'] + d['col'] * grid['cell_w'] + 2
-            by = grid['origin_y'] + d['row'] * grid['cell_h'] + 2
+        for d in sorted(raw_detections, key=lambda r: (r['panel'], r['row'], r['col'])):
+            bx, by = d['px'] + 2, d['py'] + 2
 
             item_data = id_to_item.get(d['item_id'])
             if not item_data:
@@ -3196,10 +3580,8 @@ def _sell_scan_inner(from_calibration=False):
             if prot:
                 # Cyan = KEEP: unmistakably different from flea-green and
                 # trader-gold so "do not sell" reads at a glance.
-                fx1 = grid['origin_x'] + d['col'] * grid['cell_w']
-                fy1 = grid['origin_y'] + d['row'] * grid['cell_h']
-                fx2 = fx1 + d['W'] * grid['cell_w']
-                fy2 = fy1 + d['H'] * grid['cell_h']
+                fx1, fy1 = d['px'], d['py']
+                fx2, fy2 = d['px'] + d['pw'], d['py'] + d['ph']
                 draw.rectangle([fx1, fy1, fx2, fy2],
                                fill=(0, 180, 220, 60), outline=(0, 220, 255, 255), width=3)
                 draw_badge(draw, bx, by, 'KEEP', bg=(0, 140, 180, 230))
@@ -3212,6 +3594,7 @@ def _sell_scan_inner(from_calibration=False):
                     'rotated':      d.get('rotated', False),
                     'fir':          d.get('fir'),
                     'x': bx, 'y': by,
+                    'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph'],
                     'recommend':    'keep',
                     'trader_name':  None, 'trader_price': None,
                     'flea_list':    None, 'flea_net':     None,
@@ -3239,6 +3622,7 @@ def _sell_scan_inner(from_calibration=False):
                 'fir':          d.get('fir'),
                 'non_fir_note': non_fir_note,
                 'x': bx, 'y': by,
+                'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph'],
                 **rec,
             })
             num += 1

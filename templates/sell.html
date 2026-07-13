@@ -833,16 +833,20 @@ function buildResultRow(r) {
   }
 
   // Click-to-highlight: jump to this item's cell in the annotated image.
-  if (r.col != null && r.row != null && r.W != null && r.H != null) {
+  // The backend sends the absolute pixel rect (px/py/pw/ph); with multiple
+  // container panels col/row are panel-local, so the lastGrid math is only
+  // a fallback for old responses.
+  if (r.px != null || (r.col != null && r.row != null && r.W != null && r.H != null)) {
     row.classList.add('clickable');
     row.title = 'Click to highlight in the scan image';
     row.addEventListener('click', () => {
-      if (!lastGrid) return;
-      const px = lastGrid.origin_x + r.col * lastGrid.cell_w;
-      const py = lastGrid.origin_y + r.row * lastGrid.cell_h;
-      const pw = r.W * lastGrid.cell_w;
-      const ph = r.H * lastGrid.cell_h;
-      highlightCell(px, py, pw, ph);
+      if (r.px != null) {
+        highlightCell(r.px, r.py, r.pw, r.ph);
+      } else if (lastGrid) {
+        const px = lastGrid.origin_x + r.col * lastGrid.cell_w;
+        const py = lastGrid.origin_y + r.row * lastGrid.cell_h;
+        highlightCell(px, py, r.W * lastGrid.cell_w, r.H * lastGrid.cell_h);
+      }
     });
   }
 

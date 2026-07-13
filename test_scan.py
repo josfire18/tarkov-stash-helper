@@ -47,12 +47,17 @@ from app import (
     resolve_grid,
     validate_grid,
     identify_items_by_icon,
+    build_label_matcher,
+    tesseract_available,
     load_icon_db,
     load_json,
     default_settings,
     SETTINGS_PATH,
+    PRICES_PATH,
     _cell_block,
-    _canonical_cell_vec,
+    _native_cell_vec,
+    _slot_px,
+    get_db_at_pitch,
     _masked_ncc_scores,
     _best_with_margin,
     ICON_MATCH_MIN_SCORE,
@@ -71,21 +76,51 @@ def _load_grid(img_bgr):
     return grid, src
 
 
-def scan_image(img_bgr, icon_db):
-    """Grid detection + NCC identification. Returns (detections, grid, grid_src)."""
+_label_matcher_cache = [False, None]   # [initialized?, matcher-or-None]
+
+
+def _get_label_matcher():
+    """
+    The OCR-label matcher the live scans use, built from the offline price
+    cache (no network).  None when Tesseract or the price cache is missing —
+    the scan then measures NCC alone, which is NOT the shipped pipeline.
+    """
+    if not _label_matcher_cache[0]:
+        _label_matcher_cache[0] = True
+        prices = load_json(PRICES_PATH, lambda: {})
+        if not tesseract_available():
+            print('NOTE : Tesseract missing — scoring NCC-only (not the live pipeline)')
+        elif not prices.get('items'):
+            print('NOTE : no price cache — scoring NCC-only (not the live pipeline)')
+        else:
+            _label_matcher_cache[1] = build_label_matcher(prices)
+    return _label_matcher_cache[1]
+
+
+def scan_image(img_bgr, raw_db):
+    """
+    Grid detection + pitch resample + NCC identification + OCR-label fusion —
+    the same pipeline the live scans run.  Returns (detections, grid,
+    grid_src, matcher_db) — matcher_db is the pitch-matched DB needed by
+    top_matches for the same image.
+    """
     grid, src = _load_grid(img_bgr)
-    print(f"Grid[{src}]: cell={grid['cell_w']}×{grid['cell_h']}px  "
-          f"origin=({grid['origin_x']},{grid['origin_y']})")
-    detections = identify_items_by_icon(img_bgr, grid, icon_db)
-    return detections, grid, src
+    print(f"Grid[{src}]: cell={grid['cell_w']:.2f}×{grid['cell_h']:.2f}px  "
+          f"origin=({grid['origin_x']:.1f},{grid['origin_y']:.1f})"
+          + (f"  strength={grid['strength']}" if 'strength' in grid else ''))
+    mdb = get_db_at_pitch(raw_db, *_slot_px(grid))
+    detections = identify_items_by_icon(img_bgr, grid, mdb,
+                                        label_matcher=_get_label_matcher())
+    return detections, grid, src, mdb
 
 
-def top_matches(img_bgr, col, row, W, H, grid, icon_db, n=5):
+def top_matches(img_bgr, col, row, W, H, grid, mdb, n=5):
     """Top-N NCC matches for a specific footprint (debugging / failure dump)."""
-    vec = _canonical_cell_vec(img_bgr, col, row, W, H, grid)
-    if vec is None or (W, H) not in icon_db:
+    spw, sph = _slot_px(grid)
+    vec = _native_cell_vec(img_bgr, col, row, W, H, grid, spw, sph)
+    if vec is None or (W, H) not in mdb:
         return []
-    bucket = icon_db[(W, H)]
+    bucket = mdb[(W, H)]
     scores = _masked_ncc_scores(vec, bucket)
     idxs = np.argsort(scores)[::-1][:n]
     return [(float(scores[i]), bucket['names'][i], bucket['ids'][i],
@@ -129,7 +164,7 @@ def label_mode(img_path):
         print(f"ERROR: cannot load '{img_path}'")
         sys.exit(1)
     icon_db = _require_db()
-    detections, grid, _ = scan_image(img_bgr, icon_db)
+    detections, grid, _, mdb = scan_image(img_bgr, icon_db)
     detections = sorted(detections, key=lambda d: (d['row'], d['col']))
 
     truth = [{'col': d['col'], 'row': d['row'], 'W': d['W'], 'H': d['H'],
@@ -149,7 +184,7 @@ def label_mode(img_path):
     rows = []
     for d in detections:
         uri = _crop_data_uri(img_bgr, d['col'], d['row'], d['W'], d['H'], grid)
-        tops = top_matches(img_bgr, d['col'], d['row'], d['W'], d['H'], grid, icon_db)
+        tops = top_matches(img_bgr, d['col'], d['row'], d['W'], d['H'], grid, mdb)
         alt = '<br>'.join(f"{sc:.3f} {name} [{src}{'/rot' if rot else ''}]"
                           for sc, name, _id, src, rot in tops)
         rot = ' (rot)' if d.get('rotated') else ''
@@ -194,7 +229,7 @@ def score_mode(img_paths):
             truth = json.load(f)
 
         print(f"\n{'='*66}\n{os.path.basename(img_path)}  ({len(truth)} labelled items)")
-        detections, grid, _ = scan_image(img_bgr, icon_db)
+        detections, grid, _, mdb = scan_image(img_bgr, icon_db)
 
         # Index truth by anchor cell (col,row).
         truth_by_cell = {(t['col'], t['row']): t for t in truth}
@@ -230,14 +265,14 @@ def score_mode(img_paths):
                 print(f"    MISSED ({cell[0]:2d},{cell[1]:2d}) {t['W']}×{t['H']}  "
                       f"want '{t['name']}'")
                 for sc, name, _id, src, rot in top_matches(
-                        img_bgr, cell[0], cell[1], t['W'], t['H'], grid, icon_db):
+                        img_bgr, cell[0], cell[1], t['W'], t['H'], grid, mdb):
                     hit = ' ←WANT' if _id == t['item_id'] else ''
                     print(f"        {sc:6.3f} {name} [{src}{'/rot' if rot else ''}]{hit}")
             elif kind == 'WRONG':
                 print(f"    WRONG  ({cell[0]:2d},{cell[1]:2d})  got '{d['name']}' "
                       f"({d['score']}%)  want '{t['name']}'")
                 for sc, name, _id, src, rot in top_matches(
-                        img_bgr, cell[0], cell[1], t['W'], t['H'], grid, icon_db):
+                        img_bgr, cell[0], cell[1], t['W'], t['H'], grid, mdb):
                     hit = ' ←WANT' if _id == t['item_id'] else ''
                     print(f"        {sc:6.3f} {name} [{src}{'/rot' if rot else ''}]{hit}")
             else:  # EXTRA
@@ -274,7 +309,7 @@ def dump_mode(argv):
         sys.exit(1)
     print(f"Size : {img_bgr.shape[1]}×{img_bgr.shape[0]}")
     icon_db = _require_db()
-    detections, grid, _ = scan_image(img_bgr, icon_db)
+    detections, grid, _, mdb = scan_image(img_bgr, icon_db)
 
     print(f"\n{'─'*66}\n{'col':>4} {'row':>4}  {'size':>5}  {'rot':>3}  "
           f"{'src':>5}  {'score':>6}  item\n{'─'*66}")
@@ -289,7 +324,7 @@ def dump_mode(argv):
         W = int(argv[3]) if len(argv) > 3 else 1
         H = int(argv[4]) if len(argv) > 4 else 1
         print(f"\nTop-5 for ({col},{row}) {W}×{H}:")
-        for sc, name, _id, src, rot in top_matches(img_bgr, col, row, W, H, grid, icon_db):
+        for sc, name, _id, src, rot in top_matches(img_bgr, col, row, W, H, grid, mdb):
             flag = ' ← ACCEPTED' if sc >= ICON_MATCH_MIN_SCORE else ''
             print(f"  {sc:6.3f} {name} [{src}{'/rot' if rot else ''}]{flag}")
 

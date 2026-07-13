@@ -13,6 +13,7 @@ build/
 data/icons/
 data/tmpl_src/
 data/eval/
+data/debug/
 data/prices_cache.json
 data/icon_db.npz
 data/icon_model.pt
