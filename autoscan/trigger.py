@@ -12,7 +12,7 @@ Policy
 * stable, and the view differs from the last scan's -> ``scan``
 * stable and the same view as the last scan         -> ``scanned`` (no work)
 * a scan is never started within ``min_gap_s`` of the previous one (animated backdrops, jitter)
-* a failed scan is not retried until the view changes or ``retry_s`` has passed
+* a failed scan (state ``failed``) is not retried until the view changes or ``retry_s`` has passed
 * inventory seen without the main-menu bar (the in-raid inventory) -> ``raid_inventory``: never
   scanned unless ``allow_raid`` is set - the identify pipeline must not run mid-raid
 """
@@ -69,7 +69,7 @@ class Observation:
 
 @dataclass
 class Decision:
-    state: str                  # waiting | raid_inventory | settling | scan | scanned | blank
+    state: str                  # waiting | raid_inventory | settling | scan | scanned | failed | blank
     scan: bool = False
 
 
@@ -106,8 +106,10 @@ class Trigger:
         if not is_stable(prev, obs.thumb):
             return Decision('settling')
         if same_view(self._last_hash, view_hash(obs.thumb)):
-            if self._last_ok or now - self._last_ts < self.retry_s:
+            if self._last_ok:
                 return Decision('scanned')
+            if now - self._last_ts < self.retry_s:
+                return Decision('failed')
         if now - self._last_ts < self.min_gap_s:
             return Decision('settling')
         return Decision('scan', scan=True)

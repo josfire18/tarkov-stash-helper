@@ -43,6 +43,7 @@ MESSAGES = {
     'scanning': 'Scanning...',
     'scanned': 'Stash scanned',
     'busy': 'Another scan is running',
+    'failed': 'Last scan failed',
     'error': 'Capture error',
 }
 
@@ -80,6 +81,7 @@ class AutoScanner:
         self._seq = 0
         self._last_scan_wall = 0.0
         self._last_detect_ms = 0.0
+        self._last_error = ''
         self._last_grab_ms = 0.0
 
     # -- settings ----------------------------------------------------------------------------
@@ -191,8 +193,9 @@ class AutoScanner:
         if dec.scan:
             self._scan(res.frame, thumb, now, game_info)
             return POLL_ACTIVE_S
-        self._set(dec.state, game=game_info, score=round(det.score, 2))
-        if dec.state in ('settling', 'scanned', 'raid_inventory'):
+        extra = {'detail': self._last_error} if dec.state == 'failed' else {}
+        self._set(dec.state, game=game_info, score=round(det.score, 2), **extra)
+        if dec.state in ('settling', 'scanned', 'failed', 'raid_inventory'):
             self._idle_polls = 0
             return POLL_ACTIVE_S
         self._idle_polls += 1
@@ -205,11 +208,13 @@ class AutoScanner:
             payload = self.scan_fn(frame)
         except Exception as e:
             self.trigger.scan_failed(self.clock())
-            self._set('error', detail=f'scan failed: {e}', game=game_info)
+            self._last_error = f'scan failed: {e}'
+            self._set('error', detail=self._last_error, game=game_info)
             return
         if not isinstance(payload, dict) or payload.get('error') or payload.get('grid_failed'):
             self.trigger.scan_failed(self.clock())
             msg = (payload or {}).get('error') or 'stash grid not detected'
+            self._last_error = msg
             self._set('error', detail=msg, game=game_info)
             return
         with self._lock:
