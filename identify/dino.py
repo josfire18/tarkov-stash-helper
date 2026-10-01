@@ -181,3 +181,10 @@ class EmbeddingStore:
             self.get(rows[i:i + 512])
         self.save()
         log(f'[dino] embedded {len(rows)} icons in {time.time() - t:.1f}s')
+
+
+if __name__ == '__main__':             # python -m identify.dino  -> embed the whole catalog once
+    from .catalog import load_catalog
+    if not available():
+        raise SystemExit(f"DINO unavailable: {_state['err']}")
+    EmbeddingStore(load_catalog()).precompute()

@@ -197,13 +197,25 @@ def _dir_signature(path: str | None, pattern: str = '*.png') -> str:
     return f'{n}:{total}:{int(newest)}'
 
 
-def source_signature(prices_path: str, tmpl_dir: str, cache_dir: str | None) -> str:
+CACHE_SLACK = 25      # the game keeps adding icons while it runs: rebuild only after this many new files
+
+
+def _cache_count(path: str | None) -> int:
+    if not path or not os.path.isdir(path):
+        return 0
+    with os.scandir(path) as it:
+        return sum(1 for e in it if e.name.lower().endswith('.png'))
+
+
+def source_signature(prices_path: str, tmpl_dir: str) -> str:
+    """Signature of the *mandatory* sources (schema, prices, tarkov.dev images).  The icon cache
+    is tracked separately by file count (see :func:`load_catalog`)."""
     try:
         st = os.stat(prices_path)
         ps = f'{st.st_size}:{int(st.st_mtime)}'
     except OSError:
         ps = 'none'
-    raw = f'{CATALOG_SCHEMA}|{STAGE1_SLOT}|{ps}|{_dir_signature(tmpl_dir)}|{_dir_signature(cache_dir)}'
+    raw = f'{CATALOG_SCHEMA}|{STAGE1_SLOT}|{ps}|{_dir_signature(tmpl_dir)}'
     return hashlib.sha1(raw.encode()).hexdigest()
 
 
@@ -346,9 +358,9 @@ def _composite_dist(prem: np.ndarray, al: np.ndarray, comp: np.ndarray) -> np.nd
 # persistence
 # --------------------------------------------------------------------------
 
-def save_catalog(cat: Catalog, path: str = CATALOG_PATH, signature: str = '') -> None:
+def save_catalog(cat: Catalog, path: str = CATALOG_PATH, signature: str = '', cache_count: int = 0) -> None:
     arrs = {
-        'schema': np.array(CATALOG_SCHEMA), 'signature': np.array(signature),
+        'schema': np.array(CATALOG_SCHEMA), 'signature': np.array(signature), 'cache_count': np.array(cache_count),
         'ids': cat.ids, 'names': cat.names, 'shorts': cat.shorts, 'tint': cat.tint,
         'cats': cat.cats, 'src': cat.src, 'preset': cat.preset, 'tw': cat.tw, 'th': cat.th,
         'meta_json': np.array(json.dumps({k: v for k, v in cat.meta.items() if k != 'paths'})),
@@ -366,7 +378,7 @@ def save_catalog(cat: Catalog, path: str = CATALOG_PATH, signature: str = '') ->
 def _load_npz(path: str):
     z = np.load(path, allow_pickle=False)
     if int(z['schema']) != CATALOG_SCHEMA:
-        return None, ''
+        return None, '', 0
     stacks = {}
     for k in z.files:
         if k.startswith('idx_'):
@@ -376,22 +388,26 @@ def _load_npz(path: str):
     meta['paths'] = {int(k): v for k, v in json.loads(str(z['paths_json'])).items()}
     cat = Catalog(ids=z['ids'], names=z['names'], shorts=z['shorts'], tint=z['tint'], cats=z['cats'],
                   src=z['src'], preset=z['preset'], tw=z['tw'], th=z['th'], stacks=stacks, meta=meta)
-    return cat, str(z['signature'])
+    return cat, str(z['signature']), int(z['cache_count'])
 
 
 def load_catalog(path: str = CATALOG_PATH, prices_path: str = PRICES_PATH,
                  tmpl_dir: str = TMPL_SRC_DIR, cache_dir: str | None = None,
-                 force_rebuild: bool = False, log=print) -> Catalog:
-    """Load the persisted catalog, rebuilding it when the schema or any source changed."""
+                 force_rebuild: bool = False, cache_slack: int = CACHE_SLACK, log=print) -> Catalog:
+    """Load the persisted catalog, rebuilding it when the schema, the prices or the tarkov.dev
+    images changed, or when the EFT icon cache grew/shrank by ``cache_slack`` files or more
+    (the running game adds icons constantly; a 35 s rebuild per new icon would be absurd)."""
     cdir = cache_dir if cache_dir is not None else default_cache_dir()
-    sig = source_signature(prices_path, tmpl_dir, cdir)
+    sig = source_signature(prices_path, tmpl_dir)
+    n_cache = _cache_count(cdir)
     if not force_rebuild and os.path.exists(path):
         try:
-            cat, old = _load_npz(path)
-            if cat is not None and old == sig:
+            cat, old, old_n = _load_npz(path)
+            if (cat is not None and old == sig
+                    and abs(n_cache - old_n) < max(1, cache_slack)):
                 return cat
         except Exception as e:                       # corrupt / partial file => rebuild
             log(f'[catalog] cannot load {path}: {e}')
     cat = build_catalog(prices_path, tmpl_dir, cdir, log=log)
-    save_catalog(cat, path, sig)
+    save_catalog(cat, path, sig, n_cache)
     return cat

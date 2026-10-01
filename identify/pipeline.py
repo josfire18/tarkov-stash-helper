@@ -29,6 +29,7 @@ fitted on the labelled stash (``CALIB``); anything below ``uncertain_below`` is 
 from __future__ import annotations
 
 import math
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 
@@ -120,6 +121,7 @@ class Engine:
         self.cat = catalog if catalog is not None else load_catalog()
         self.store: dino_mod.EmbeddingStore | None = None
         ocr_mod.set_tesseract_cmd(self.s.tesseract_cmd)
+        self._lock = threading.Lock()      # scans are serialised (hotkey + button can race)
         self._api = None
         self._api_fold: list = []
         self._id_row: dict = {}
@@ -140,6 +142,10 @@ class Engine:
 
     # ------------------------------------------------------------------
     def scan(self, img_bgr: np.ndarray) -> ScanResult:
+        with self._lock:
+            return self._scan(img_bgr)
+
+    def _scan(self, img_bgr: np.ndarray) -> ScanResult:
         T: dict[str, float] = {}
         t0 = time.perf_counter()
         warnings: list[str] = []

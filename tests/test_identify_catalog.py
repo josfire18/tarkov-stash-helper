@@ -119,17 +119,26 @@ def test_persistence_roundtrip_and_rebuild_on_source_change(sources, tmp_path):
     pp, tmpl, cache, tmp = sources
     out = str(tmp_path / 'cat.npz')
     log = []
-    c1 = C.load_catalog(out, pp, tmpl, cache, log=log.append)
+    c1 = C.load_catalog(out, pp, tmpl, cache, cache_slack=1, log=log.append)
     assert os.path.exists(out) and log                              # built
     log.clear()
-    c2 = C.load_catalog(out, pp, tmpl, cache, log=log.append)
+    c2 = C.load_catalog(out, pp, tmpl, cache, cache_slack=1, log=log.append)
     assert not log                                                   # loaded from disk, not rebuilt
     assert len(c2) == len(c1) and np.array_equal(c2.ids, c1.ids)
     assert np.array_equal(c2.stacks[(2, 1)].prem, c1.stacks[(2, 1)].prem)
-    # add a new source file -> signature changes -> rebuild
+    # one new cache icon: with the default slack the running game's trickle does not force a rebuild...
     cv2.imwrite(os.path.join(cache, '99.png'), make_icon(5, 2, 2))
-    c3 = C.load_catalog(out, pp, tmpl, cache, log=log.append)
+    log.clear()
+    C.load_catalog(out, pp, tmpl, cache, log=log.append)
+    assert not log
+    # ...but with slack 1 (or after enough new icons) it does
+    c3 = C.load_catalog(out, pp, tmpl, cache, cache_slack=1, log=log.append)
     assert log and len(c3) == len(c1) + 1
+    # a changed tarkov.dev image always rebuilds
+    log.clear()
+    cv2.imwrite(os.path.join(tmpl, 'a' * 24 + '.png'), make_icon(77, 1, 1))
+    C.load_catalog(out, pp, tmpl, cache, log=log.append)
+    assert log
 
 
 def test_schema_mismatch_forces_rebuild(sources, tmp_path, monkeypatch):

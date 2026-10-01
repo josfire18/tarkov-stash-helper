@@ -4104,6 +4104,17 @@ def _startup_maintenance():
             kappa_sync()
     except Exception as e:
         print(f"[kappa] startup sync skipped (offline?): {e}")
+    # Warm the v2 identification engine (loads/builds the template catalog - ~35 s the first
+    # time - and the optional DINO model) so the first hotkey scan isn't the one that pays for it.
+    try:
+        if identify_engine(load_json(SETTINGS_PATH, default_settings)) == 'v2' and os.path.exists(PRICES_PATH):
+            from identify.config import EngineSettings
+            from identify.pipeline import Engine
+            es = EngineSettings.from_settings(load_json(SETTINGS_PATH, default_settings))
+            _v2_engine[:] = [repr(es), Engine(es)]
+            print('[v2] identification engine ready')
+    except Exception as e:
+        print(f"[v2] warm-up skipped: {e}")
 
 
 # Module-level handle to the running pywebview window / pystray icon / quit
