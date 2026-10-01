@@ -168,6 +168,9 @@ class _DSU:
             self.p[rb] = ra
 
 
+RIDGE_WIDTH = 2     # resampled / JPEG lines smear over 2 px; the exact-colour model needs exactly 1
+
+
 @dataclass
 class EdgeModel:
     """Which edges of a panel carry a drawn line: per-boundary line coverage, the threshold
@@ -190,10 +193,10 @@ def edge_model(img_bgr: np.ndarray, panel: Panel, ridge: bool | None = None) -> 
     nc, nr = panel.n_cols, panel.n_rows
     xs, ys = panel.xs, panel.ys
 
-    def fractions(lm_h, lm_v):
-        fv = {(r, c): _edge_fraction(lm_v, True, xs[c], ys[r] + 2, ys[r + 1] - 1)
+    def fractions(lm_h, lm_v, width=1):
+        fv = {(r, c): _edge_fraction(lm_v, True, xs[c], ys[r] + 2, ys[r + 1] - 1, width=width)
               for r in range(nr) for c in range(1, nc)}
-        fh = {(r, c): _edge_fraction(lm_h, False, ys[r], xs[c] + 2, xs[c + 1] - 1)
+        fh = {(r, c): _edge_fraction(lm_h, False, ys[r], xs[c] + 2, xs[c + 1] - 1, width=width)
               for c in range(nc) for r in range(1, nr)}
         return fv, fh
 
@@ -206,7 +209,7 @@ def edge_model(img_bgr: np.ndarray, panel: Panel, ridge: bool | None = None) -> 
     for name, (mh, mv) in models:
         if ridge is not None and (name == 'ridge') != bool(ridge):
             continue
-        fv, fh = fractions(mh, mv)
+        fv, fh = fractions(mh, mv, 1 if name == 'strict' else RIDGE_WIDTH)
         vals = np.array(list(fv.values()) + list(fh.values()), np.float64)
         t, j = _otsu_1d(vals, 0.3, 0.9)
         cands.append((j, t, fv, fh, name))
