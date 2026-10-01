@@ -281,6 +281,14 @@ def _fit_lattice(pos: list[float], pitch: float, tol_frac: float = 0.1):
         k = np.round((arr - o) / pitch)
         res = arr - (o + k * pitch)
         keep = np.abs(res) <= tol_frac * pitch
+        # one line per lattice slot: a viewport frame line a few px beside the item line must
+        # not drag the fit (it would bend the pitch across a 14-column panel)
+        for kk in np.unique(k[keep]):
+            same = np.where(keep & (k == kk))[0]
+            if len(same) > 1:
+                best = same[np.argmin(np.abs(res[same]))]
+                keep[same] = False
+                keep[best] = True
         if keep.sum() < 2 or len(np.unique(k[keep])) < 2:
             break
         A = np.vstack([np.ones(int(keep.sum())), k[keep]]).T
@@ -288,7 +296,10 @@ def _fit_lattice(pos: list[float], pitch: float, tol_frac: float = 0.1):
         o, pitch = float(sol[0]), float(sol[1])
     k = np.round((arr - o) / pitch)
     res = arr - (o + k * pitch)
-    inl = np.abs(res) <= tol_frac * pitch
+    # the fit itself is robust (loose tolerance), but a peak counts as a lattice line only when
+    # it sits within ~4 % of the pitch (3-4 px at 1080p-1440p): a window frame or art edge a few
+    # px off the lattice must not become the panel's first/last line
+    inl = np.abs(res) <= min(tol_frac, 0.045) * pitch
     return o, pitch, [float(p) for p, i in zip(pos, inl) if i]
 
 
@@ -321,7 +332,7 @@ def _analyse_axis(proj: np.ndarray, pitch_ref: float | None, hint: float | None)
     if proj.size == 0 or proj.max() <= 0:
         return None
     sm_max = float(np.convolve(proj.astype(np.float64), np.ones(3), 'same').max())
-    pk = _peaks(proj, min_val=max(8.0, 0.25 * sm_max))
+    pk = _peaks(proj, min_val=max(8.0, 0.18 * sm_max))
     if len(pk) < 2:
         return None
     pos = [p for p, _ in pk]
@@ -344,8 +355,52 @@ def _analyse_axis(proj: np.ndarray, pitch_ref: float | None, hint: float | None)
         pitch = pitch_ref
         o = _phase_from_pitch(inl, pitch)
     ws = [s for p, s in pk if any(abs(p - q) < 1e-6 for q in inl)]
-    return _Axis(o, pitch, min(inl), max(inl), len(inl), float(np.mean(ws)) if ws else 0.0,
+    first, last = min(inl), max(inl)
+    if pitch_ref is not None:
+        # with the pitch known, a lattice-aligned line at least one cell long extends the
+        # panel even when it is too faint (next to a long frame line) to count as a 'peak':
+        # a window whose right-hand columns hold only a few big items
+        n = len(proj)
+        for direction in (1, -1):
+            edge = last if direction > 0 else first
+            for _ in range(24):
+                q = edge + direction * pitch
+                c = int(round(q))
+                if c < 1 or c >= n - 1:
+                    break
+                if float(proj[max(0, c - 2):c + 3].max()) < 0.8 * pitch:
+                    break
+                edge = float(c)
+            if direction > 0:
+                last = edge
+            else:
+                first = edge
+    return _Axis(o, pitch, first, last, len(inl), float(np.mean(ws)) if ws else 0.0,
                  len(inl) / max(1, len(pk)))
+
+
+def _consensus_pitch(axes: list, min_lines: int = 3, min_ratio: float = 0.6) -> float | None:
+    """One pitch for the whole frame from the per-panel axis estimates.
+
+    A panel whose items are all 2x2 or bigger only shows lines every second cell, so its own
+    estimate is a *multiple* of the real pitch.  The consensus is the smallest reliable
+    estimate of which every other reliable estimate is (about) an integer multiple; panels
+    that disagree (art speckle) are outvoted by line count.  ``None`` when no estimate is
+    reliable (the caller then keeps the per-panel estimates)."""
+    good = [a for a in axes if a is not None and a.n_lines >= min_lines and a.ratio >= min_ratio]
+    if not good:
+        return None
+    best, best_w = None, -1.0
+    for cand in sorted({round(a.pitch, 2) for a in good}):
+        w = 0.0
+        for a in good:
+            k = round(a.pitch / cand)
+            if k >= 1 and abs(a.pitch - k * cand) <= 0.04 * a.pitch:
+                w += a.n_lines * a.ratio
+        # a smaller candidate only wins by explaining *all* the evidence a bigger one does
+        if w > best_w + 1e-9:
+            best, best_w = cand, w
+    return float(best)
 
 
 # --------------------------------------------------------------------------
@@ -409,13 +464,38 @@ def _detect(img_bgr: np.ndarray, pitch_hint: float | None, min_cells: int,
     comps.sort(reverse=True)
     comps = comps[:12]
 
-    # pass 1: every component's own lattice (pitch unknown)
-    first = []
+    # pass 1: every component's own lattice (pitch unknown); per-axis estimates are kept even
+    # when the other axis (or the lattice consistency) failed - a panel made of big items
+    # (armour, backpacks) has too few lines to find its own pitch, but it still has to
+    # agree with the frame's
+    raw = []
     for _, i in comps:
         cm = lab == i
         hmc, vmc = hm & cm, vm & cm
-        ax = _analyse_axis(vmc.sum(axis=0), None, pitch_hint)
-        ay = _analyse_axis(hmc.sum(axis=1), None, pitch_hint)
+        raw.append((hmc, vmc, _analyse_axis(vmc.sum(axis=0), None, pitch_hint),
+                    _analyse_axis(hmc.sum(axis=1), None, pitch_hint)))
+    xs_est = [a for _, _, a, _ in raw]
+    ys_est = [b for _, _, _, b in raw]
+    ref_x, ref_y = _consensus_pitch(xs_est), _consensus_pitch(ys_est)
+    pooled = _consensus_pitch(xs_est + ys_est)
+    if pooled is not None:
+        # a stretched capture (4:3 -> 16:9) has different x and y pitches; otherwise both
+        # axes share one pitch and each axis borrows the other's evidence
+        if ref_x is None or ref_y is None:
+            ref_x = ref_x or pooled
+            ref_y = ref_y or pooled
+        else:
+            r = max(ref_x, ref_y) / min(ref_x, ref_y)
+            k = round(r)
+            if abs(r - k) <= 0.04 * r and k >= 1 and not (k == 1 and abs(ref_x - ref_y) > 0.04 * ref_x):
+                ref_x = ref_y = pooled
+    first = []
+    for hmc, vmc, ax, ay in raw:
+        if ref_x is not None:
+            # the frame pitch is authoritative (a lone panel of 2x2 items would otherwise
+            # report twice the real pitch, a sparse one none at all)
+            ax = _analyse_axis(vmc.sum(axis=0), ref_x, pitch_hint)
+            ay = _analyse_axis(hmc.sum(axis=1), ref_y, pitch_hint)
         if ax is None or ay is None or ax.ratio < 0.5 or ay.ratio < 0.5:
             continue
         if not (0.6 <= ax.pitch / ay.pitch <= 1.6):
@@ -470,7 +550,8 @@ def _build_panel(hmc: np.ndarray, vmc: np.ndarray, ax: _Axis, ay: _Axis) -> Pane
     for x in xs:
         lit_count += vmc[:, max(0, x - 1):x + 2].any(axis=1)
     both = lit_count >= 2
-    rows_all = _longest_run(both, gap=8)
+    # empty rows draw no lines, so the run may be interrupted by up to a few blank rows
+    rows_all = _longest_run(both, gap=max(8, int(3.5 * py)))
     if rows_all is None:
         return None
     ymin, ymax = rows_all
