@@ -1,39 +1,46 @@
 #!/usr/bin/env python3
 """
-Offline stash-scan evaluation harness.
+Offline stash-scan evaluation harness (no Tarkov, no Flask needed).
 
-Runs grid detection + NCC identification on saved screenshots without needing
-Tarkov running or Flask started, and measures accuracy against labelled ground
-truth so every tuning change is provable.
+Two engines can be scored side by side on the same labelled screenshots:
+
+  --engine v2        the new ``identify`` package (default)
+  --engine legacy    the old app.py masked-NCC pipeline
+  --engine both      run both and print a comparison table
 
 Usage
 -----
-  # 1. Save 2-3 real full-stash screenshots (native resolution) here:
-  #        data/eval/<name>.png
+  # score (segmentation / identification / per-category / uncertain / end-to-end)
+  python test_scan.py --score data/eval/stash1.png [--engine v2|legacy|both]
+                      [--truth full|orig|<path>] [--no-dino] [--no-ocr] [--json out.json]
 
-  # 2. Generate a ground-truth template you correct once:
-  python test_scan.py --label data/eval/myshot.png
-  #    → writes data/eval/myshot.truth.json  (list of {col,row,W,H,item_id})
-  #    → also writes data/eval/myshot.label.html — open it, eyeball each crop
-  #      against the guessed name, fix wrong item_ids in the .truth.json.
+  # label a new screenshot (v2 prefill + contact sheets), then correct and re-score
+  python test_scan.py --prefill data/eval/shot.png
+  python test_scan.py --relabel data/eval/shot.png corrections.json
+  python test_scan.py --score data/eval/shot.png --truth full
 
-  # 3. Score detection against the corrected truth (per-failure dump included):
-  python test_scan.py --score data/eval/*.png
-  #    → precision / recall / accuracy per image and overall.
+  # legacy helpers (unchanged): --label <img> writes the old truth+HTML; no flag dumps one image
+  python test_scan.py --label data/eval/shot.png
+  python test_scan.py [path/to/stash.png] [col row W H]
 
-Legacy (no flag): dumps detections for a single image (default data/test_stash.png).
-
-  python test_scan.py [path/to/stash.png] [col row W H]   # + optional top-5 probe
+What is measured (``--score``)
+  segmentation    footprint rectangles, IoU >= 0.9, one-to-one: precision / recall
+  identification  top-1 accuracy on correctly segmented, non-"uncertain" truth items,
+                  overall and per category (ammo, weapon, mod, meds, ...)
+  uncertain       share of detections the engine flagged uncertain, how many of its wrong
+                  answers it flagged, how many flagged answers were in fact right
+  end-to-end      truth items found with the right rectangle AND the right item id
 """
 import sys
 import os
 import glob
 import json
+import time
+import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Windows consoles default to cp1252 which can't encode the arrows / box-drawing
-# used in the failure dumps — force UTF-8 so --score never crashes mid-report.
+# Windows consoles default to cp1252 which can't encode the symbols used in reports.
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 except Exception:
@@ -42,355 +49,479 @@ except Exception:
 import cv2
 import numpy as np
 
-from app import (
-    detect_stash_grid,
-    resolve_grid,
-    resolve_panels,
-    validate_grid,
-    identify_items_by_icon,
-    scan_all_panels,
-    build_label_matcher,
-    tesseract_available,
-    load_icon_db,
-    load_json,
-    default_settings,
-    SETTINGS_PATH,
-    PRICES_PATH,
-    _cell_block,
-    _native_cell_vec,
-    _slot_px,
-    get_db_at_pitch,
-    _masked_ncc_scores,
-    _best_with_margin,
-    ICON_MATCH_MIN_SCORE,
-)
-
-EVAL_DIR = os.path.join(os.path.dirname(__file__), 'data', 'eval')
+EVAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'eval')
+PRICES = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'prices_cache.json')
+IOU_MIN = 0.9
 
 
 # ---------------------------------------------------------------------------
-# Shared
+# truth
 # ---------------------------------------------------------------------------
 
-_label_matcher_cache = [False, None]   # [initialized?, matcher-or-None]
+def _stem(img_path):
+    return os.path.splitext(img_path)[0]
 
 
-def _get_label_matcher():
-    """
-    The OCR-label matcher the live scans use, built from the offline price
-    cache (no network).  None when Tesseract or the price cache is missing —
-    the scan then measures NCC alone, which is NOT the shipped pipeline.
-    """
-    if not _label_matcher_cache[0]:
-        _label_matcher_cache[0] = True
-        prices = load_json(PRICES_PATH, lambda: {})
-        if not tesseract_available():
-            print('NOTE : Tesseract missing — scoring NCC-only (not the live pipeline)')
-        elif not prices.get('items'):
-            print('NOTE : no price cache — scoring NCC-only (not the live pipeline)')
-        else:
-            _label_matcher_cache[1] = build_label_matcher(prices)
-    return _label_matcher_cache[1]
+def truth_path(img_path, which='full'):
+    if which in ('full', 'orig'):
+        return _stem(img_path) + ('.truth.full.json' if which == 'full' else '.truth.json')
+    return which
 
 
-def scan_image(img_bgr, raw_db, use_persisted=False):
-    """
-    Panel resolution + per-panel NCC identification + OCR-label fusion — the
-    SAME pipeline run_keep_scan() runs live (resolve_panels → scan_all_panels),
-    not the old single full-frame grid.
-
-    Settings are loaded fresh, then copied and stripped of any persisted
-    'grid' key (unless use_persisted=True) — eval must measure detection on
-    its own merits, never coast on a grid a previous *live* scan persisted.
-    resolve_panels is called with persist_fn=None so eval never writes
-    settings.json either.
-
-    Returns (detections, panels, panels_src, matcher_db) — matcher_db is the
-    pitch-matched DB for panels[0] (the pitch scan_all_panels itself uses for
-    every panel, mirroring get_matcher_db(panels[0]) in run_keep_scan), needed
-    by top_matches for the same image.
-    """
-    settings = dict(load_json(SETTINGS_PATH, default_settings))
-    if not use_persisted:
-        settings.pop('grid', None)
-    panels, src = resolve_panels(img_bgr, settings, persist_fn=None)
-    grid0 = panels[0]
-    print(f"Grid[{src}]: {len(panels)} panel(s)  "
-          f"cell={grid0['cell_w']:.2f}×{grid0['cell_h']:.2f}px  "
-          f"origin=({grid0['origin_x']:.1f},{grid0['origin_y']:.1f})"
-          + (f"  strength={grid0['strength']}" if 'strength' in grid0 else ''))
-    mdb = get_db_at_pitch(raw_db, *_slot_px(grid0))
-    detections = scan_all_panels(img_bgr, panels, mdb,
-                                 label_matcher=_get_label_matcher())
-    return detections, panels, src, mdb
+def load_truth(img_path, which='full'):
+    p = truth_path(img_path, which)
+    if which == 'full' and not os.path.exists(p):
+        p = truth_path(img_path, 'orig')
+    if not os.path.exists(p):
+        return None, p
+    with open(p, encoding='utf-8') as f:
+        return json.load(f), p
 
 
-def _panel_local_grid(panel):
-    """Panel-local grid dict: same pitch, origin translated into the panel's
-    own crop — exactly the `local` grid scan_all_panels builds per panel."""
-    return {'cell_w': panel['cell_w'], 'cell_h': panel['cell_h'],
-            'origin_x': panel['origin_x'] - panel['x0'],
-            'origin_y': panel['origin_y'] - panel['y0']}
+def _categories():
+    """item_id -> category (same mapping the catalog uses)."""
+    from identify.catalog import category_of
+    with open(PRICES, encoding='utf-8') as f:
+        return {it['id']: category_of(it.get('types')) for it in json.load(f)['items']}
 
 
-def _panel_crop(img_bgr, panel):
-    return img_bgr[panel['y0']:panel['y1'], panel['x0']:panel['x1']]
+def _legacy_truth_to_rects(truth, panel0):
+    """Original ``stash1.truth.json`` rows have (col,row) on the legacy grid (origin y=141,
+    i.e. the *second* line of the v2 lattice) and no rect: map them through the v2 panel."""
+    if not truth or 'rect' in truth[0]:
+        return truth
+    off = int(round((141.0 - panel0.ys[0]) / panel0.pitch_y))
+    out = []
+    for t in truth:
+        t = dict(t)
+        c, r, w, h = t['col'], t['row'] + off, t['W'], t['H']
+        t['rect'] = list(panel0.rect(c, r, w, h))
+        out.append(t)
+    return out
 
 
-def top_matches(img_bgr, col, row, W, H, panel, mdb, n=5):
-    """Top-N NCC matches for a specific footprint inside `panel` (debugging /
-    failure dump).  Crops to the panel and uses its local grid, mirroring how
-    scan_all_panels scores cells for that same panel in the live pipeline."""
-    crop = _panel_crop(img_bgr, panel)
-    grid = _panel_local_grid(panel)
-    spw, sph = _slot_px(grid)
-    vec = _native_cell_vec(crop, col, row, W, H, grid, spw, sph)
-    if vec is None or (W, H) not in mdb:
-        return []
-    bucket = mdb[(W, H)]
-    scores = _masked_ncc_scores(vec, bucket)
-    idxs = np.argsort(scores)[::-1][:n]
-    return [(float(scores[i]), bucket['names'][i], bucket['ids'][i],
-             bucket['sources'][i], bool(bucket['rotated'][i])) for i in idxs]
+# ---------------------------------------------------------------------------
+# engines -> normalised detections
+#   each detection: {'rect': [x,y,w,h], 'item_id', 'name', 'uncertain', 'conf'}
+# ---------------------------------------------------------------------------
+
+_v2_engines = {}
 
 
-def _require_db():
-    icon_db = load_icon_db()
+def run_v2(img_bgr, use_dino=True, use_ocr=True, warm=True):
+    from identify.config import EngineSettings
+    from identify.pipeline import Engine
+    key = (use_dino, use_ocr)
+    if key not in _v2_engines:
+        _v2_engines[key] = Engine(EngineSettings(use_dino=use_dino, use_ocr=use_ocr))
+        if warm:                       # first call pays model load / CUDA init: don't time it
+            _v2_engines[key].scan(img_bgr)
+    t = time.perf_counter()
+    res = _v2_engines[key].scan(img_bgr)
+    dt = time.perf_counter() - t
+    dets = [{'rect': list(d.rect), 'item_id': d.item_id, 'name': d.name, 'uncertain': d.uncertain,
+             'conf': d.confidence, 'det': d} for d in res.detections]
+    return dets, dt, res
+
+
+def run_legacy(img_bgr):
+    import app as A
+    icon_db = A.load_icon_db()
     if icon_db is None:
-        print("ERROR: No icon DB found (or version mismatch).")
-        print("  → Open the web app, click Build Icon DB, then retry.")
-        sys.exit(1)
-    total = sum(len(b['ids']) for b in icon_db.values())
-    print(f"DB   : {len(icon_db)} size buckets, {total} templates")
-    return icon_db
-
-
-def _truth_path(img_path):
-    stem = os.path.splitext(os.path.basename(img_path))[0]
-    return os.path.join(os.path.dirname(img_path), stem + '.truth.json')
+        raise SystemExit('legacy engine needs data/icon_db.npz (Build Icon DB in the app)')
+    settings = dict(A.load_json(A.SETTINGS_PATH, A.default_settings))
+    settings.pop('grid', None)
+    prices = A.load_json(A.PRICES_PATH, lambda: {})
+    lm = A.build_label_matcher(prices) if (A.tesseract_available() and prices.get('items')) else None
+    t = time.perf_counter()
+    panels, _src = A.resolve_panels(img_bgr, settings, persist_fn=None)
+    mdb = A.get_db_at_pitch(icon_db, *A._slot_px(panels[0]))
+    raw = A.scan_all_panels(img_bgr, panels, mdb, label_matcher=lm)
+    dt = time.perf_counter() - t
+    dets = [{'rect': [d['px'], d['py'], d['pw'], d['ph']], 'item_id': d['item_id'], 'name': d['name'],
+             'uncertain': False, 'conf': d['score'] / 100.0} for d in raw]
+    return dets, dt, None
 
 
 # ---------------------------------------------------------------------------
-# --label : produce an editable ground-truth + visual HTML
+# metrics
 # ---------------------------------------------------------------------------
 
-def _crop_data_uri(img_bgr, col, row, W, H, panel):
-    crop = _panel_crop(img_bgr, panel)
-    grid = _panel_local_grid(panel)
-    block = _cell_block(crop, col, row, W, H, grid)
-    if block is None or block.size == 0:
-        return ''
-    ok, buf = cv2.imencode('.png', block)
-    if not ok:
-        return ''
-    import base64
-    return 'data:image/png;base64,' + base64.b64encode(buf.tobytes()).decode()
+def iou(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    iy = max(0, min(ay + ah, by + bh) - max(ay, by))
+    inter = ix * iy
+    union = aw * ah + bw * bh - inter
+    return inter / union if union else 0.0
 
 
-def label_mode(img_path):
+def match_rects(truth_rects, det_rects, thr=IOU_MIN):
+    """Greedy one-to-one IoU matching -> {truth_idx: det_idx}."""
+    pairs = []
+    for i, t in enumerate(truth_rects):
+        for j, d in enumerate(det_rects):
+            v = iou(t, d)
+            if v >= thr:
+                pairs.append((v, i, j))
+    pairs.sort(reverse=True)
+    mt, md = {}, {}
+    for v, i, j in pairs:
+        if i not in mt and j not in md:
+            mt[i] = j
+            md[j] = i
+    return mt
+
+
+def score(truth, dets, cats, verbose=True):
+    """Compute the metric dict for one image."""
+    tr = [t['rect'] for t in truth]
+    dr = [d['rect'] for d in dets]
+    mt = match_rects(tr, dr)
+    n_t, n_d, n_m = len(truth), len(dets), len(mt)
+    seg = {'truth': n_t, 'detections': n_d, 'matched': n_m,
+           'recall': n_m / n_t if n_t else 0.0, 'precision': n_m / n_d if n_d else 0.0}
+
+    ident = {'n': 0, 'ok': 0}
+    percat = {}
+    wrong = []
+    caught = needless = flagged = 0
+    e2e_ok = 0
+    e2e_n = 0
+    for i, t in enumerate(truth):
+        if t.get('uncertain') or not t.get('item_id'):
+            continue
+        e2e_n += 1
+        j = mt.get(i)
+        if j is None:
+            continue
+        d = dets[j]
+        cat = t.get('category') or cats.get(t['item_id'], 'other')
+        c = percat.setdefault(cat, {'n': 0, 'ok': 0})
+        ident['n'] += 1
+        c['n'] += 1
+        ok = d['item_id'] == t['item_id']
+        if ok:
+            ident['ok'] += 1
+            c['ok'] += 1
+            e2e_ok += 1
+        else:
+            wrong.append((i, t, d))
+        if d.get('uncertain'):
+            flagged += 1
+            if ok:
+                needless += 1
+            else:
+                caught += 1
+    n_unc = sum(1 for d in dets if d.get('uncertain'))
+    wrong_n = ident['n'] - ident['ok']
+    return {
+        'segmentation': seg,
+        'identification': {**ident, 'acc': ident['ok'] / ident['n'] if ident['n'] else 0.0},
+        'per_category': {k: {**v, 'acc': v['ok'] / v['n'] if v['n'] else 0.0} for k, v in sorted(percat.items())},
+        'uncertain': {'rate': n_unc / n_d if n_d else 0.0, 'flagged': n_unc,
+                      'wrong_flagged': caught, 'wrong_total': wrong_n,
+                      'flagged_but_right': needless},
+        'end_to_end': {'ok': e2e_ok, 'n': e2e_n, 'acc': e2e_ok / e2e_n if e2e_n else 0.0},
+        '_wrong': wrong, '_unmatched': [i for i in range(n_t) if i not in mt],
+    }
+
+
+def _pct(x):
+    return f'{100 * x:5.1f}%'
+
+
+def print_report(name, m, dt, truth, dets, show_wrong=True):
+    s, i, u, e = m['segmentation'], m['identification'], m['uncertain'], m['end_to_end']
+    print(f'\n--- {name}  ({dt:.2f}s) ---')
+    print(f"  segmentation   recall {_pct(s['recall'])} ({s['matched']}/{s['truth']})   "
+          f"precision {_pct(s['precision'])} ({s['matched']}/{s['detections']})")
+    print(f"  identification top-1 {_pct(i['acc'])} ({i['ok']}/{i['n']}) on segmented, non-uncertain truth")
+    for k, v in m['per_category'].items():
+        print(f"      {k:<10} {_pct(v['acc'])} ({v['ok']}/{v['n']})")
+    print(f"  uncertain      {_pct(u['rate'])} of detections flagged; catches {u['wrong_flagged']}/{u['wrong_total']} "
+          f"wrong answers; {u['flagged_but_right']} flagged answers were right")
+    print(f"  end-to-end     {_pct(e['acc'])} ({e['ok']}/{e['n']})  right rectangle AND right item")
+    if show_wrong:
+        for idx, t, d in m['_wrong'][:30]:
+            print(f"    WRONG #{idx} {t['rect']} want '{t.get('name')}'  got '{d['name']}'"
+                  f"{'  [flagged uncertain]' if d.get('uncertain') else ''}")
+        for idx in m['_unmatched'][:20]:
+            t = truth[idx]
+            print(f"    NOT SEGMENTED #{idx} {t['rect']} '{t.get('name')}'")
+
+
+def _strip(m):
+    return {k: v for k, v in m.items() if not k.startswith('_')}
+
+
+# ---------------------------------------------------------------------------
+# --score
+# ---------------------------------------------------------------------------
+
+def score_mode(paths, engine, which, use_dino, use_ocr, json_out):
+    cats = _categories()
+    engines = ['v2', 'legacy'] if engine == 'both' else [engine]
+    results = {}
+    agg = {e: {'truth': 0, 'matched': 0, 'dets': 0, 'ok': 0, 'n': 0, 'e2e_ok': 0, 'e2e_n': 0,
+               'time': 0.0, 'cat': {}} for e in engines}
+    for path in paths:
+        img = cv2.imread(path)
+        if img is None:
+            print(f'cannot load {path}')
+            continue
+        truth, tp = load_truth(path, which)
+        if truth is None:
+            print(f'\n{os.path.basename(path)}: no truth file ({tp}); run --prefill first')
+            continue
+        print(f"\n{'=' * 70}\n{os.path.basename(path)}  truth={os.path.basename(tp)}  ({len(truth)} rows, "
+              f"{sum(1 for t in truth if t.get('uncertain'))} uncertain)")
+        if truth and 'rect' not in truth[0]:
+            from identify.grid import detect_grid
+            gp = detect_grid(img).panels
+            truth = _legacy_truth_to_rects(truth, gp[0])
+        for e in engines:
+            if e == 'v2':
+                dets, dt, _ = run_v2(img, use_dino, use_ocr)
+            else:
+                dets, dt, _ = run_legacy(img)
+            m = score(truth, dets, cats)
+            print_report(e, m, dt, truth, dets)
+            results.setdefault(os.path.basename(path), {})[e] = {**_strip(m), 'time': dt}
+            a = agg[e]
+            a['truth'] += m['segmentation']['truth']; a['matched'] += m['segmentation']['matched']
+            a['dets'] += m['segmentation']['detections']
+            a['ok'] += m['identification']['ok']; a['n'] += m['identification']['n']
+            a['e2e_ok'] += m['end_to_end']['ok']; a['e2e_n'] += m['end_to_end']['n']
+            a['time'] += dt
+            for k, v in m['per_category'].items():
+                c = a['cat'].setdefault(k, [0, 0])
+                c[0] += v['ok']; c[1] += v['n']
+    if len(paths) > 1 or engine == 'both':
+        print(f"\n{'=' * 70}\nOVERALL")
+        hdr = f"  {'':<22}" + ''.join(f'{e:>12}' for e in engines)
+        print(hdr)
+
+        def row(label, fn):
+            print(f'  {label:<22}' + ''.join(f'{fn(agg[e]):>12}' for e in engines))
+        row('seg recall', lambda a: _pct(a['matched'] / a['truth']) if a['truth'] else '-')
+        row('seg precision', lambda a: _pct(a['matched'] / a['dets']) if a['dets'] else '-')
+        row('identification', lambda a: _pct(a['ok'] / a['n']) if a['n'] else '-')
+        row('end-to-end', lambda a: _pct(a['e2e_ok'] / a['e2e_n']) if a['e2e_n'] else '-')
+        row('time/scan (s)', lambda a: f"{a['time'] / max(1, len(paths)):.2f}")
+        allcats = sorted({k for e in engines for k in agg[e]['cat']})
+        for k in allcats:
+            row(f'  {k}', lambda a, k=k: (f"{_pct(a['cat'][k][0] / a['cat'][k][1])} ({a['cat'][k][0]}/{a['cat'][k][1]})"
+                                           if k in a['cat'] and a['cat'][k][1] else '-'))
+    if json_out:
+        with open(json_out, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=1, default=str)
+        print(f'\nwrote {json_out}')
+    return results
+
+
+# ---------------------------------------------------------------------------
+# --robustness: how do JPEG / blur / rescaling hurt each stage?
+# ---------------------------------------------------------------------------
+
+def make_variant(img, kind):
+    """Degraded copy of a screenshot + the geometric scale applied to it ((fx, fy) or one float)."""
+    if kind == 'png':
+        return img, 1.0
+    if kind.startswith('stretch'):            # 4:3 -> 16:9 style horizontal stretch (the user's setup)
+        fx = float(kind[7:] or 1.3333)
+        return cv2.resize(img, None, fx=fx, fy=1.0, interpolation=cv2.INTER_CUBIC), (fx, 1.0)
+    if kind.startswith('jpg'):
+        q = int(kind[3:])
+        ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, q])
+        return cv2.imdecode(buf, cv2.IMREAD_COLOR), 1.0
+    if kind == 'blur':
+        return cv2.GaussianBlur(img, (0, 0), 1.0), 1.0
+    if kind == 'noise':
+        rng = np.random.default_rng(0)
+        return np.clip(img.astype(np.float32) + rng.normal(0, 6, img.shape), 0, 255).astype(np.uint8), 1.0
+    if kind.startswith('scale'):
+        f = float(kind[5:])
+        return cv2.resize(img, None, fx=f, fy=f, interpolation=cv2.INTER_AREA if f < 1 else cv2.INTER_CUBIC), f
+    raise ValueError(kind)
+
+
+ROBUST_KINDS = ['png', 'jpg95', 'jpg85', 'jpg70', 'jpg50', 'jpg30', 'blur', 'noise', 'scale0.83', 'scale1.33',
+                'stretch1.3333']
+ROBUST_CONFIGS = [('pixels only', False, False), ('+DINO', True, False), ('+OCR', False, True), ('full', True, True)]
+
+
+def _scale_rect(rect, f):
+    fx, fy = (f, f) if not isinstance(f, tuple) else f
+    x, y, w, h = rect
+    return [int(round(x * fx)), int(round(y * fy)), int(round(w * fx)), int(round(h * fy))]
+
+
+def robustness_mode(img_path, which, kinds=None, json_out=None):
+    cats = _categories()
+    img = cv2.imread(img_path)
+    truth, _ = load_truth(img_path, which)
+    cols = kinds or ROBUST_KINDS
+    table = {}
+    print(f"\nrobustness on {os.path.basename(img_path)} ({len(truth)} truth rows): "
+          "identification top-1 / segmentation recall")
+    print(f"  {'variant':<11}" + ''.join(f'{c[0]:>20}' for c in ROBUST_CONFIGS))
+    for kind in cols:
+        v, f = make_variant(img, kind)
+        tr = [dict(t, rect=_scale_rect(t['rect'], f)) for t in truth]
+        row = []
+        for name, dino, ocr in ROBUST_CONFIGS:
+            dets, dt, _ = run_v2(v, dino, ocr)
+            m = score(tr, dets, cats)
+            row.append((m['identification']['acc'], m['segmentation']['recall'], dt))
+            table.setdefault(kind, {})[name] = {'id_acc': m['identification']['acc'],
+                                               'seg_recall': m['segmentation']['recall'], 'time': dt}
+        print(f"  {kind:<11}" + ''.join(f'{100 * a:>12.1f}% /{100 * r:>4.0f}%' for a, r, _ in row))
+    if json_out:
+        with open(json_out, 'w', encoding='utf-8') as fh:
+            json.dump(table, fh, indent=1)
+    return table
+
+
+# ---------------------------------------------------------------------------
+# --prefill / --relabel
+# ---------------------------------------------------------------------------
+
+def prefill_mode(img_path, use_dino=True):
+    from identify import evaltools as ET
+    img = cv2.imread(img_path)
+    if img is None:
+        raise SystemExit(f'cannot load {img_path}')
+    dets, dt, res = run_v2(img, use_dino, True, warm=False)
+    eng = _v2_engines[(use_dino, True)]
+    rows = ET.truth_from_detections([d['det'] for d in dets], res.items)
+    out = truth_path(img_path, 'full')
+    if os.path.exists(out):
+        out += '.new'
+        print(f'NOTE: {truth_path(img_path, "full")} exists; writing the draft to {out}')
+    with open(out, 'w', encoding='utf-8') as f:
+        json.dump(rows, f, indent=1, ensure_ascii=False)
+    sheets = ET.contact_sheets(img, rows, [d['det'] for d in dets], eng.cat, _stem(img_path) + '.sheet')
+    print(f'{len(rows)} footprints ({len(dets)} identified) in {dt:.1f}s -> {out}')
+    print('contact sheets:\n  ' + '\n  '.join(sheets))
+    print('Check each sheet by eye, write corrections as {"<index>": {"name": "...", "uncertain": false, '
+          '"note": "..."}} and apply with --relabel.')
+
+
+def relabel_mode(img_path, corr_path):
+    from identify import evaltools as ET
+    p = truth_path(img_path, 'full')
+    if not os.path.exists(p) and os.path.exists(p + '.new'):
+        p += '.new'
+    with open(p, encoding='utf-8') as f:
+        rows = json.load(f)
+    with open(corr_path, encoding='utf-8') as f:
+        corr = json.load(f)
+    items = ET.load_items(PRICES)
+    cats = _categories()
+    for k, c in corr.items():
+        r = rows[int(k)]
+        if 'name' in c or 'item_id' in c:
+            q = c.get('item_id') or c['name']
+            if q in ('', '?', 'none'):
+                r['item_id'], r['name'] = '', c.get('label', '')
+            else:
+                hits = [items[q]] if q in items else [it for it in items.values() if it['name'].lower() == q.lower()]
+                if not hits:
+                    hits = ET.find_items(items, q)
+                if len(hits) != 1:
+                    raise SystemExit(f'#{k}: "{q}" matched {len(hits)} items: {[h["name"] for h in hits]}')
+                r['item_id'], r['name'] = hits[0]['id'], hits[0]['name']
+                r['category'] = cats.get(hits[0]['id'], 'other')
+        for key in ('uncertain', 'note', 'category', 'W', 'H', 'rotated'):
+            if key in c:
+                r[key] = c[key]
+        r.pop('pred_conf', None)
+    out = truth_path(img_path, 'full')
+    with open(out, 'w', encoding='utf-8') as f:
+        json.dump(rows, f, indent=1, ensure_ascii=False)
+    print(f'wrote {out} ({len(rows)} rows, {sum(1 for r in rows if r.get("uncertain"))} uncertain)')
+
+
+# ---------------------------------------------------------------------------
+# legacy modes (--label, dump): unchanged behaviour, lazy app import
+# ---------------------------------------------------------------------------
+
+def _legacy_api():
+    import app as A
+    return A
+
+
+def legacy_label_mode(img_path):
+    A = _legacy_api()
     img_bgr = cv2.imread(img_path)
     if img_bgr is None:
         print(f"ERROR: cannot load '{img_path}'")
         sys.exit(1)
-    icon_db = _require_db()
-    detections, panels, _, mdb = scan_image(img_bgr, icon_db)
+    icon_db = A.load_icon_db()
+    settings = dict(A.load_json(A.SETTINGS_PATH, A.default_settings))
+    settings.pop('grid', None)
+    panels, _ = A.resolve_panels(img_bgr, settings, persist_fn=None)
+    mdb = A.get_db_at_pitch(icon_db, *A._slot_px(panels[0]))
+    prices = A.load_json(A.PRICES_PATH, lambda: {})
+    lm = A.build_label_matcher(prices) if A.tesseract_available() and prices.get('items') else None
+    detections = A.scan_all_panels(img_bgr, panels, mdb, label_matcher=lm)
     detections = sorted(detections, key=lambda d: (d.get('panel', 0), d['row'], d['col']))
-
-    truth = [{'panel': d.get('panel', 0), 'col': d['col'], 'row': d['row'],
-              'W': d['W'], 'H': d['H'],
-              'item_id': d['item_id'], 'name': d['name'],
-              'rotated': d.get('rotated', False)} for d in detections]
-
-    tp = _truth_path(img_path)
+    truth = [{'panel': d.get('panel', 0), 'col': d['col'], 'row': d['row'], 'W': d['W'], 'H': d['H'],
+              'item_id': d['item_id'], 'name': d['name'], 'rotated': d.get('rotated', False)}
+             for d in detections]
+    tp = truth_path(img_path, 'orig')
     if os.path.exists(tp):
-        print(f"NOTE : {tp} already exists — writing guesses to {tp}.new instead "
-              "(merge manually so you don't lose corrections).")
-        tp = tp + '.new'
+        tp += '.new'
     with open(tp, 'w', encoding='utf-8') as f:
         json.dump(truth, f, indent=2, ensure_ascii=False)
-    print(f"Wrote {len(truth)} guesses → {tp}")
+    print(f'Wrote {len(truth)} legacy guesses -> {tp}  (prefer --prefill: the v2 tool also labels the whole stash)')
 
-    # Visual HTML: crop + guessed name + top-5 so you can verify/fix quickly.
-    rows = []
-    for d in detections:
-        panel = panels[d.get('panel', 0)]
-        uri = _crop_data_uri(img_bgr, d['col'], d['row'], d['W'], d['H'], panel)
-        tops = top_matches(img_bgr, d['col'], d['row'], d['W'], d['H'], panel, mdb)
-        alt = '<br>'.join(f"{sc:.3f} {name} [{src}{'/rot' if rot else ''}]"
-                          for sc, name, _id, src, rot in tops)
-        rot = ' (rot)' if d.get('rotated') else ''
-        rows.append(
-            f"<tr><td><img src='{uri}' style='max-height:96px;border:1px solid #333'></td>"
-            f"<td>panel {d.get('panel', 0)} ({d['col']},{d['row']}) {d['W']}×{d['H']}{rot}</td>"
-            f"<td><b>{d['name']}</b><br><code>{d['item_id']}</code><br>"
-            f"{d['score']}%</td><td style='font-size:11px;color:#888'>{alt}</td></tr>")
-    html = ("<html><body style='background:#111;color:#ccc;font-family:sans-serif'>"
-            f"<h3>{os.path.basename(img_path)} — {len(detections)} detections "
-            f"across {len(panels)} panel(s)</h3>"
-            "<p>Fix wrong <code>item_id</code>s in the .truth.json, delete false "
-            "positives, add rows for missed items.</p>"
-            "<table cellpadding=6 style='border-collapse:collapse'>"
-            "<tr><th>crop</th><th>cell</th><th>guess</th><th>top-5</th></tr>"
-            + ''.join(rows) + "</table></body></html>")
-    hp = os.path.join(os.path.dirname(img_path),
-                      os.path.splitext(os.path.basename(img_path))[0] + '.label.html')
-    with open(hp, 'w', encoding='utf-8') as f:
-        f.write(html)
-    print(f"Wrote visual check → {hp}  (open in a browser)")
-
-
-# ---------------------------------------------------------------------------
-# --score : precision / recall / accuracy vs. truth
-# ---------------------------------------------------------------------------
-
-def score_mode(img_paths):
-    icon_db = _require_db()
-    grand = {'tp': 0, 'fp': 0, 'fn': 0, 'wrong': 0, 'truth': 0}
-
-    for img_path in img_paths:
-        tp_path = _truth_path(img_path)
-        if not os.path.exists(tp_path):
-            print(f"\n{os.path.basename(img_path)} — no {os.path.basename(tp_path)}; "
-                  "run --label first, correct it, then --score.")
-            continue
-        img_bgr = cv2.imread(img_path)
-        if img_bgr is None:
-            print(f"\n{os.path.basename(img_path)} — cannot load; skipping.")
-            continue
-        with open(tp_path, encoding='utf-8') as f:
-            truth = json.load(f)
-
-        print(f"\n{'='*66}\n{os.path.basename(img_path)}  ({len(truth)} labelled items)")
-        detections, panels, _, mdb = scan_image(img_bgr, icon_db)
-        if len(panels) > 1:
-            print(f"  WARNING: {len(panels)} panels detected — most truth files are "
-                  "built from a single panel; rows without a 'panel' field default "
-                  "to panel 0.")
-
-        # Index by (panel, col, row): plain (col,row) collides across panels
-        # (each panel's grid restarts at its own local 0,0), which would let a
-        # panel-1 detection silently clobber a panel-0 truth match in the dict
-        # below.  Truth rows from older single-panel labels have no 'panel'
-        # key and default to 0 — identical behaviour to before this existed.
-        truth_by_cell = {(t.get('panel', 0), t['col'], t['row']): t for t in truth}
-        det_by_cell = {(d.get('panel', 0), d['col'], d['row']): d for d in detections}
-
-        tp = fp = fn = wrong = 0
-        failures = []
-        for cell, t in truth_by_cell.items():
-            d = det_by_cell.get(cell)
-            if d is None:
-                fn += 1
-                failures.append(('MISSED', cell, t, None))
-            elif d['item_id'] == t['item_id']:
-                tp += 1
-            else:
-                wrong += 1
-                failures.append(('WRONG', cell, t, d))
-        for cell, d in det_by_cell.items():
-            if cell not in truth_by_cell:
-                fp += 1
-                failures.append(('EXTRA', cell, None, d))
-
-        n = len(truth)
-        acc = tp / n if n else 0
-        prec = tp / (tp + wrong + fp) if (tp + wrong + fp) else 0
-        rec = tp / (tp + wrong + fn) if (tp + wrong + fn) else 0
-        print(f"  accuracy {acc*100:5.1f}%   precision {prec*100:5.1f}%   "
-              f"recall {rec*100:5.1f}%")
-        print(f"  correct={tp}  wrong={wrong}  missed={fn}  extra={fp}")
-
-        for kind, cell, t, d in failures[:40]:
-            pnl, col, row = cell
-            # `pnl` comes from the truth/detection's own 'panel' field (0 for
-            # every single-panel eval image), so this is panels[0] in the
-            # common case and only differs for genuinely multi-panel shots.
-            panel = panels[pnl] if pnl < len(panels) else panels[0]
-            if kind == 'MISSED':
-                print(f"    MISSED panel{pnl} ({col:2d},{row:2d}) {t['W']}×{t['H']}  "
-                      f"want '{t['name']}'")
-                for sc, name, _id, src, rot in top_matches(
-                        img_bgr, col, row, t['W'], t['H'], panel, mdb):
-                    hit = ' ←WANT' if _id == t['item_id'] else ''
-                    print(f"        {sc:6.3f} {name} [{src}{'/rot' if rot else ''}]{hit}")
-            elif kind == 'WRONG':
-                print(f"    WRONG  panel{pnl} ({col:2d},{row:2d})  got '{d['name']}' "
-                      f"({d['score']}%)  want '{t['name']}'")
-                for sc, name, _id, src, rot in top_matches(
-                        img_bgr, col, row, t['W'], t['H'], panel, mdb):
-                    hit = ' ←WANT' if _id == t['item_id'] else ''
-                    print(f"        {sc:6.3f} {name} [{src}{'/rot' if rot else ''}]{hit}")
-            else:  # EXTRA
-                print(f"    EXTRA  panel{pnl} ({col:2d},{row:2d}) {d['W']}×{d['H']}  "
-                      f"got '{d['name']}' ({d['score']}%)")
-
-        grand['tp'] += tp; grand['fp'] += fp; grand['fn'] += fn
-        grand['wrong'] += wrong; grand['truth'] += n
-
-    n = grand['truth']
-    if n:
-        tp, wrong, fn, fp = grand['tp'], grand['wrong'], grand['fn'], grand['fp']
-        acc = tp / n
-        prec = tp / (tp + wrong + fp) if (tp + wrong + fp) else 0
-        rec = tp / (tp + wrong + fn) if (tp + wrong + fn) else 0
-        print(f"\n{'='*66}\nOVERALL  {n} items across {len(img_paths)} image(s)")
-        print(f"  accuracy {acc*100:5.1f}%   precision {prec*100:5.1f}%   "
-              f"recall {rec*100:5.1f}%")
-        print(f"  correct={tp}  wrong={wrong}  missed={fn}  extra={fp}")
-        print(f"  TARGET ≥95% accuracy — {'PASS' if acc >= 0.95 else 'not yet'}")
-
-
-# ---------------------------------------------------------------------------
-# Legacy single-image dump
-# ---------------------------------------------------------------------------
 
 def dump_mode(argv):
-    img_path = argv[0] if argv else os.path.join(
-        os.path.dirname(__file__), 'data', 'test_stash.png')
-    print(f"Image: {img_path}")
-    img_bgr = cv2.imread(img_path)
-    if img_bgr is None:
-        print(f"ERROR: cannot load '{img_path}'  (save one under data/eval/)")
+    img_path = argv[0] if argv else os.path.join(EVAL_DIR, 'stash1.png')
+    img = cv2.imread(img_path)
+    if img is None:
+        print(f"ERROR: cannot load '{img_path}'")
         sys.exit(1)
-    print(f"Size : {img_bgr.shape[1]}×{img_bgr.shape[0]}")
-    icon_db = _require_db()
-    detections, panels, _, mdb = scan_image(img_bgr, icon_db)
-
-    print(f"\n{'─'*66}\n{'pnl':>3} {'col':>4} {'row':>4}  {'size':>5}  {'rot':>3}  "
-          f"{'src':>5}  {'score':>6}  item\n{'─'*66}")
-    for d in sorted(detections, key=lambda x: (x.get('panel', 0), x['row'], x['col'])):
-        print(f"{d.get('panel', 0):>3} {d['col']:>4} {d['row']:>4}  {d['W']}×{d['H']:<3}  "
-              f"{'Y' if d.get('rotated') else '·':>3}  {d.get('source','?'):>5}  "
-              f"{d['score']:>5.1f}%  {d['name']}")
-    print(f"{'─'*66}\nTotal: {len(detections)} items across {len(panels)} panel(s)")
-
-    if len(argv) >= 3:
-        col, row = int(argv[1]), int(argv[2])
-        W = int(argv[3]) if len(argv) > 3 else 1
-        H = int(argv[4]) if len(argv) > 4 else 1
-        print(f"\nTop-5 for panel 0 ({col},{row}) {W}×{H}:")
-        for sc, name, _id, src, rot in top_matches(img_bgr, col, row, W, H, panels[0], mdb):
-            flag = ' ← ACCEPTED' if sc >= ICON_MATCH_MIN_SCORE else ''
-            print(f"  {sc:6.3f} {name} [{src}{'/rot' if rot else ''}]{flag}")
+    dets, dt, res = run_v2(img)
+    print(f'Image {img_path}  {img.shape[1]}x{img.shape[0]}  scan {dt:.2f}s  {res.timings}')
+    for d in res.detections:
+        print(f"{d.panel:>2} ({d.col:>2},{d.row:>2}) {d.w}x{d.h} {'R' if d.rotated else ' '} "
+              f"{d.confidence:.2f}{'?' if d.uncertain else ' '} fir={d.fir!s:<5} n={d.count!s:<5} {d.name}")
 
 
 def main():
-    args = sys.argv[1:]
-    if args and args[0] == '--label':
-        if len(args) < 2:
-            print("usage: python test_scan.py --label data/eval/shot.png")
-            sys.exit(1)
-        label_mode(args[1])
-    elif args and args[0] == '--score':
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument('--score', nargs='+', metavar='IMG')
+    ap.add_argument('--engine', default='v2', choices=['v2', 'legacy', 'both'])
+    ap.add_argument('--truth', default='full', help="'full' (default), 'orig' or a path")
+    ap.add_argument('--no-dino', action='store_true')
+    ap.add_argument('--no-ocr', action='store_true')
+    ap.add_argument('--json')
+    ap.add_argument('--robustness', metavar='IMG')
+    ap.add_argument('--kinds', help='comma separated variants for --robustness')
+    ap.add_argument('--prefill', metavar='IMG')
+    ap.add_argument('--relabel', nargs=2, metavar=('IMG', 'CORRECTIONS.json'))
+    ap.add_argument('--label', metavar='IMG')
+    ap.add_argument('rest', nargs='*')
+    a = ap.parse_args()
+    if a.score:
         paths = []
-        for a in args[1:]:
-            paths.extend(sorted(glob.glob(a)) if any(c in a for c in '*?[') else [a])
-        if not paths:
-            print("usage: python test_scan.py --score data/eval/*.png")
-            sys.exit(1)
-        score_mode(paths)
+        for p in a.score:
+            paths.extend(sorted(glob.glob(p)) if any(c in p for c in '*?[') else [p])
+        score_mode(paths, a.engine, a.truth, not a.no_dino, not a.no_ocr, a.json)
+    elif a.robustness:
+        robustness_mode(a.robustness, a.truth, a.kinds.split(',') if a.kinds else None, a.json)
+    elif a.prefill:
+        prefill_mode(a.prefill, not a.no_dino)
+    elif a.relabel:
+        relabel_mode(*a.relabel)
+    elif a.label:
+        legacy_label_mode(a.label)
     else:
-        dump_mode(args)
+        dump_mode(a.rest)
 
 
 if __name__ == '__main__':
