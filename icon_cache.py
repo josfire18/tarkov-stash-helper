@@ -37,10 +37,19 @@ CACHE_MAP_PATH = os.path.join(DATA, 'cache_map.json')
 
 GRID_PITCH = 63              # px per slot @ 1080p (icon cache + tarkov.dev grid geometry)
 POOL       = 16              # pooled-descriptor side length for the shortlist
-SHORTLIST  = 12              # NCC-verify this many top pooled candidates
+SHORTLIST  = 32              # NCC-verify this many top pooled candidates (widened so the
+                             # true item can't miss the shortlist — association is
+                             # offline/incremental so the extra NCC cost is fine)
 STRONG     = 0.86            # >= this NCC → confident item match (preset=False)
 FLOOR      = 0.55            # >= this (but < STRONG) → preset variant of best guess
+ASSOC_MARGIN_MIN = 0.04      # STRONG match needs >= this lead over the best distinct-item
+                             # candidate in the shortlist, else it's flagged 'ambiguous'
+                             # (a same-silhouette wrong item scored almost as well)
 NEUTRAL_TINT = (38, 42, 44)  # association happens tint-agnostic (masks drop the bg)
+
+CACHE_MAP_VERSION = 2        # bump whenever cache_map.json's *meaning* changes (e.g. new
+                             # fields the incremental mtime-reuse would otherwise never
+                             # backfill) — forces a full re-association, not just new files
 
 
 # ---------------------------------------------------------------------------
@@ -191,10 +200,14 @@ def _build_reference_index(items, load_src_fn, workers=24):
 def _associate_one(cache_bgra, W, H, ref_bucket):
     """
     Match a single cache icon against references of its slot size.
-    Returns (item_id, name, score) for the best reference, or (None, None, best).
+    Returns (item_id, name, score, margin) for the best reference, or
+    (None, None, -1.0, 0.0).  `margin` is best_score minus the best score
+    among shortlisted candidates that belong to a *different* item id — a
+    small margin means a same-silhouette wrong item scored almost as well,
+    i.e. the association is not to be trusted even if the raw score is high.
     """
     if ref_bucket is None or not ref_bucket['ids']:
-        return None, None, -1.0
+        return None, None, -1.0, 0.0
     q = _pooled(cache_bgra)
     sims = ref_bucket['pooled'] @ q                      # cosine (both unit-norm)
     k = min(SHORTLIST, sims.shape[0])
@@ -202,16 +215,24 @@ def _associate_one(cache_bgra, W, H, ref_bucket):
     cq = _canon_gray(cache_bgra, W, H)
     mq = _alpha_mask(cache_bgra, W, H)
     best_i, best_sc = -1, -1.0
+    scored = []
     for i in cand:
         ref = ref_bucket['srcs'][int(i)]
         rc = _canon_gray(ref, W, H)
         rm = _alpha_mask(ref, W, H)
         sc = _masked_corr(cq, mq, rc, rm)
+        scored.append((int(i), sc))
         if sc > best_sc:
             best_sc, best_i = sc, int(i)
     if best_i < 0:
-        return None, None, -1.0
-    return ref_bucket['ids'][best_i], ref_bucket['names'][best_i], best_sc
+        return None, None, -1.0, 0.0
+    best_id = ref_bucket['ids'][best_i]
+    best_other_sc = -1.0
+    for i, sc in scored:
+        if ref_bucket['ids'][i] != best_id and sc > best_other_sc:
+            best_other_sc = sc
+    margin = best_sc - best_other_sc
+    return ref_bucket['ids'][best_i], ref_bucket['names'][best_i], best_sc, margin
 
 
 # ---------------------------------------------------------------------------
@@ -219,16 +240,29 @@ def _associate_one(cache_bgra, W, H, ref_bucket):
 # ---------------------------------------------------------------------------
 
 def load_cache_map():
+    """Load the persisted cache map, or {} when missing/unreadable/stale.
+
+    A `_version` mismatch (old schema — e.g. entries from before the
+    association-margin field existed) is treated the same as "missing": the
+    incremental mtime-based reuse in associate_cache() would otherwise keep
+    old margin-less entries forever, since their files haven't changed on
+    disk.  Returning {} here means every entry has no `prev`, so
+    associate_cache() naturally re-associates everything.
+    """
     if os.path.exists(CACHE_MAP_PATH):
         try:
             with open(CACHE_MAP_PATH, encoding='utf-8') as f:
-                return json.load(f)
+                cmap = json.load(f)
+            if cmap.get('_version') != CACHE_MAP_VERSION:
+                return {}
+            return cmap
         except Exception:
             pass
     return {}
 
 
 def save_cache_map(cmap):
+    cmap['_version'] = CACHE_MAP_VERSION
     tmp = CACHE_MAP_PATH + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(cmap, f)
@@ -309,7 +343,7 @@ def associate_cache(items, load_src_fn, force=False):
     print(f"[icon_cache] associating {len(todo)} new/changed of {len(files)} cache icons…")
     ref_index = _build_reference_index(items, load_src_fn)
 
-    n_strong = n_preset = n_unknown = n_exact = 0
+    n_strong = n_preset = n_unknown = n_exact = n_ambiguous = 0
     for i, (fp, fn, mt) in enumerate(todo):
         if i and i % 250 == 0:
             print(f"[icon_cache] associate… {i}/{len(todo)}")
@@ -334,11 +368,16 @@ def associate_cache(items, load_src_fn, force=False):
             continue
         h_px, w_px = bgra.shape[:2]
         W, H = slot_size(w_px, h_px)
-        iid, name, score = _associate_one(bgra, W, H, ref_index.get((W, H)))
+        iid, name, score, margin = _associate_one(bgra, W, H, ref_index.get((W, H)))
         entry = {'mtime': mt, 'W': W, 'H': H, 'score': round(float(score), 4), 'exact': False}
         if iid is not None and score >= STRONG:
-            entry.update({'item_id': iid, 'name': name, 'preset': False, 'unknown': False})
-            n_strong += 1
+            ambiguous = margin < ASSOC_MARGIN_MIN
+            entry.update({'item_id': iid, 'name': name, 'preset': False,
+                         'unknown': False, 'ambiguous': ambiguous})
+            if ambiguous:
+                n_ambiguous += 1
+            else:
+                n_strong += 1
         elif iid is not None and score >= FLOOR:
             entry.update({'item_id': iid, 'name': name, 'preset': True, 'unknown': False})
             n_preset += 1
@@ -347,14 +386,15 @@ def associate_cache(items, load_src_fn, force=False):
             n_unknown += 1
         cmap[fn] = entry
 
-    # Drop entries whose cache files were deleted by the game
+    # Drop entries whose cache files were deleted by the game ('_version' is
+    # a schema stamp, not a per-file entry — the liveness sweep must skip it).
     live = {os.path.basename(f) for f in files}
-    for fn in [k for k in cmap if k not in live]:
+    for fn in [k for k in cmap if k != '_version' and k not in live]:
         del cmap[fn]
 
     save_cache_map(cmap)
     print(f"[icon_cache] associated: {n_strong} strong, {n_preset} preset, "
-          f"{n_unknown} unknown, {n_exact} exact")
+          f"{n_unknown} unknown, {n_exact} exact, {n_ambiguous} ambiguous")
     return cmap
 
 
@@ -370,12 +410,17 @@ def build_cache_templates(items, template_fn, tint_fn, load_src_fn, force=False)
     tint_fn(item)                     -> BGR tint tuple
     load_src_fn(item)                 -> (base_bgra, has_alpha)
 
-    Returns list of (footprint_wh, item_id, name, rotated, canon, mask, exact),
-    one native plus (for non-square icons) two 90°-rotated variants per
-    associated cache icon.  `unknown` associations are skipped.  `exact` is
+    Returns list of (footprint_wh, item_id, name, rotated, canon, mask, exact,
+    preset), one native plus (for non-square icons) two 90°-rotated variants
+    per associated cache icon.  `unknown` and `ambiguous` associations are
+    skipped — for `ambiguous` (a STRONG-score match with too small a lead over
+    a same-silhouette distinct-item candidate) the item's own API template
+    still covers it, so only the small cache-source bonus is lost.  `exact` is
     True when the association came from the validated exact-hash pipeline
     (eft_hash.py) rather than NCC visual matching — app.py uses it to prefer
-    (and give extra trust to) these templates.
+    (and give extra trust to) these templates.  `preset` is True for
+    FLOOR-tier best-guess associations (modded weapon builds etc.) — callers
+    that only want confident, non-guessed cache templates can filter on it.
     """
     with _assoc_lock:
         cmap = associate_cache(items, load_src_fn, force=force)
@@ -386,7 +431,9 @@ def build_cache_templates(items, template_fn, tint_fn, load_src_fn, force=False)
     cache_dir = find_cache_dir()
     records = []
     for fn, entry in cmap.items():
-        if entry.get('unknown') or not entry.get('item_id'):
+        if fn == '_version':
+            continue
+        if entry.get('unknown') or entry.get('ambiguous') or not entry.get('item_id'):
             continue
         item = id_to_item.get(entry['item_id'])
         if item is None:
@@ -398,7 +445,8 @@ def build_cache_templates(items, template_fn, tint_fn, load_src_fn, force=False)
         W, H = entry.get('W', 1), entry.get('H', 1)
         tint = tint_fn(item)
         exact = bool(entry.get('exact'))
-        name = item['name'] + (' (build)' if entry.get('preset') else '')
+        preset = bool(entry.get('preset'))
+        name = item['name'] + (' (build)' if preset else '')
         variants = [((W, H), False, bgra)]
         if W != H:
             variants.append(((H, W), True, cv2.rotate(bgra, cv2.ROTATE_90_CLOCKWISE)))
@@ -408,5 +456,5 @@ def build_cache_templates(items, template_fn, tint_fn, load_src_fn, force=False)
             if made is None:
                 continue
             canon, mask = made
-            records.append(((fw, fh), item['id'], name, rotated, canon, mask, exact))
+            records.append(((fw, fh), item['id'], name, rotated, canon, mask, exact, preset))
     return records

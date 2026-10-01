@@ -89,6 +89,12 @@ PRESTIGE_WIKI_API    = ('https://escapefromtarkov.fandom.com/api.php'
 ICON_MATCH_THRESHOLD = 0.68  # cv2.TM_CCOEFF_NORMED score cutoff for icon matching
 CANONICAL_PER_SLOT   = 64    # px per 1×1 slot in the canonical-size template
 ICON_MATCH_MIN_SCORE = 0.40  # NCC threshold to accept an icon match
+# Match-quality gate: a grid that passes validate_grid can still be wrong (a
+# chrome-forged fallback), and a wrong grid emits few, low-scoring detections
+# where a correct one claims most occupied cells at high scores.  Below either
+# floor the scan is "suspect" → grid-hypothesis arbitration kicks in.
+SCAN_MIN_ACCEPT_RATE = 0.25  # accepted detections / occupied cells floor
+SCAN_MIN_MEDIAN_PCT  = 55.0  # median accepted score (%) floor (scores are 0–100)
 LABEL_BLANK_PX       = 13    # top rows of each cell to overwrite with bg colour (removes item-name label)
 CORNER_BLANK_PX      = 18    # top-right (FiR ✓) and bottom-right (stack count) corner blanking
 FIR_BRIGHT           = 170   # grayscale floor for a pixel to count as part of the FiR ✓ mark
@@ -96,7 +102,13 @@ FIR_MIN_PX           = 6     # below this many bright px, too little signal to c
 FIR_MAX_FRAC         = 0.5   # above this fraction of the corner window lit up, probably not a clean ✓ (indeterminate)
 NCC_MARGIN_MIN       = 0.04  # require top-1 NCC to beat top-2 by this much (rejects ambiguous matches)
 ICON_DB_PATH         = os.path.join(DATA, 'icon_db.npz')
-DB_VERSION           = 6     # bump whenever the vector format changes; forces a rebuild
+DB_VERSION           = 7     # bump whenever the vector format changes; forces a rebuild
+CACHE_INCLUDE_PRESETS = False  # preset-tier cache templates ('(build)', FLOOR<=score<STRONG)
+                               # are only ever low-confidence guesses that the association
+                               # pass couldn't tell apart from another same-silhouette item
+                               # (guns/presets are already excluded from DB targets, so these
+                               # are guesses about *non-gun* items) — excluding them stops a
+                               # mislabeled pixel-perfect render from outscoring the true item
 _STASH_BG_BGR        = (38, 42, 44)  # Tarkov stash cell background colour (BGR) — used for blanked (masked-out) regions
 GRID_PITCH_1080P     = 63    # px per slot in-game @ 1080p reference (icon-cache geometry); captures may be ANY pitch
 
@@ -174,7 +186,7 @@ class ScanError(Exception):
 
 
 # Shared state for hotkey-triggered scans
-_last_scan = {'image': None, 'detections': [], 'ts': 0,
+_last_scan = {'image': None, 'detections': [], 'ts': 0, 'grid_failed': False,
               'error': None, 'warnings': [], 'checklist_matches': []}
 _scan_lock = threading.Lock()
 
@@ -940,12 +952,16 @@ def build_icon_db(price_cache, progress_cb=None, workers=24, use_cache=True):
             import icon_cache
             cache_recs = icon_cache.build_cache_templates(
                 items, _template_from_bgra, tint_for, _load_template_source)
-            for (wh, item_id, name, rotated, vec, mask, exact) in cache_recs:
+            n_skipped_preset = 0
+            for (wh, item_id, name, rotated, vec, mask, exact, preset) in cache_recs:
+                if preset and not CACHE_INCLUDE_PRESETS:
+                    n_skipped_preset += 1
+                    continue
                 src = 'cache-exact' if exact else 'cache'
                 _append_record(by_size_raw, wh, item_id, name, src, rotated, vec, mask)
                 cache_ids.add(item_id)
-            print(f"[icon_db] cache templates: {len(cache_recs)} "
-                  f"({len(cache_ids)} distinct items)")
+            print(f"[icon_db] cache templates: {len(cache_recs) - n_skipped_preset} "
+                  f"({len(cache_ids)} distinct items, {n_skipped_preset} preset-tier skipped)")
         except Exception as e:
             print(f"[icon_db] icon-cache pass skipped: {e}")
 
@@ -1318,6 +1334,19 @@ def _best_with_margin(scores, ids):
 
 GRID_ASPECT_TOL   = 0.10  # max |cell_w - cell_h| / max(...) — EFT slots are square on-screen
 GRID_MIN_STRENGTH = 1.6   # autocorr peak decisiveness floor (≈1 = no periodicity at all)
+GRID_ASPECT_MAX   = 1.45  # max cell aspect for a GENUINELY stretched capture (4:3→16:9 = 1.333)
+GRID_AXIS_DISAGREE = 0.06  # |cw-ch|/max above which the two axes are treated as disagreeing
+# When the axes disagree, one may be a real stretch and the other chrome corruption
+# (a sidebar's icon strip forges a false pitch on one axis).  Strength alone can't tell
+# them apart — measured: the false 47px axis on stash1.png is STRONGER (5.22) than the
+# true 63px axis (3.78).  The discriminator that DOES work is cross-axis corroboration:
+# a real (square) grid pitch shows a decisive comb response on BOTH projections, a chrome
+# pitch only on its own.  A candidate period is the true square pitch when its min-across-
+# axes normalized comb clears GRID_CORROB_MIN and beats the rival period's by ×RATIO.
+# Measured: stash1 chrome → winner 3.03 vs loser 1.90 (ratio 1.60, rescue fires);
+#           genuine 84×63 stretch → 2.57 vs 2.16 (ratio 1.19, no rescue, both kept).
+GRID_CORROB_MIN   = 2.5   # winner's cross-axis min normalized comb floor to call it square
+GRID_CORROB_RATIO = 1.35  # winner must beat the rival period's corroboration by this factor
 
 
 def validate_grid(grid):
@@ -1328,7 +1357,9 @@ def validate_grid(grid):
     captured game window can be any resolution (windowed, Lossless Scaling,
     stretched res), so the pitch is whatever it is.  Checks instead:
       - pitch within the supported range on both axes,
-      - near-square cells (EFT slots are square on-screen),
+      - cells either near-square (EFT slots are square at native aspect) OR
+        genuinely stretched with two independently-confident axes (a 4:3 grid
+        rendered on a 16:9 monitor stretches cells to ~1.33:1 — real, not noise),
       - a decisive autocorrelation peak when the detection carries one
         (persisted grids were validated when saved and carry none).
     """
@@ -1338,8 +1369,23 @@ def validate_grid(grid):
     if not (GRID_PITCH_LO - 1 <= cw <= GRID_PITCH_HI + 1
             and GRID_PITCH_LO - 1 <= ch <= GRID_PITCH_HI + 1):
         return False
-    if abs(cw - ch) / max(cw, ch) > GRID_ASPECT_TOL:
-        return False
+    aspect = max(cw, ch) / min(cw, ch) if min(cw, ch) > 0 else 1e9
+    if aspect > 1 + GRID_ASPECT_TOL:
+        # Beyond near-square: accept ONLY a genuine stretch — two confident axes.
+        # A chrome-corrupted grid has one false axis; a real stretch has two real
+        # ones.  (The false 47×63 grid on stash1.png is prevented upstream: its
+        # detection is rescued to a square 63×63 before it can be returned — see
+        # detect_stash_grid.  Strengths alone cannot reject a raw 47×63 here,
+        # because both its axes read strong; that discrimination needs the image,
+        # so it lives in detection where corroboration runs.)
+        sx = grid.get('strength_x')
+        sy = grid.get('strength_y')
+        if sx is None or sy is None:
+            return False  # older grid without per-axis strengths → near-square only
+        if aspect > GRID_ASPECT_MAX:
+            return False
+        if not (sx >= GRID_MIN_STRENGTH and sy >= GRID_MIN_STRENGTH):
+            return False
     strength = grid.get('strength')
     if strength is not None and strength < GRID_MIN_STRENGTH:
         return False
@@ -1357,7 +1403,10 @@ def resolve_grid(img_bgr, settings, persist_fn=None):
     grid = detect_stash_grid(img_bgr)
     if validate_grid(grid):
         if persist_fn:
-            persist_fn(grid)
+            # 'alt' is an in-memory hypothesis for later arbitration, not part of
+            # the persisted last-good grid — strip it so settings.json stays a
+            # clean grid record.
+            persist_fn({k: v for k, v in grid.items() if k != 'alt'})
         return grid, 'detected'
     saved = settings.get('grid')
     if validate_grid(saved):
@@ -1711,6 +1760,125 @@ def scan_all_panels(img_bgr, panels, matcher_db, label_matcher=None,
         all_dets.extend(dets)
     return all_dets
 
+
+def _estimate_occupied(img_bgr, panels):
+    """
+    Total occupied cells across all panels, using the SAME occupancy machinery
+    identify_items_by_icon builds from (per-panel, on the panel-local grid) so
+    the count matches exactly what the matcher walked.  This is the denominator
+    of the match-quality gate's acceptance rate.
+    """
+    total = 0
+    for p in panels:
+        crop = img_bgr[p['y0']:p['y1'], p['x0']:p['x1']]
+        local = {'cell_w': p['cell_w'], 'cell_h': p['cell_h'],
+                 'origin_x': p['origin_x'] - p['x0'],
+                 'origin_y': p['origin_y'] - p['y0']}
+        ch, cw = crop.shape[:2]
+        n_cols = max(0, int((cw - local['origin_x']) // local['cell_w']))
+        n_rows = max(0, int((ch - local['origin_y']) // local['cell_h']))
+        if n_cols == 0 or n_rows == 0:
+            continue
+        total += int(_build_occupancy(crop, local, n_rows, n_cols).sum())
+    return total
+
+
+def _scan_suspect(detections, occupied):
+    """
+    True when a scan's quality looks like a misdetected grid: too few accepted
+    detections relative to occupied cells, or accepted scores clustering low.
+    occupied == 0 (empty stash) is a legitimate result, never suspect.
+    Detection scores are 0–100 (see identify_items_by_icon), matching
+    SCAN_MIN_MEDIAN_PCT.
+    """
+    if occupied <= 0:
+        return False
+    if len(detections) / occupied < SCAN_MIN_ACCEPT_RATE:
+        return True
+    if not detections:
+        return True
+    return float(np.median([d['score'] for d in detections])) < SCAN_MIN_MEDIAN_PCT
+
+
+def _arbitrate_scan(img_bgr, panels, initial_dets, grid, grid_src, settings,
+                    matcher_db, label_matcher, warnings, persist_fn,
+                    progress_cb=None):
+    """
+    Match-quality gate + grid-hypothesis arbitration, shared by both scan entry
+    points.  If the initial scan_all_panels result is not suspect, it is
+    returned unchanged.  Otherwise up to 3 alternative full-frame grid
+    hypotheses are re-scanned and the best NON-suspect one is kept and
+    persisted (so the next scan starts right):
+
+      - the detection's discarded independent-axis reading ('alt'),
+      - the persisted last-good grid (settings['grid']) if valid and different,
+      - the flat cell_size default grid if not already used.
+
+    If every hypothesis is also suspect, this is a grid failure: returns empty
+    detections and grid_failed=True, appends a user-facing warning, and NEVER
+    surfaces the suspect detections.
+
+    Returns (detections, grid, grid_src, grid_failed).
+    """
+    occupied = _estimate_occupied(img_bgr, panels)
+    if not _scan_suspect(initial_dets, occupied):
+        return initial_dets, grid, grid_src, False
+
+    sh, sw = img_bgr.shape[:2]
+
+    def _slot_key(g):
+        return (round(g['cell_w'], 1), round(g['cell_h'], 1))
+
+    used = {_slot_key(grid)}
+    hypotheses = []                         # (grid_dict, src_label)
+    alt = grid.get('alt')
+    if validate_grid(alt):
+        hypotheses.append((alt, 'alt'))
+    saved = settings.get('grid')
+    if validate_grid(saved):
+        hypotheses.append((dict(saved), 'persisted'))
+    cs = float(settings.get('cell_size', 64))
+    hypotheses.append(({'cell_w': cs, 'cell_h': cs,
+                        'origin_x': 0.0, 'origin_y': 0.0}, 'fallback'))
+
+    best = None                             # (rate, med, dets, grid, src)
+    tried = 0
+    for hyp, src in hypotheses:
+        if tried >= 3:
+            break
+        key = _slot_key(hyp)
+        if key in used:
+            continue
+        used.add(key)
+        tried += 1
+        hyp = {k: v for k, v in hyp.items() if k != 'alt'}
+        hyp_db = get_matcher_db(hyp)
+        if hyp_db is None:
+            continue
+        hyp_panels = [{**hyp, 'x0': 0, 'y0': 0, 'x1': sw, 'y1': sh}]
+        hyp_occ = _estimate_occupied(img_bgr, hyp_panels)
+        hyp_dets = scan_all_panels(img_bgr, hyp_panels, hyp_db,
+                                   label_matcher=label_matcher,
+                                   progress_cb=progress_cb)
+        if _scan_suspect(hyp_dets, hyp_occ):
+            continue
+        rate = len(hyp_dets) / hyp_occ if hyp_occ else 0.0
+        med  = float(np.median([d['score'] for d in hyp_dets])) if hyp_dets else 0.0
+        if best is None or (rate, med) > (best[0], best[1]):
+            best = (rate, med, hyp_dets, hyp, src)
+
+    if best is not None:
+        _, _, dets, hyp_grid, src = best
+        print(f"[scan] grid arbitration: '{grid_src}' was suspect, "
+              f"switched to '{src}' ({len(dets)} detections)")
+        if persist_fn:
+            persist_fn({k: v for k, v in hyp_grid.items() if k != 'alt'})
+        return dets, hyp_grid, src, False
+
+    print(f"[scan] grid FAILED: '{grid_src}' suspect and no hypothesis recovered")
+    warnings.append('Stash grid not detected — check the capture region covers '
+                    'the stash, or recalibrate.')
+    return [], grid, grid_src, True
 
 
 def prefetch_keep_list_icons(keep_list, price_index, scale=2.0):
@@ -2473,45 +2641,155 @@ def _refine_axis(proj, period, phase):
     return best[0], best[1]
 
 
+def _rescue_weak_axis(proj, prior_period):
+    """
+    Re-detect one axis using `prior_period` as a hard prior instead of letting
+    autocorrelation pick the period freely.  Used when the other axis found the
+    true (square) pitch but this axis's raw projection is chrome-corrupted: the
+    coarse phase is folded at the prior period, then `_refine_axis`'s ±0.75px
+    window locks the sub-pixel period — that narrow window IS the prior, so it
+    cannot wander back to a distant false pitch (e.g. a sidebar's 47px comb).
+    Returns (origin, period) floats.
+    """
+    phase = _grid_phase(proj, prior_period)
+    return _refine_axis(proj, prior_period, phase)
+
+
+def _axis_corroboration(v_proj, h_proj, period):
+    """
+    How strongly BOTH projections support the grid pitch `period`, as the
+    minimum of the two axes' normalized comb responses (comb energy / median).
+
+    A real square grid draws lines at `period` on both axes, so both respond;
+    a chrome pitch (sidebar icon strip) exists on only one axis, so the other's
+    response collapses and drags the min down.  This is the signal that tells a
+    genuinely stretched capture (neither axis corroborates the other's pitch)
+    apart from chrome corruption (the true pitch corroborates on both).
+    """
+    ov, pv = _refine_axis(v_proj, period, _grid_phase(v_proj, period))
+    oh, ph = _refine_axis(h_proj, period, _grid_phase(h_proj, period))
+    medv = float(np.median(v_proj)) or 1.0
+    medh = float(np.median(h_proj)) or 1.0
+    cv_ = _comb_score(v_proj, ov, pv) / medv
+    ch_ = _comb_score(h_proj, oh, ph) / medh
+    return min(cv_, ch_)
+
+
+def _resolve_axis_pitches(v_proj, h_proj, lo=GRID_PITCH_LO, hi=GRID_PITCH_HI):
+    """
+    Resolve the true per-axis grid pitches from the two Sobel line projections,
+    correcting chrome-corrupted axes.
+
+    Returns a dict with resolved pitches `px`/`py` and their strengths `sx`/`sy`,
+    the raw independent detections `px0`/`py0`/`sx0`/`sy0` (before any rescue),
+    and `rescued` (True when one axis was overridden with the other's pitch).
+    Returns None when neither axis shows any periodicity.
+
+    Cases:
+      - both axes agree (within GRID_AXIS_DISAGREE)  → keep both, no rescue.
+      - one axis missing                             → substitute the found one.
+      - axes disagree, one period corroborates on BOTH axes and beats the rival
+        (GRID_CORROB_MIN / _RATIO)                   → chrome: force it on both.
+      - axes disagree, neither corroborates          → genuine stretch: keep both.
+    """
+    px0, sx0 = _dominant_period(v_proj, lo, hi)
+    py0, sy0 = _dominant_period(h_proj, lo, hi)
+    if not px0 and not py0:
+        return None
+    if not px0:                       # x axis silent → borrow the y pitch
+        return {'px': py0, 'py': py0, 'sx': sy0, 'sy': sy0,
+                'px0': py0, 'py0': py0, 'sx0': sy0, 'sy0': sy0, 'rescued': True}
+    if not py0:                       # y axis silent → borrow the x pitch
+        return {'px': px0, 'py': px0, 'sx': sx0, 'sy': sx0,
+                'px0': px0, 'py0': px0, 'sx0': sx0, 'sy0': sx0, 'rescued': True}
+
+    base = {'px0': px0, 'py0': py0, 'sx0': sx0, 'sy0': sy0}
+    if abs(px0 - py0) / max(px0, py0) <= GRID_AXIS_DISAGREE:
+        return {**base, 'px': px0, 'py': py0, 'sx': sx0, 'sy': sy0,
+                'rescued': False}
+
+    # Disagreement: is one period the true SQUARE pitch (corroborated on both
+    # axes), making the other chrome?  Or are both real (a genuine stretch)?
+    corr_x = _axis_corroboration(v_proj, h_proj, px0)
+    corr_y = _axis_corroboration(v_proj, h_proj, py0)
+    win_x = corr_x >= corr_y
+    win_corr, lose_corr = (corr_x, corr_y) if win_x else (corr_y, corr_x)
+    if win_corr >= GRID_CORROB_MIN and win_corr >= GRID_CORROB_RATIO * lose_corr:
+        # Chrome corruption: the winning period is the real square pitch; force
+        # it on both axes and carry the winner's strength across the rescue.
+        P = px0 if win_x else py0
+        S = sx0 if win_x else sy0
+        return {**base, 'px': P, 'py': P, 'sx': S, 'sy': S, 'rescued': True}
+
+    # Genuine stretch: both axes are real and simply differ — keep them.
+    return {**base, 'px': px0, 'py': py0, 'sx': sx0, 'sy': sy0, 'rescued': False}
+
+
+def _axis_origin_pitch(proj, period):
+    """Coarse phase + joint sub-pixel refine of (origin, pitch) at `period`,
+    then shift the origin into the first full cell.  Shared by both axes."""
+    origin, pitch = _refine_axis(proj, period, _grid_phase(proj, period))
+    while origin >= pitch:
+        origin -= pitch
+    return float(origin), float(pitch)
+
+
 def detect_stash_grid(img_bgr, lo=GRID_PITCH_LO, hi=GRID_PITCH_HI):
     """
     Auto-detect the Tarkov stash grid parameters from the screenshot.
     Uses the repeating edge pattern (cell borders) via autocorrelation, then
     refines pitch+origin to sub-pixel precision via the comb response.
 
-    Returns dict {cell_w, cell_h, origin_x, origin_y (floats), strength}
-    or None on failure.  Pitch is NOT assumed to be 63px — windowed captures
-    render the grid at whatever the game window's resolution dictates.
+    Returns dict {cell_w, cell_h, origin_x, origin_y (floats), strength,
+    strength_x, strength_y} or None on failure.  Pitch is NOT assumed to be
+    63px — windowed captures render the grid at whatever resolution dictates.
+
+    When one axis is chrome-corrupted (UI sidebar forging a false pitch), the
+    corrupted axis is rescued to the corroborated square pitch and the raw
+    independent reading is exposed under 'alt' as an alternative hypothesis for
+    later match-quality arbitration.  The no-rescue path is behaviourally
+    identical to the original independent per-axis detection.
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    # np.abs computed once and shared across both projections (and by callers'
+    # rescue path) — the Sobel gradients are otherwise recomputed per use.
+    agx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+    agy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
 
     # Project each axis — peaks mark the grid lines
-    h_proj = np.sum(np.abs(gy), axis=1)   # rows → horizontal line positions
-    v_proj = np.sum(np.abs(gx), axis=0)   # cols → vertical line positions
+    h_proj = np.sum(agy, axis=1)   # rows → horizontal line positions
+    v_proj = np.sum(agx, axis=0)   # cols → vertical line positions
 
-    cell_h, strength_h = _dominant_period(h_proj, lo, hi)
-    cell_w, strength_w = _dominant_period(v_proj, lo, hi)
-    if not cell_h or not cell_w:
+    pit = _resolve_axis_pitches(v_proj, h_proj, lo, hi)
+    if pit is None:
         return None
 
-    origin_y = _grid_phase(h_proj, cell_h)
-    origin_x = _grid_phase(v_proj, cell_w)
-    origin_x, cell_w = _refine_axis(v_proj, cell_w, origin_x)
-    origin_y, cell_h = _refine_axis(h_proj, cell_h, origin_y)
+    origin_x, cell_w = _axis_origin_pitch(v_proj, pit['px'])
+    origin_y, cell_h = _axis_origin_pitch(h_proj, pit['py'])
+    strength_w, strength_h = pit['sx'], pit['sy']
 
-    # Origins are phases (mod pitch): shift into the first full cell.
-    while origin_x >= cell_w:
-        origin_x -= cell_w
-    while origin_y >= cell_h:
-        origin_y -= cell_h
-
-    return {
+    grid = {
         'cell_w': float(cell_w), 'cell_h': float(cell_h),
         'origin_x': float(origin_x), 'origin_y': float(origin_y),
         'strength': round(min(strength_w, strength_h), 2),
+        'strength_x': round(float(strength_w), 2),
+        'strength_y': round(float(strength_h), 2),
     }
+
+    # When a rescue overrode an axis, expose the discarded independent reading
+    # as an alternative hypothesis (JSON-serializable; stripped before persist).
+    if pit['rescued'] and pit['px0'] and pit['py0'] and (
+            pit['px0'] != pit['px'] or pit['py0'] != pit['py']):
+        ax, aw = _axis_origin_pitch(v_proj, pit['px0'])
+        ay, ah = _axis_origin_pitch(h_proj, pit['py0'])
+        grid['alt'] = {
+            'cell_w': float(aw), 'cell_h': float(ah),
+            'origin_x': float(ax), 'origin_y': float(ay),
+            'strength': round(min(pit['sx0'], pit['sy0']), 2),
+            'strength_x': round(float(pit['sx0']), 2),
+            'strength_y': round(float(pit['sy0']), 2),
+        }
+    return grid
 
 
 PANEL_COMB_MIN  = 1.6  # folded comb peak/median floor to START a span
@@ -2566,6 +2844,42 @@ def _phase_spans(proj, pitch):
     return [(s, min(e, n)) for s, e, _ in spans if e - s >= 2 * p]
 
 
+PANEL_CHROME_OUTLIER = 6.0  # a horizontal edge this many× the span's median line
+                            # energy is UI chrome (toolbar/header rule), not a grid
+                            # line — grid lines sit ≤~2× median even when bold.
+
+
+def _chrome_top_trim(h_seg, sy0, sy1, pitch):
+    """
+    Raise a y-span's top past a dominant non-grid chrome edge.
+
+    A stash panel is preceded by UI chrome (search/sort toolbar, currency bar)
+    whose bottom rule is a horizontal edge far stronger than any interior grid
+    line.  _phase_spans can't drop it: its 3-pitch (≈190px) window always
+    straddles the ~1-2 chrome rows into the grid below, so the span starts at
+    the frame top and the panel then counts the chrome rows as phantom grid
+    rows.  This scans the span's top ~2 cells for an edge that is a strong
+    OUTLIER (≥PANEL_CHROME_OUTLIER× the span-median line energy — grid lines,
+    even bold borders, stay ≤~2×) and moves the top just below the lowest such
+    edge.  Chrome-free crops have no outlier and are left untouched.
+
+    Returns the trimmed absolute top coordinate (≥ sy0).
+    """
+    seg = h_seg[sy0:sy1]
+    if len(seg) < 3 * pitch:
+        return sy0
+    med = float(np.median(seg)) or 1.0
+    look = int(min(len(seg) - 2 * int(round(pitch)), 2.2 * pitch))
+    thr = PANEL_CHROME_OUTLIER * med
+    last = -1
+    for i in range(max(0, look)):
+        if seg[i] > thr:
+            last = i
+    if last < 0:
+        return sy0
+    return sy0 + last + max(4, int(round(0.12 * pitch)))
+
+
 def detect_panels(img_bgr):
     """
     Find every stash/container grid panel in the frame, each with its own
@@ -2586,14 +2900,34 @@ def detect_panels(img_bgr):
     gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
     gy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
     v_proj = gx.sum(axis=0)
-    pitch_x, _ = _dominant_period(v_proj)
-    if not pitch_x:
+    h_proj = gy.sum(axis=1)
+    # Frame reference pitch for x-span segmentation.  Taken from BOTH axes, not
+    # the x-projection alone: a UI sidebar's icon strip forges a false pitch on
+    # x (measured on stash1.png: x reads 47px, strong, while the true grid is
+    # 63px), and segmenting at that false pitch splits the real panel wrong and
+    # then rejects every correct sub-grid.  _resolve_axis_pitches corroborates
+    # across axes and returns the true square pitch when one axis is chrome; on
+    # a genuine stretch it returns the real, different px/py.
+    pit = _resolve_axis_pitches(v_proj, h_proj)
+    if pit is None:
         return []
+    pitch_x = pit['px']
 
     sh, sw = img_bgr.shape[:2]
     px_i = int(round(pitch_x))
     candidates = []
     for (sx0, sx1) in _phase_spans(v_proj, pitch_x):
+        # A real panel column-span renders at the frame pitch.  A UI sidebar
+        # (category-filter icon strip / container thumbnails) sits left of the
+        # stash and forms its own phase-span, but its LOCAL dominant x-period is
+        # the sidebar's forged pitch (measured on stash1.png: 41/47px vs the
+        # frame's 63px), not the grid's — so it would otherwise become a bogus
+        # narrow panel that outranks the real stash.  Drop spans whose own
+        # x-period disagrees with the frame pitch.
+        loc_v = gx[:, sx0:sx1].sum(axis=0)
+        local_xp, _ = _dominant_period(loc_v)
+        if not local_xp or abs(local_xp - pitch_x) / pitch_x > GRID_AXIS_DISAGREE:
+            continue
         h_local = gy[:, sx0:sx1].sum(axis=1)
         pitch_y, _ = _dominant_period(h_local)
         if not pitch_y:
@@ -2605,20 +2939,30 @@ def detect_panels(img_bgr):
             # way so the sub-detection sees the true edge lines; overlaps into
             # a neighbour are trimmed at its first grid line below.
             x0, x1 = max(0, sx0 - px_i), min(sw, sx1 + px_i)
-            y0, y1 = max(0, sy0 - py_i), min(sh, sy1 + py_i)
+            # Drop a leading UI-chrome rule (toolbar/header) from this span's
+            # top before expanding, so the panel doesn't count chrome rows as
+            # phantom grid rows; then expand by one pitch for the true edge line.
+            sy0t = _chrome_top_trim(h_local, sy0, sy1, pitch_y)
+            # When a chrome rule was trimmed, DON'T expand back up over it (that
+            # would re-admit the phantom rows); otherwise expand one pitch up to
+            # catch a span-quantized first grid line.
+            top = sy0t if sy0t > sy0 else max(0, sy0 - py_i)
+            y0, y1 = top, min(sh, sy1 + py_i)
             sub = img_bgr[y0:y1, x0:x1]
             g = detect_stash_grid(sub)
             if not g or not validate_grid(g):
                 continue
             # One frame renders at one UI scale, so every real panel shares
             # the frame-global pitch — a sub-crop straddling a panel seam
-            # "detects" some other periodicity and gets rejected here.  Both
-            # axes compare against the x pitch: a full-frame y reference is
-            # poisoned by cross-panel correlation when panels sit at offset
-            # heights (measured: two panels 27px apart → global y "pitch" 27),
-            # and validate_grid enforces near-square cells anyway.
+            # "detects" some other periodicity and gets rejected here.  x is
+            # compared against the frame x pitch; y against THIS span's own
+            # pitch_y (computed from the span-local h_local above, not a
+            # full-frame y reference which is poisoned by cross-panel
+            # correlation when panels sit at offset heights — measured: two
+            # panels 27px apart → global y "pitch" 27).  Per-axis references
+            # also admit genuinely stretched grids where pitch_x != pitch_y.
             if (abs(g['cell_w'] - pitch_x) / pitch_x > 0.06
-                    or abs(g['cell_h'] - pitch_x) / pitch_x > 0.10):
+                    or abs(g['cell_h'] - pitch_y) / pitch_y > 0.10):
                 continue
             if (x1 - x0) < 2 * g['cell_w'] or (y1 - y0) < 2 * g['cell_h']:
                 continue
@@ -2670,6 +3014,22 @@ def detect_panels(img_bgr):
     panels = [p for p in panels
               if p['x1'] - p['x0'] >= 2 * p['cell_w']
               and p['y1'] - p['y0'] >= 2 * p['cell_h']]
+
+    # One frame renders at one UI scale → one pitch.  Per-panel sub-detections
+    # can round to neighbouring integer slot sizes (e.g. 63 vs 64), which would
+    # make the shared pitch-matched DB's templates the wrong length for a panel
+    # whose slot rounds differently and crash the masked-NCC matmul.  Snap only
+    # the SLOT-rounding outliers to the dominant slot (leaving each panel's own
+    # sub-pixel pitch otherwise intact so NCC sampling is unperturbed).
+    if len(panels) > 1:
+        from collections import Counter
+        slots = [(int(round(p['cell_w'])), int(round(p['cell_h']))) for p in panels]
+        dom = Counter(slots).most_common(1)[0][0]
+        for p, s in zip(panels, slots):
+            if s != dom:
+                p['cell_w'] = p['cell_w'] * dom[0] / s[0]
+                p['cell_h'] = p['cell_h'] * dom[1] / s[1]
+
     panels.sort(key=lambda p: (p['y0'], p['x0']))
     return panels
 
@@ -2803,6 +3163,7 @@ def run_keep_scan(from_calibration=False):
               f"origin=({grid['origin_x']:.1f},{grid['origin_y']:.1f})")
 
         detections    = []
+        grid_failed   = False
         found_entries = {}   # entry_id -> entry, for the confirm-to-check bar
 
         prices    = get_prices()
@@ -2828,6 +3189,10 @@ def run_keep_scan(from_calibration=False):
             all_dets = scan_all_panels(img_bgr, panels, matcher_db,
                                        label_matcher=label_matcher,
                                        progress_cb=_cb)
+            all_dets, grid, grid_src, grid_failed = _arbitrate_scan(
+                img_bgr, panels, all_dets, grid, grid_src, settings,
+                matcher_db, label_matcher, warnings, _persist_grid,
+                progress_cb=_cb)
             if settings.get('debug_dumps', True):
                 _save_debug_bundle(img_bgr, panels, all_dets, 'keep')
             for d in all_dets:
@@ -2864,6 +3229,7 @@ def run_keep_scan(from_calibration=False):
         img.save(buf, format='PNG')
         encoded = base64.b64encode(buf.getvalue()).decode()
         return {'image': encoded, 'detections': detections, 'grid': grid, 'grid_src': grid_src,
+                'grid_failed': grid_failed,
                 'warnings': warnings, 'checklist_matches': checklist_matches}
     finally:
         _scan_state.update({'running': False, 'phase': None, 'ts': time.time()})
@@ -2881,8 +3247,8 @@ def do_scan():
         print(f"[hotkey scan] ERROR:\n{traceback.format_exc()}")
         with _scan_lock:
             _last_scan.update({'image': None, 'detections': [], 'warnings': [],
-                               'checklist_matches': [], 'error': str(e),
-                               'ts': time.time()})
+                               'checklist_matches': [], 'grid_failed': False,
+                               'error': str(e), 'ts': time.time()})
 
 
 # ---------------------------------------------------------------------------
@@ -3013,6 +3379,7 @@ def take_screenshot():
         tb = traceback.format_exc()
         print(f"[screenshot] ERROR:\n{tb}")
         return jsonify({'error': str(e), 'image': None, 'detections': [],
+                        'grid_failed': False,
                         'warnings': [], 'checklist_matches': []})
 
 @app.route('/api/keep-list', methods=['GET'])
@@ -3501,7 +3868,7 @@ def _sell_scan_inner(from_calibration=False):
     icon_db = get_icon_db()
     if not icon_db:
         return jsonify({
-            'image': None, 'results': [], 'grid': None,
+            'image': None, 'results': [], 'grid': None, 'grid_failed': False,
             'error': 'Icon index not built yet. Click "Build Icon DB" first.',
         })
 
@@ -3516,7 +3883,7 @@ def _sell_scan_inner(from_calibration=False):
                                             require_region=True, warnings=warnings)
         except ScanError as e:
             return jsonify({'image': None, 'results': [], 'grid': None,
-                            'error': str(e)})
+                            'grid_failed': False, 'error': str(e)})
 
         # --- Grid detection (any pitch, per-panel origins, persisted) --------
         _scan_state['phase'] = 'grid'
@@ -3549,6 +3916,9 @@ def _sell_scan_inner(from_calibration=False):
         raw_detections = scan_all_panels(img_bgr, panels, matcher_db,
                                          label_matcher=label_matcher,
                                          progress_cb=_cb)
+        raw_detections, grid, grid_src, grid_failed = _arbitrate_scan(
+            img_bgr, panels, raw_detections, grid, grid_src, settings,
+            matcher_db, label_matcher, warnings, _persist_grid, progress_cb=_cb)
         print(f"[sell_scan] matches: {len(raw_detections)}")
         if settings.get('debug_dumps', True):
             _save_debug_bundle(img_bgr, panels, raw_detections, 'sell')
@@ -3633,10 +4003,11 @@ def _sell_scan_inner(from_calibration=False):
         img.save(buf, format='PNG')
         encoded = base64.b64encode(buf.getvalue()).decode()
         return jsonify({
-            'image':    encoded,
-            'results':  results,
-            'grid':     grid,
-            'warnings': warnings,
+            'image':       encoded,
+            'results':     results,
+            'grid':        grid,
+            'grid_failed': grid_failed,
+            'warnings':    warnings,
         })
     finally:
         _scan_state.update({'running': False, 'phase': None, 'ts': time.time()})

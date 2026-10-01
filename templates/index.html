@@ -798,6 +798,7 @@ function stopScanProgress() {
 }
 
 function showScanWarnings(res) {
+  if (res.grid_failed) return;   // grid failure raises its own persistent toast
   if (res.warnings && res.warnings.length) {
     toast('⚠ ' + res.warnings[0], 4000);
   }
@@ -1094,6 +1095,19 @@ function applyScanResult(res) {
   document.getElementById('stash-image-wrap').style.display = 'inline-block';
   const img = document.getElementById('stash-image');
   img.src = 'data:image/png;base64,' + res.image;
+  if (res.grid_failed) {
+    // The captured (un-annotated) frame is still shown so the user can see
+    // what was grabbed — but no detections are trustworthy, so surface the
+    // failure instead of a misleading "Found 0 items".
+    const msg = (res.warnings && res.warnings[0])
+      || 'Stash grid not detected — check the capture region covers the stash, or recalibrate.';
+    document.getElementById('ocr-status').textContent = msg;
+    toast('⚠ ' + msg, 8000);
+    renderDetectionsBar([]);
+    showConfirmBar([]);
+    if (res.ts) lastScanTs = res.ts;
+    return;
+  }
   const acquired = res.detections.filter(d => d.acquired).length;
   const needed = res.detections.filter(d => !d.acquired).length;
   document.getElementById('ocr-status').textContent =
@@ -1114,7 +1128,7 @@ async function pollHotkey() {
       } else {
         applyScanResult(res);
         showScanWarnings(res);
-        toast('✓ Hotkey scan complete');
+        if (!res.grid_failed) toast('✓ Hotkey scan complete');
       }
     }
   } catch (_) {}

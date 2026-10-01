@@ -951,6 +951,18 @@ function applyScan(res) {
   document.getElementById('stash-image-wrap').style.display = 'inline-block';
   const img = document.getElementById('stash-image');
   img.src = 'data:image/png;base64,' + res.image;
+  if (res.grid_failed) {
+    // Captured frame is shown un-annotated; no result is trustworthy, so
+    // surface the failure rather than "0 items found".
+    const msg = (res.warnings && res.warnings[0])
+      || 'Stash grid not detected — check the capture region covers the stash, or recalibrate.';
+    lastGrid = null;
+    allResults = [];
+    renderResults(allResults);
+    document.getElementById('scan-status').textContent = msg;
+    toast('⚠ ' + msg, 8000);
+    return;
+  }
   lastGrid = res.grid || null;
   allResults = res.results || [];
   renderResults(allResults);
@@ -994,7 +1006,7 @@ async function runScan() {
     const res = await api('POST', '/api/sell-scan');
     stopScanProgress();
     applyScan(res);
-    if (res.warnings && res.warnings.length) toast('⚠ ' + res.warnings[0], 4000);
+    if (!res.grid_failed && res.warnings && res.warnings.length) toast('⚠ ' + res.warnings[0], 4000);
   } catch(e) {
     stopScanProgress();
     document.getElementById('scan-status').textContent = 'Error: ' + e.message;
