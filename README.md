@@ -31,13 +31,29 @@ tool; check the source in this repo if you want to verify that yourself.
 
 ## Running from source
 
-Requires Python 3.11+.
+Requires Python 3.11+ (developed and tested on 3.12).
 
 ```
 pip install -r requirements.txt
 winget install UB-Mannheim.TesseractOCR
 python app.py
 ```
+
+Optional, for the best accuracy (DINOv2 re-rank, +~1 point) and a GPU-resident stage 1 (about
+2x faster): `pip install -r requirements-dino.txt`, then for an NVIDIA GPU replace the CPU torch
+with a CUDA build, e.g. `pip install torch --index-url https://download.pytorch.org/whl/cu128`.
+The model (`facebook/dinov2-small`, ~88 MB) downloads once into the Hugging Face cache on first
+use. Without a GPU leave it out: DINO on a CPU takes about 20 s per scan.
+
+## Packaging
+
+`build.bat` (or `pyinstaller TarkovStashHelper.spec`, which is what CI runs) produces the single
+file `dist\TarkovStashHelper.exe` in an isolated venv. The release exe is the **lean** flavour:
+no torch/transformers, so stage 1 runs on the CPU and DINO is off (the engine degrades by itself;
+measured on 12 labelled screenshots: end-to-end 96.3% vs 97.1%, sell decision 97.0% vs 98.0%),
+and it is ~74 MB. `TarkovStashHelper.exe --selftest [report.json]` checks a built exe without
+opening the window (bundled templates and `identify/assets`, data dir, engine imports). `data/`
+always lives next to the exe, so settings and the item database survive updates.
 
 ## How it works
 
