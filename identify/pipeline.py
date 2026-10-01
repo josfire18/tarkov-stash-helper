@@ -57,6 +57,10 @@ RES_PLAUSIBLE = 8.5        # mean level error above which a visual match needs t
 OCR_AUTH = 90.0            # fuzzy score at/above which a label is considered a real read
 LABEL_PARTIAL_CAP = 94.0   # best score a non-exact label match can get (exact = 100)
 LABEL_RIVAL_GAP = 5.0      # a label this much better than the chosen item's gets a say
+LITERAL_RES = 3.0          # a stage-1 residual this low with LITERAL_DINO is a near pixel-exact match
+LITERAL_DINO = 0.9
+TIE_MARGIN = 0.1           # fused-score gap below which two differently named items are indistinguishable
+TIE_CONF_CAP = 0.5         # ...and the answer is a coin flip, so it may not be reported as certain
 LEARN_MAX_RES = 4.0        # stage-1 residual of a near-literal match to a cached icon
 NAMED_DINO_SLACK = 0.03    # a named candidate this close in DINO to a nameless winner may name it
 LEARN_DISTINCT = 2.0       # learn only if every different look-alike is at least this x worse
@@ -108,6 +112,20 @@ class ScanResult:
     items: list = field(default_factory=list)       # every segmented footprint (incl. empty)
     timings: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
+
+
+def literal_beats_label(residual: float, dino: float | None, label_score: float) -> bool:
+    """True when a tile is a near pixel-exact, DINO-confirmed match to a template and the only
+    contrary evidence is a partial label read: a letter or two misread ("Egg" -> "Mass") must not
+    overrule the picture.  An exact (100) read still can, since look-alike rounds sit within a
+    hair of each other in pixels."""
+    return (label_score < 100.0 and residual <= LITERAL_RES
+            and dino is not None and dino >= LITERAL_DINO)
+
+
+def is_tie(gap: float | None) -> bool:
+    """Two differently named best candidates whose fused scores are equal within noise."""
+    return gap is not None and gap < TIE_MARGIN
 
 
 def _sigmoid(x: float) -> float:
@@ -341,6 +359,7 @@ class Engine:
                 if v is not None:
                     sims[(c.row, c.rot)] = float(qe[qi] @ v)
             work[i]['sims'] = sims
+            work[i]['qe'] = qe[qi]
 
     # ------------------------------------------------------------------
     BUILD_SIM, BUILD_MARGIN = 0.90, 0.08
@@ -494,13 +513,16 @@ class Engine:
                 or best_res > 9.0:
             auth = self._label_authority(w.get('ocr_all') or [], tile,
                                          prefer_weapon=str(cat.cats[c.row]) in ('weapon', 'build'),
-                                         res_by_row=_best_res_by_id(cat, cands), at_edge=edge)
+                                         res_by_row=_best_res_by_id(cat, cands), at_edge=edge,
+                                         twin_rank=self._twin_ranker(w))
         elif text and (o is None or o < 60 or o < self._best_label(w, tile) - LABEL_RIVAL_GAP):
             # label conflict: the picture says one thing, a clean unambiguous printed name
             # says another (e.g. a 2x1 suppressor whose label names a 1x1 flash hider)
             auth = self._label_authority(w.get('ocr_all') or [], tile, prefer_weapon=False,
-                                         res_by_row=_best_res_by_id(cat, cands), at_edge=edge)
-            if auth is not None and str(cat.ids[auth[0]]) == str(cat.ids[c.row]):
+                                         res_by_row=_best_res_by_id(cat, cands), at_edge=edge,
+                                         twin_rank=self._twin_ranker(w))
+            if auth is not None and (str(cat.ids[auth[0]]) == str(cat.ids[c.row])
+                                     or literal_beats_label(c.score, s_dino, auth[1])):
                 auth = None
         item_id = str(cat.ids[c.row])
         name = str(cat.names[c.row])
@@ -550,6 +572,10 @@ class Engine:
                 margin = chosen_S - S2
                 break
         evidence['margin'] = round(margin, 3)
+        tie_gap = None
+        if auth is None and item_id and not twins > 1:
+            tie_gap = min((chosen_S - S2 for S2, c2, _, _ in scored[1:] if str(cat.names[c2.row]) != name),
+                          default=None)
         alts, seen = [], {item_id}
         for S2, c2, d2, o2 in scored[1:]:
             iid2 = str(cat.ids[c2.row])
@@ -573,6 +599,9 @@ class Engine:
         if twins > 1:
             z -= 1.5 * math.log(twins)
         conf = _sigmoid(z)
+        if is_tie(tie_gap):
+            conf = min(conf, TIE_CONF_CAP)
+            evidence['note'] = 'indistinguishable look-alike (same picture, same label read)'
         # absolute plausibility: a large residual is only acceptable when the printed name
         # vouches for the item.  Without it the tile is something the catalog does not
         # contain (new item, modded build, unknown icon) - flag it instead of guessing.
@@ -620,8 +649,32 @@ class Engine:
                         break
         return self._api
 
+    def _twin_ranker(self, w):
+        """Picture score of label twins: ``-W_RES * residual + W_DINO * cosine`` of each twin's
+        best template, the same fusion that ranks the pool.  Twins share a short name (BP, BS
+        ...) and, for ammo of one box size, often a near-identical silhouette; the residual
+        alone is brightness-sensitive and ranks the wrong calibre's pack first on a dim
+        capture, DINO sees the pack's art.  Returns ``f(rows) -> {row: score}`` (rows without a
+        visual candidate are absent; DINO is left out unless every twin has an embedding)."""
+        cat, cands = self.cat, w['cands']
+        qe = w.get('qe')
+
+        def rank(rows):
+            best = {}
+            for c in cands:
+                iid = str(cat.ids[c.row])
+                if iid and iid not in best:
+                    best[iid] = c
+            have = {r: best[str(cat.ids[r])] for r in rows if str(cat.ids[r]) in best}
+            out = {r: -W_RES * c.score for r, c in have.items()}
+            if qe is None or self.store is None or w['tile'].clip or not have                     or any(c.rot != 0 for c in have.values()) or len(have) < len(rows):
+                return out
+            emb = self.store.get([c.row for c in have.values()])
+            return {r: out[r] + W_DINO * float(qe @ e) for r, e in zip(have, emb)}
+        return rank
+
     def _label_authority(self, texts: list, tile: Tile, prefer_weapon: bool, res_by_row: dict | None = None,
-                         at_edge: bool = False):
+                         at_edge: bool = False, twin_rank=None):
         """Identity from the printed short name over *all* base items (any footprint no
         larger than the tile: a modded item draws bigger than its base; a viewport-clipped
         tile may hide up to 3 rows).  Needs a confident read (>= ``OCR_AUTH``) that beats
@@ -649,8 +702,11 @@ class Engine:
             if not sc:
                 continue
             sc.sort(key=lambda t: -t[0])
-            if sc[0][0] >= OCR_AUTH and (best is None or sc[0][0] > best[0][0][0]):
-                best = (sc, txt)
+            # between equally good reads (one variant says M82, another M80) the one that names
+            # an item fitting the tile wins: a bigger item is only possible at the viewport edge
+            key_ = (sc[0][0], sc[0] in fits)
+            if sc[0][0] >= OCR_AUTH and (best is None or key_ > best[2]):
+                best = (sc, txt, key_)
         if best is None:
             return None
         sc = best[0]
@@ -661,12 +717,21 @@ class Engine:
         twins = [r for s_, r in sc if s_ >= top - 0.01]
         area = tile.W * tile.H
 
-        def key(r):
+        def coarse(r):
             weap = str(cat.cats[r]) == 'weapon'
-            # equal-label twins (a loose round and its ammo pack share one short name): the
-            # picture decides - the twin whose icon is closest to the tile wins
-            rr = round(res_by_row.get(r, 99.0), 1) if res_by_row else 0.0
-            return (0 if (prefer_weapon and weap) else 1, abs(int(cat.tw[r]) * int(cat.th[r]) - area), rr, r)
+            return (0 if (prefer_weapon and weap) else 1, abs(int(cat.tw[r]) * int(cat.th[r]) - area))
+        # equal-label twins (a loose round and its ammo pack share one short name): among those
+        # that fit the tile equally well the picture decides
+        c0 = min(coarse(r) for r in twins)
+        finalists = [r for r in twins if coarse(r) == c0]
+        vis = twin_rank(finalists) if (twin_rank and len(finalists) > 1) else {}
+
+        def key(r):
+            if vis:
+                rr = -round(vis.get(r, -99.0), 1)
+            else:
+                rr = round(res_by_row.get(r, 99.0), 1) if res_by_row else 0.0
+            return coarse(r) + (rr, r)
         twins.sort(key=key)
         return twins[0], float(top), len(twins)
 
