@@ -4318,6 +4318,9 @@ def _run_app():
 
 
 if __name__ == '__main__':
+    if '--selftest' in sys.argv:    # packaged-build smoke test: no window/tray/hotkey (selftest.py)
+        import selftest
+        sys.exit(selftest.main(sys.modules[__name__], sys.argv[sys.argv.index('--selftest') + 1:]))
     # Packaged windowed builds (PyInstaller --windowed) have no console and
     # sys.stdout is None, so print() would raise — route output to a log file.
     if FROZEN and sys.stdout is None:
