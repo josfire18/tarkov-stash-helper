@@ -255,6 +255,12 @@
   .trader-name     { color: #c4a040; }
   .reason          { font-size: 10px; color: #4a4a4a; margin-top: 2px; }
   .fir-warn        { color: #e8a33d; font-weight: 600; }
+  .list-at         { color: #7acc40; font-size: 15px; font-weight: 700; }
+  .gain            { color: #7acc40; font-size: 10px; }
+  .rec-queue { background: #1a2418; border: 1px dashed #4a6a3a; color: #8aa07a; }
+  .item-num.queue  { background: #4a6a4a; }
+  .sec-total       { float: right; font-weight: 600; letter-spacing: 0; text-transform: none; }
+  .grand-total     { color: #e0d8c8; font-weight: 700; }
 
   /* ── Summary bar ── */
   .summary-bar {
@@ -785,22 +791,31 @@ function buildResultRow(r) {
   row.className = 'result-row';
 
   let badgeClass, badgeText, priceLine;
+  const stackNote = r.keep_n ? ` <span class="fir-warn">keep ${r.keep_n} of this stack</span>` : '';
+  const currency = r.trader_currency && r.trader_currency !== 'RUB' ? ` (paid in ${r.trader_currency})` : '';
   if (r.recommend === 'keep') {
     badgeClass = 'rec-keep'; badgeText = 'KEEP';
-    priceLine  = `<span style="color:#3a9ab4">${r.reason || 'On keep list'} — do not sell</span>`;
+    priceLine  = `<span style="color:#3a9ab4">${r.reason || 'On keep list'}</span>`;
   } else if (r.recommend === 'flea') {
-    badgeClass = 'rec-flea'; badgeText = 'FLEA';
+    badgeClass = r.flea_queue ? 'rec-queue' : 'rec-flea';
+    badgeText  = r.flea_queue ? 'QUEUE' : 'FLEA';
     priceLine  = `
-      List at <span class="price-highlight">${fmt(r.flea_list)}</span>
-      <span class="price-fee">(net ~${fmt(r.flea_net)} after fees)</span>
-      &nbsp;·&nbsp; Trader: ${fmt(r.trader_price)} via <span class="trader-name">${r.trader_name || '—'}</span>`;
+      List at <span class="list-at">${fmt(r.flea_list)}</span>
+      <span class="price-fee">net ${fmt(r.flea_net)} after ${fmt(r.flea_fee)} fee</span>
+      ${r.gain != null && r.trader_price ? `<span class="gain">${r.gain >= 0 ? '+' : ''}${fmt(r.gain)} vs trader</span>` : ''}
+      <span>Trader: ${fmt(r.trader_price)} via <span class="trader-name">${r.trader_name || '—'}</span></span>`;
   } else {
     badgeClass = 'rec-trader'; badgeText = 'TRADER';
     priceLine  = `
       Sell to <span class="trader-name">${r.trader_name || '—'}</span>
-      for <span class="price-highlight">${fmt(r.trader_price)}</span>
+      for <span class="price-highlight">${fmt(r.trader_price)}</span>${currency}
       ${r.flea_list ? `&nbsp;·&nbsp; Flea: ${fmt(r.flea_list)}` : ''}`;
   }
+  const queueNote = r.flea_queue
+    ? `<span class="fir-warn">flea queue - list when one of your ${r.flea_slots} offers frees up</span>` : '';
+  const fleaNote = r.recommend === 'flea' && r.fir === null
+    ? `<span class="fir-warn">⚠ FiR unclear - check the ✓ before listing</span>` : '';
+  const priceNote = r.price_note ? `<span class="fir-warn">${r.price_note}</span>` : '';
 
   // A KEEP row should never carry non_fir_note any more (the backend falls
   // it through to a normal sell rec instead) — this only ever fires on a
@@ -809,7 +824,7 @@ function buildResultRow(r) {
     ? `<span class="fir-warn">⚠ not FIR — can't be handed in</span>`
     : '';
 
-  const numClass = r.recommend === 'keep' ? 'keep' : r.recommend;
+  const numClass = r.recommend === 'keep' ? 'keep' : (r.flea_queue ? 'queue' : r.recommend);
   const qty = r.count > 1
     ? ` <span class="qty">×${r.count}</span>${r.total ? ` <span class="price-fee">= ${fmt(r.total)}</span>` : ''}`
     : '';
@@ -823,7 +838,7 @@ function buildResultRow(r) {
     <div class="rec-badge ${badgeClass}">${badgeText}</div>
     <div></div>
     <div class="price-line" style="grid-column:2/4">${priceLine}</div>
-    <div class="reason">${firHint} ${r.reason || ''}</div>`;
+    <div class="reason">${firHint} ${queueNote} ${fleaNote} ${priceNote} ${stackNote} ${r.recommend === 'keep' ? '' : (r.reason || '')}</div>`;
 
   // Tint the item-num chip and rec-badge with the trader's accent colour so
   // the panel visually batches by trader the same way the annotated
@@ -874,9 +889,11 @@ function renderResults(results) {
     return;
   }
 
-  // Bucket into per-trader groups, a flea group, and a keep group.
+  // Bucket into per-trader groups, a flea group (offers that fit the player's
+  // slots), the flea queue (beyond the slots), and a keep group.
   const traderGroups = new Map();   // trader name -> items[]
   const fleaItems = [];
+  const queueItems = [];
   const keepItems = [];
   for (const r of filtered) {
     if (r.recommend === 'trader') {
@@ -884,56 +901,66 @@ function renderResults(results) {
       if (!traderGroups.has(key)) traderGroups.set(key, []);
       traderGroups.get(key).push(r);
     } else if (r.recommend === 'flea') {
-      fleaItems.push(r);
+      (r.flea_queue ? queueItems : fleaItems).push(r);
     } else {
       keepItems.push(r);
     }
   }
 
   // The server already ordered results for selling (traders in in-game tab
-  // order, then flea by total profit) and numbered the image badges to match,
-  // so keep that order here - re-sorting would desync list and badges.
+  // order, then flea offers by margin, then the queue) and numbered the image
+  // badges to match, so keep that order here - re-sorting would desync list and badges.
+  const sum = items => items.reduce((t, r) => t + (r.total || 0), 0);
   const traderSections = [...traderGroups.entries()].map(([name, items]) => ({
-    name, items, total: items.reduce((s, r) => s + (r.total || r.trader_price || 0), 0),
+    name, items, total: sum(items),
   }));
 
   scroll.innerHTML = '';
+  const addHeader = (html, color) => {
+    const hdr = document.createElement('div');
+    hdr.className = 'section-header';
+    if (color) hdr.style.color = color;
+    hdr.innerHTML = html;
+    scroll.appendChild(hdr);
+  };
 
   for (const sec of traderSections) {
     const color = TRADER_COLORS[sec.name] || DEFAULT_TRADER_COLOR;
-    const hdr = document.createElement('div');
-    hdr.className = 'section-header';
-    hdr.style.color = color;
-    hdr.textContent = `SELL TO ${sec.name.toUpperCase()}`;
-    scroll.appendChild(hdr);
+    addHeader(`SELL TO ${sec.name.toUpperCase()} · ${sec.items.length} item${sec.items.length === 1 ? '' : 's'}`
+      + `<span class="sec-total">${fmt(sec.total)}</span>`, color);
     for (const r of sec.items) scroll.appendChild(buildResultRow(r));
   }
 
   if (fleaItems.length) {
-    const hdr = document.createElement('div');
-    hdr.className = 'section-header';
-    hdr.textContent = 'SELL ON FLEA';
-    scroll.appendChild(hdr);
+    const slots = fleaItems[0].flea_slots;
+    addHeader(`LIST ON FLEA · ${fleaItems.length}${slots != null ? ' of ' + slots : ''} offers`
+      + `<span class="sec-total">${fmt(sum(fleaItems))} net</span>`);
     for (const r of fleaItems) scroll.appendChild(buildResultRow(r));
   }
 
+  if (queueItems.length) {
+    addHeader(`FLEA QUEUE · list when a slot frees · ${queueItems.length}`
+      + `<span class="sec-total">${fmt(sum(queueItems))} net</span>`, '#8aa07a');
+    for (const r of queueItems) scroll.appendChild(buildResultRow(r));
+  }
+
   if (keepItems.length) {
-    const hdr = document.createElement('div');
-    hdr.className = 'section-header';
-    hdr.textContent = 'KEEP';
-    scroll.appendChild(hdr);
+    addHeader(`KEEP · ${keepItems.reduce((t, r) => t + (r.count || 1), 0)} items`, '#4ad4f0');
     for (const r of keepItems) scroll.appendChild(buildResultRow(r));
   }
 
-  const traderCount = filtered.length - fleaItems.length - keepItems.length;
+  const sellRows = filtered.length - keepItems.length;
   document.getElementById('result-count').textContent = `${filtered.length} items`;
   const summary = document.getElementById('summary-bar');
-  const bits = traderSections.map(s =>
-    `<span style="color:${TRADER_COLORS[s.name] || DEFAULT_TRADER_COLOR}">&#x25CF; ${s.name} &times;${s.items.length}</span>`);
-  if (fleaItems.length) bits.push(`<span class="s-flea">&#x25CF; ${fleaItems.length} flea</span>`);
+  const traderTotal = traderSections.reduce((t, s) => t + s.total, 0);
+  const fleaTotal = sum(fleaItems);
+  const bits = [`<span class="grand-total">Sell now ${fmt(traderTotal + fleaTotal)}</span>`,
+                `<span class="s-trader">traders ${fmt(traderTotal)}</span>`];
+  if (fleaItems.length) bits.push(`<span class="s-flea">${fleaItems.length} flea offers ${fmt(fleaTotal)}</span>`);
+  if (queueItems.length) bits.push(`<span style="color:#8aa07a">queue ${fmt(sum(queueItems))}</span>`);
   if (keepItems.length) bits.push(`<span style="color:#666">&#x25CF; ${keepItems.length} keep</span>`);
-  bits.push(`<span style="color:#444">|</span>`);
-  bits.push(`<span>${fleaItems.length + traderCount} sellable</span>`);
+  bits.push(`<span>${sellRows} sellable</span>`);
+  summary.style.flexWrap = 'wrap';
   summary.innerHTML = bits.join('');
 }
 
