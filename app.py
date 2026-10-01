@@ -22,6 +22,12 @@ from pynput import keyboard
 import cv2
 import numpy as np
 
+import sellcalc
+# The sell-advice economics live in sellcalc.py (pure functions); the historical
+# names stay importable from here (test_scan.py scores sell decisions via app.*).
+from sellcalc import (best_trader_price, calc_flea_fee, price_420, flea_block_reason,
+                      sell_recommendation, order_for_selling, TRADER_ORDER)
+
 APP_VERSION = '0.3.1'
 
 FROZEN = getattr(sys, 'frozen', False)
@@ -68,7 +74,7 @@ PRICE_CACHE_TTL      = 1800  # seconds (30 min)
 KAPPA_WIKI_TTL       = 86400 # seconds (24 h) — Collector list changes rarely
 PRESTIGE_WIKI_TTL    = 7 * 86400 # seconds (7 d) — Prestige requirements change only per major patch
 TASKS_CACHE_TTL      = 86400 # seconds (24 h) — task/hideout requirements change per patch
-FLEA_MIN_PROFIT      = 10000 # recommend flea only if net > trader by this much
+FLEA_MIN_PROFIT      = sellcalc.FLEA_MIN_GAIN  # recommend flea only if net > trader by this much (setting: flea_min_gain)
 TARKOV_API           = 'https://api.tarkov.dev/graphql'
 # Self-update: owner/repo are baked in here and NEVER taken from the client —
 # the download URL that ends up in _update_state always traces back to this
@@ -147,29 +153,7 @@ TRADER_COLORS_RGB = {
 }
 DEFAULT_TRADER_BADGE_RGB = (180, 120, 20)  # fallback — the old uniform trader-gold
 FLEA_RGB = (30, 150, 30)
-
-# The order of the trader tabs in game, so the sell list walks the traders
-# left to right and each trader is visited once.
-TRADER_ORDER = ['Prapor', 'Therapist', 'Fence', 'Skier', 'Peacekeeper',
-                'Mechanic', 'Ragman', 'Jaeger', 'Ref']
-
-
-def order_for_selling(entries):
-    """Sort sell entries into the order the player should sell them.
-
-    Trader sales first, grouped by trader in TRADER_ORDER and, within a
-    trader, by stack value (highest first); then flea sales by total net
-    profit, highest first.  Ties keep their stash reading order.
-    """
-    def trader_rank(name):
-        return TRADER_ORDER.index(name) if name in TRADER_ORDER else len(TRADER_ORDER)
-
-    traders = [e for e in entries if e['recommend'] == 'trader']
-    flea    = [e for e in entries if e['recommend'] == 'flea']
-    traders.sort(key=lambda e: (trader_rank(e['trader_name']), e['trader_name'] or '',
-                                -(e.get('total') or 0)))
-    flea.sort(key=lambda e: -(e.get('total') or 0))
-    return traders + flea
+FLEA_QUEUE_RGB = (95, 125, 95)   # flea picks beyond the offer slots: same family, visibly dimmer
 
 # The scanner only cares about items / parts / components — NOT ammo, full
 # weapons, weapon presets, or storage containers.  Templates for these tarkov.dev
@@ -185,10 +169,22 @@ def is_target_item(item):
 
 PRICE_QUERY = '''{
   items {
-    id name shortName basePrice avg24hPrice low24hPrice iconLink width height
+    id name shortName basePrice avg24hPrice low24hPrice lastLowPrice iconLink width height
     backgroundColor gridImageLink baseImageLink types
-    sellFor { vendor { name } priceRUB }
+    sellFor { vendor { name } priceRUB price currency }
   }
+}'''
+
+# The flea market's live rules and what each trader pays, from the game's own
+# globals via tarkov.dev (schema checked 2026-10-01).  A separate, best-effort
+# query: if it fails the item prices still refresh and sellcalc's documented
+# constants apply.  Rates are fractions (0.05 = 5 %).
+RULES_QUERY = '''{
+  fleaMarket {
+    minPlayerLevel enabled sellOfferFeeRate sellRequirementFeeRate foundInRaidRequired
+    reputationLevels { offers offersSpecialEditions minRep maxRep }
+  }
+  traders { name currency { shortName } levels { level payRate } }
 }'''
 
 TASKS_QUERY = '''{
@@ -315,8 +311,43 @@ def fetch_prices():
                          for e in body.get('errors') or []) or 'no items'
         raise PriceFetchError(f'tarkov.dev HTTP {r.status_code}: {errs}')
     cache = {'timestamp': time.time(), 'items': items}
+    previous = load_json(PRICES_PATH, lambda: None) if os.path.exists(PRICES_PATH) else None
+    rules = fetch_sell_rules() or (previous or {}).get('rules')
+    if rules:
+        cache['rules'] = rules
     save_json(PRICES_PATH, cache)
     return cache
+
+
+def parse_sell_rules(data):
+    """The RULES_QUERY response's ``data`` as the compact blob sellcalc reads:
+    {'flea': {...fleaMarket...}, 'traders': {name: {'currency', 'pay_rates': {level: rate}}}}.
+    None when there is nothing usable."""
+    data = data or {}
+    flea = data.get('fleaMarket') or None
+    traders = {}
+    for t in data.get('traders') or []:
+        name = t.get('name')
+        rates = {lv['level']: lv['payRate'] for lv in t.get('levels') or []
+                 if lv.get('level') and lv.get('payRate')}
+        if name and rates:
+            traders[name] = {'currency': (t.get('currency') or {}).get('shortName'),
+                             'pay_rates': rates}
+    if not flea and not traders:
+        return None
+    return {'flea': flea, 'traders': traders}
+
+
+def fetch_sell_rules():
+    """Best-effort fetch of the flea fee rates / FiR rule / trader pay rates.
+    Never raises: an outage or a schema change leaves the documented constants
+    in force (sellcalc)."""
+    try:
+        r = http_requests.post(TARKOV_API, json={'query': RULES_QUERY}, timeout=20)
+        return parse_sell_rules((r.json() or {}).get('data'))
+    except Exception as e:
+        print(f'[prices] sell rules unavailable, using built-in constants: {e}')
+        return None
 
 def get_prices():
     """Return cached prices, refreshing if stale.
@@ -1992,34 +2023,6 @@ def prefetch_keep_list_icons(keep_list, price_index, scale=2.0):
     return downloaded
 
 
-def best_trader_price(item_data):
-    """Return (trader_name, priceRUB) for the highest trader sell offer."""
-    best = (None, 0)
-    for sf in item_data.get('sellFor', []):
-        vendor = sf.get('vendor', {}).get('name', '')
-        if vendor.lower() == 'flea market':
-            continue
-        p = sf.get('priceRUB', 0) or 0
-        if p > best[1]:
-            best = (vendor, p)
-    return best
-
-def calc_flea_fee(base_price, listing_price):
-    """Tarkov flea market listing fee formula."""
-    if not base_price or not listing_price:
-        return 0
-    q0, q = base_price, listing_price
-    fee = q0 * 0.03 * (4 ** math.log10(q0 / q)) + q * 0.03 * (4 ** math.log10(q / q0))
-    return round(fee)
-
-def price_420(target):
-    """Floor target to nearest price ending in 420. Falls back to target-1."""
-    if target <= 420:
-        return max(1, target - 1)
-    rem = target % 1000
-    p = (target - rem + 420) if rem >= 420 else (target - rem - 580)
-    return p if p >= 420 else max(1, target - 1)
-
 def is_unpriced_weapon(item_data, category=None):
     """True for a gun the sell list should skip.
 
@@ -2035,65 +2038,19 @@ def is_unpriced_weapon(item_data, category=None):
     return item_data is None and category == 'weapon'
 
 
-def flea_block_reason(item_data, fir, settings):
-    """Why this copy can't be listed on the flea, or None if it can.
-
-    noFlea items are banned outright.  When the flea requires Found-in-Raid
-    (the normal rule; Battlestate has lifted it for events, hence the setting),
-    a copy confidently read as non-FiR can't be listed.  An indeterminate FiR
-    read (None) is not treated as a block - the badge tells the player to check.
-    """
-    if 'noFlea' in (item_data.get('types') or ()):
-        return 'banned from flea'
-    if settings.get('flea_requires_fir', True) and fir is False:
-        return 'not FiR, cannot list on flea'
-    return None
-
-
-def sell_recommendation(item_data, flea_blocked=None):
-    """
-    Returns dict with trader, flea, and recommendation for ONE unit.
-    Flea is recommended only if it is allowed for this copy and its
-    net-after-fee beats the best trader by FLEA_MIN_PROFIT (or no trader buys it).
-    """
-    trader_name, trader_price = best_trader_price(item_data)
-    base_price   = item_data.get('basePrice') or 0
-    low24h       = item_data.get('low24hPrice') or 0
-    avg24h       = item_data.get('avg24hPrice') or 0
-    flea_ref     = low24h or avg24h  # prefer lowest current listing
-
-    rec = {
-        'trader_name':  trader_name,
-        'trader_price': trader_price,
-        'flea_list':    None,
-        'flea_net':     None,
-        'recommend':    'trader',
-        'reason':       '',
-    }
-
-    if flea_blocked:
-        rec['reason'] = flea_blocked.capitalize()
-        return rec
-    if not flea_ref:
-        rec['reason'] = 'No flea data'
-        return rec
-
-    flea_list = price_420(flea_ref)
-    flea_fee  = calc_flea_fee(base_price, flea_list)
-    flea_net  = flea_list - flea_fee
-    rec['flea_list'] = flea_list
-    rec['flea_net']  = flea_net
-
-    if not trader_price and flea_net > 0:
-        rec['recommend'] = 'flea'
-        rec['reason']    = 'No trader buys this'
-    elif flea_net - trader_price >= FLEA_MIN_PROFIT:
-        rec['recommend'] = 'flea'
-        rec['reason']    = f'+{(flea_net - trader_price):,} over trader after fees'
-    else:
-        rec['reason'] = f'Flea net {flea_net:,} not {FLEA_MIN_PROFIT//1000}k+ above trader'
-
-    return rec
+def build_sell_context(settings, prices):
+    """sellcalc context for one scan: settings + the live rules cached with the
+    prices + the Intelligence Center level from the hideout progress."""
+    intel = 0
+    try:
+        tasks = get_tasks(allow_fetch=False)
+        if tasks:
+            progress = load_json(PROGRESS_PATH, default_progress)
+            intel = sellcalc.intel_center_level(tasks.get('hideoutStations'),
+                                                progress.get('completed_hideout'))
+    except Exception as e:
+        print(f'[sell] intel center level unavailable: {e}')
+    return sellcalc.make_context(settings, (prices or {}).get('rules'), intel)
 
 
 # ---------------------------------------------------------------------------
@@ -2119,7 +2076,15 @@ def default_settings():
         'grid': None,       # last-good detected grid, persisted so a noisy frame can't derail a scan
         'kappa_only_tasks': True,  # only kappaRequired tasks count toward task aggregate/KEEP totals
         'debug_dumps': True,  # save raw frame + detections of the last few scans under data/debug/
-        'flea_requires_fir': True,  # normal flea rule; Battlestate has lifted it for events
+        # Sell advice (see sellcalc.SELL_DEFAULTS for what each means; all are optional in settings.json)
+        'flea_requires_fir': None,  # None = follow tarkov.dev's flea rule (live: FiR only); set false when Battlestate lifts it for an event
+        'flea_offer_slots': sellcalc.DEFAULT_FLEA_SLOTS,  # simultaneous flea offers (your flea rating decides; shown as 'Offers x/y' in the flea tab)
+        'flea_overflow': 'queue',   # flea picks beyond the slots: 'queue' (list when a slot frees) or 'trader' (sell now)
+        'flea_min_gain': sellcalc.FLEA_MIN_GAIN,  # roubles an offer must beat the trader by to be worth a slot
+        'intel_center_level': None,  # None = read from Tasks & Hideout progress; level 3 = -30% flea fee
+        'hideout_management_level': 0,  # skill level 0-51; each level adds 0.3% flea fee discount (with Intel Center 3)
+        'skip_traders': ['Ref'],   # Ref pays GP coins, not roubles
+        'trader_levels': {},       # e.g. {'Ref': 4} - only Ref's pay rate changes with loyalty level
         'identify_engine': 'v2',  # 'v2' (identify/ package) or 'legacy' (masked-NCC icon DB below)
     }
 
@@ -2523,11 +2488,13 @@ def get_tasks(allow_fetch=True):
 # stash items worth tracking — they'd bury real requirements in the aggregate.
 CURRENCY_NAMES = {'roubles', 'dollars', 'euros'}
 
-def compute_tasks_view(cache, progress, kappa_only=False):
+def compute_tasks_view(cache, progress, kappa_only=False, kinds=('giveItem',)):
     """
     Server-side merged view of what the player still needs.
-    Only 'giveItem' objectives count as hand-ins; objectives with a null item
-    are skipped (tarkov.dev is migrating TaskObjectiveItem.item → items).
+    Only 'giveItem' objectives count as hand-ins (the Tasks page); the sell
+    advisor also passes 'plantItem', whose items are consumed in raid and so
+    must not be sold.  Objectives with a null item are skipped (tarkov.dev is
+    migrating TaskObjectiveItem.item → items).
 
     `kappa_only` restricts which TASK objectives contribute to the aggregate
     totals to those on tasks with `kappaRequired` — non-kappa tasks (e.g.
@@ -2557,7 +2524,7 @@ def compute_tasks_view(cache, progress, kappa_only=False):
     for t in cache.get('tasks', []):
         items = []
         for o in (t.get('objectives') or []):
-            if o.get('type') != 'giveItem':
+            if o.get('type') not in kinds:
                 continue
             it, cnt = o.get('item'), o.get('count') or 0
             if not it or not it.get('id') or cnt <= 0:
@@ -2622,47 +2589,71 @@ def compute_tasks_view(cache, progress, kappa_only=False):
 
 def get_protected_ids(keep_list, price_idx):
     """
-    {tarkov.dev item id: {'reason': str, 'fir_only': bool}} for everything the
-    player should NOT unconditionally sell: unacquired keep-list entries +
-    task/hideout items still short of their required count.  Task data is
-    cache-only here — a scan never waits on the network for it.
+    {tarkov.dev item id: {'reason', 'fir_only', 'need', 'fir_need', 'why'}} for
+    everything the player should NOT unconditionally sell: unacquired keep-list
+    entries + task/hideout items still short of their required count.  Task
+    data is cache-only here — a scan never waits on the network for it.
 
-    `fir_only` marks entries where a Found-in-Raid copy specifically is what's
-    required, meaning a NON-FiR copy of the same item is safe to sell instead:
+    ``need`` is how many copies are still short (the scan keeps that many and
+    sells the surplus - see sellcalc.allocate_keep), ``fir_need`` how many of
+    those must be Found-in-Raid, ``why`` one string per source for the KEEP row.
+    Copies on the Tasks page's ``have`` count are treated as already secured
+    elsewhere and subtracted.  ``fir_only`` stays the summary the scan used
+    before: True when no remaining need accepts a non-FiR copy, so a copy
+    confidently read as non-FiR is safe to sell:
       - keep-list KAPPA (Collector) entries — Collector hand-ins require FiR.
       - keep-list manual/task entries — not FiR-gated (fir_only=False), those
         categories accept any copy.
-      - task/hideout aggregate items — fir_only only when EVERY remaining
-        need across all sources is FiR-specific (fir_needed >= total_needed);
-        if even one source accepts non-FiR, a non-FiR copy is still needed,
-        so fir_only must stay False.
+      - task/hideout items — fir_only only when EVERY remaining need across
+        all sources is FiR-specific; if even one source accepts non-FiR, a
+        non-FiR copy is still needed.
+    Task hand-ins and plant-item objectives both count (planted items are
+    consumed); completed tasks/hideout levels are excluded by the progress data.
     """
     protected = {}
-    entry_cat = {e['id']: cat['id']
+    entry_cat = {e['id']: cat
                  for cat in keep_list['categories'] for e in cat['items']}
     mapped, _unmapped = map_keep_entries_to_ids(keep_list, price_idx)
     for tid, entry in mapped.items():
         if not entry.get('acquired'):
-            fir_only = entry_cat.get(entry['id']) == 'kappa'
-            protected[tid] = {'reason': 'On keep list', 'fir_only': fir_only}
+            cat = entry_cat.get(entry['id']) or {}
+            fir_only = cat.get('id') == 'kappa'
+            protected[tid] = {
+                'reason': 'On keep list', 'fir_only': fir_only,
+                'need': 1, 'fir_need': 1 if fir_only else 0,
+                'why': [f"{cat.get('label') or 'Keep list'}: 1 needed"
+                        + (' (Found in Raid)' if fir_only else '')],
+            }
     try:
         cache = get_tasks(allow_fetch=False)
         if cache:
             progress = load_json(PROGRESS_PATH, default_progress)
             settings = load_json(SETTINGS_PATH, default_settings)
             view = compute_tasks_view(cache, progress,
-                                      kappa_only=settings.get('kappa_only_tasks', True))
+                                      kappa_only=settings.get('kappa_only_tasks', True),
+                                      kinds=('giveItem', 'plantItem'))
             for rec in view['aggregate']:
-                if rec['have'] >= rec['total_needed']:
+                need, fir_need = sellcalc.remaining_needs(
+                    rec['total_needed'], rec['fir_needed'], rec['have'])
+                if need <= 0:
                     continue
                 srcs = rec['sources']
                 first = srcs[0]['name'] if srcs else 'tasks'
                 more = f' +{len(srcs) - 1} more' if len(srcs) > 1 else ''
-                fir_only = rec['fir_needed'] >= rec['total_needed'] > 0
-                protected.setdefault(
-                    rec['item_id'],
-                    {'reason': f"Needed: {first} (×{rec['total_needed']}){more}",
-                     'fir_only': fir_only})
+                why = [f"{s['name']} ×{s['count']}" + (' FiR' if s['fir'] else '') for s in srcs]
+                have = f", {rec['have']} already set aside" if rec['have'] else ''
+                if rec['item_id'] in protected:        # on the keep list too: the needs add up
+                    cur = protected[rec['item_id']]
+                    cur['need'] += need
+                    cur['fir_need'] += fir_need
+                    cur['why'] += why
+                    cur['fir_only'] = cur['need'] == cur['fir_need']
+                    continue
+                protected[rec['item_id']] = {
+                    'reason': f"Needed: {first} (×{rec['total_needed']}){more}",
+                    'fir_only': need == fir_need, 'need': need, 'fir_need': fir_need,
+                    'why': why[:] if not have else why + [have.lstrip(', ')],
+                }
     except Exception as e:
         print(f"[tasks] protected-id pass skipped: {e}")
     return protected
@@ -4076,100 +4067,46 @@ def _sell_scan_inner(from_calibration=False):
         # --- Build every entry, then number them in SELL order ---------------
         # The list and the badges on the image share one numbering, so badge 1
         # is the first row to sell: trader items grouped in the game's trader
-        # order (one visit per trader), then flea items by total profit, then
-        # KEEP items.  Everything is outlined on the image in its own colour.
+        # order (one visit per trader), then the flea offers that fit in the
+        # player's slots by margin, then the flea queue, then KEEP items.
+        # Everything is outlined on the image in its own colour.  The decisions
+        # themselves are sellcalc.plan_entries (pure); this only draws them.
         draw    = ImageDraw.Draw(img, 'RGBA')
-        results = []
         skipped_weapons = 0
 
-        keep_results = []   # KEEP items — appended after numbered items
+        sellable = []
         for d in sorted(raw_detections, key=lambda r: (r['panel'], r['row'], r['col'])):
-            bx, by = d['px'] + 2, d['py'] + 2
-
             if is_unpriced_weapon(id_to_item.get(d['item_id']), d.get('category')):
                 # Guns are never priced: a build can use any of hundreds of parts, so the
                 # identity says nothing about its value.  Mark it so the player sees it was
                 # recognised, and leave it out of the sell list.
                 draw.rectangle([d['px'], d['py'], d['px'] + d['pw'], d['py'] + d['ph']],
                                outline=(110, 110, 110, 255), width=2)
-                draw_badge(draw, bx, by, 'GUN', bg=(80, 80, 80, 220))
+                draw_badge(draw, d['px'] + 2, d['py'] + 2, 'GUN', bg=(80, 80, 80, 220))
                 skipped_weapons += 1
-                continue
+            else:
+                sellable.append(d)
 
-            item_data = id_to_item.get(d['item_id'])
-            if not item_data:
-                continue
+        ctx = build_sell_context(settings, prices)
+        results, keep_results = sellcalc.plan_entries(sellable, id_to_item, protected, settings, ctx)
 
-            prot = protected.get(d['item_id'])
-            # A FiR-only protection (Kappa hand-ins, or aggregate needs that
-            # are entirely FiR-gated) only holds for a FiR copy — a detection
-            # confidently read as non-FiR falls through to a normal sell rec
-            # instead of being force-kept.  `fir is None` (indeterminate) must
-            # never unprotect, so it still counts as protected here.
-            non_fir_note = False
-            if prot and prot['fir_only'] and d.get('fir') is False:
-                prot = None
-                non_fir_note = True
-
-            if prot:
-                # Cyan = KEEP: unmistakably different from flea-green and
-                # trader-gold so "do not sell" reads at a glance.
-                fx1, fy1 = d['px'], d['py']
-                fx2, fy2 = d['px'] + d['pw'], d['py'] + d['ph']
-                draw.rectangle([fx1, fy1, fx2, fy2],
-                               fill=(0, 180, 220, 60), outline=(0, 220, 255, 255), width=3)
-                draw_badge(draw, bx, by, 'KEEP', bg=(0, 140, 180, 230))
-                keep_results.append({
-                    'num':          'K',
-                    'matched_name': item_data['name'],
-                    'score':        d['score'],
-                    'col':          d['col'], 'row': d['row'],
-                    'W':            d['W'],   'H':   d['H'],
-                    'rotated':      d.get('rotated', False),
-                    'fir':          d.get('fir'),
-                    'x': bx, 'y': by,
-                    'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph'],
-                    'recommend':    'keep',
-                    'trader_name':  None, 'trader_price': None,
-                    'flea_list':    None, 'flea_net':     None,
-                    'reason':       prot['reason'],
-                })
-                continue
-
-            rec = sell_recommendation(
-                item_data, flea_blocked=flea_block_reason(item_data, d.get('fir'), settings))
-            if non_fir_note:
-                rec['reason'] += ' - not FIR, cannot be handed in'
-            count = d.get('count') or 1
-            unit  = rec['flea_net'] if rec['recommend'] == 'flea' else rec['trader_price']
-
-            results.append({
-                'num':          None,   # assigned after sorting into sell order
-                'count':        count,
-                'total':        (unit or 0) * count,
-                'uncertain':    bool(d.get('uncertain')),
-                'matched_name': item_data['name'],
-                'score':        d['score'],
-                'col':          d['col'], 'row': d['row'],
-                'W':            d['W'],   'H':   d['H'],
-                'rotated':      d.get('rotated', False),
-                'fir':          d.get('fir'),
-                'non_fir_note': non_fir_note,
-                'x': bx, 'y': by,
-                'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph'],
-                **rec,
-            })
-
-        results = order_for_selling(results)
-        for num, r in enumerate(results, start=1):
-            r['num'] = num
+        for r in results:
             if r['recommend'] == 'flea':
-                rgb = FLEA_RGB
+                rgb = FLEA_QUEUE_RGB if r.get('flea_queue') else FLEA_RGB
             else:
                 rgb = TRADER_COLORS_RGB.get(r['trader_name'], DEFAULT_TRADER_BADGE_RGB)
             draw.rectangle([r['px'], r['py'], r['px'] + r['pw'], r['py'] + r['ph']],
                            fill=rgb + (40,), outline=rgb + (255,), width=3)
-            draw_badge(draw, r['x'], r['y'], str(num), bg=rgb + (230,))
+            draw_badge(draw, r['x'], r['y'], str(r['num']), bg=rgb + (230,))
+
+        for k in keep_results:
+            if k.pop('drawn'):
+                # Cyan = KEEP: unmistakably different from flea-green and
+                # trader-gold so "do not sell" reads at a glance.  A stack that
+                # is only partly needed is drawn by its sell row instead.
+                draw.rectangle([k['px'], k['py'], k['px'] + k['pw'], k['py'] + k['ph']],
+                               fill=(0, 180, 220, 60), outline=(0, 220, 255, 255), width=3)
+                draw_badge(draw, k['x'], k['y'], 'KEEP', bg=(0, 140, 180, 230))
 
         results.extend(keep_results)   # KEEP items always at the end
 

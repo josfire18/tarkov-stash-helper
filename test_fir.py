@@ -107,8 +107,14 @@ def test_get_protected_ids_fir_only_shape(monkeypatch):
 
     protected = tsh_app.get_protected_ids(keep_list, price_idx)
 
-    assert protected['tid_kappa'] == {'reason': 'On keep list', 'fir_only': True}
-    assert protected['tid_task']  == {'reason': 'On keep list', 'fir_only': False}
+    assert protected['tid_kappa']['reason'] == 'On keep list'
+    assert protected['tid_kappa']['fir_only'] is True
+    assert protected['tid_task']['reason'] == 'On keep list'
+    assert protected['tid_task']['fir_only'] is False
+    # one copy each; the Kappa hand-in must be FiR, the manual entry takes any copy
+    assert (protected['tid_kappa']['need'], protected['tid_kappa']['fir_need']) == (1, 1)
+    assert (protected['tid_task']['need'], protected['tid_task']['fir_need']) == (1, 0)
+    assert 'Kappa (Collector)' in protected['tid_kappa']['why'][0]
 
 
 def test_get_protected_ids_skips_acquired_entries(monkeypatch):
