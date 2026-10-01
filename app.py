@@ -298,21 +298,43 @@ def _is_newer(remote, local):
 # Pricing helpers
 # ---------------------------------------------------------------------------
 
+class PriceFetchError(Exception):
+    """tarkov.dev did not return item data (outage, rate limit, schema change)."""
+
+
 def fetch_prices():
     """Fetch all item prices from tarkov.dev and write to cache."""
     r = http_requests.post(TARKOV_API, json={'query': PRICE_QUERY}, timeout=30)
-    items = r.json()['data']['items']
+    try:
+        body = r.json()
+    except ValueError:
+        raise PriceFetchError(f'tarkov.dev returned HTTP {r.status_code} with no JSON')
+    items = (body.get('data') or {}).get('items')
+    if not items:
+        errs = '; '.join(e.get('message', '?') if isinstance(e, dict) else str(e)
+                         for e in body.get('errors') or []) or 'no items'
+        raise PriceFetchError(f'tarkov.dev HTTP {r.status_code}: {errs}')
     cache = {'timestamp': time.time(), 'items': items}
     save_json(PRICES_PATH, cache)
     return cache
 
 def get_prices():
-    """Return cached prices, refreshing if stale."""
-    if os.path.exists(PRICES_PATH):
-        cache = load_json(PRICES_PATH, lambda: None)
-        if cache and time.time() - cache.get('timestamp', 0) < PRICE_CACHE_TTL:
-            return cache
-    return fetch_prices()
+    """Return cached prices, refreshing if stale.
+
+    A failed refresh (tarkov.dev outage) falls back to the last good cache,
+    marked ``stale_error`` so the UI can say how old the prices are - a
+    temporary API problem must not stop a sell scan.
+    """
+    cache = load_json(PRICES_PATH, lambda: None) if os.path.exists(PRICES_PATH) else None
+    if cache and time.time() - cache.get('timestamp', 0) < PRICE_CACHE_TTL:
+        return cache
+    try:
+        return fetch_prices()
+    except (PriceFetchError, http_requests.RequestException) as e:
+        if not cache:
+            raise
+        print(f'[prices] refresh failed, using cached prices: {e}')
+        return {**cache, 'stale_error': str(e)}
 
 def build_price_index(cache):
     """Build name/shortname lookup from cache."""
@@ -1997,6 +2019,21 @@ def price_420(target):
     rem = target % 1000
     p = (target - rem + 420) if rem >= 420 else (target - rem - 580)
     return p if p >= 420 else max(1, target - 1)
+
+def is_unpriced_weapon(item_data, category=None):
+    """True for a gun the sell list should skip.
+
+    A gun's value depends on whatever parts are on it, so its identity can't
+    price it.  tarkov.dev also tags signal flares (RSP-30) as 'gun', but those
+    are fixed special-slot items with a real price, so they are kept.
+    """
+    types = set((item_data or {}).get('types') or ())
+    if 'specialSlot' in types:
+        return False
+    if types & {'gun', 'preset'}:
+        return True
+    return item_data is None and category == 'weapon'
+
 
 def flea_block_reason(item_data, fir, settings):
     """Why this copy can't be listed on the flea, or None if it can.
@@ -4000,6 +4037,10 @@ def _sell_scan_inner(from_calibration=False):
               f"origin=({grid['origin_x']:.1f},{grid['origin_y']:.1f})")
 
         prices     = get_prices()
+        if prices.get('stale_error'):
+            age_h = (time.time() - prices.get('timestamp', 0)) / 3600
+            warnings.append(f'Price refresh failed ({prices["stale_error"]}); '
+                            f'using prices from {age_h:.0f} h ago')
         price_idx  = build_price_index(prices)
         id_to_item = {it['id']: it for it in prices.get('items', [])}
 
@@ -4039,10 +4080,21 @@ def _sell_scan_inner(from_calibration=False):
         # KEEP items.  Everything is outlined on the image in its own colour.
         draw    = ImageDraw.Draw(img, 'RGBA')
         results = []
+        skipped_weapons = 0
 
         keep_results = []   # KEEP items — appended after numbered items
         for d in sorted(raw_detections, key=lambda r: (r['panel'], r['row'], r['col'])):
             bx, by = d['px'] + 2, d['py'] + 2
+
+            if is_unpriced_weapon(id_to_item.get(d['item_id']), d.get('category')):
+                # Guns are never priced: a build can use any of hundreds of parts, so the
+                # identity says nothing about its value.  Mark it so the player sees it was
+                # recognised, and leave it out of the sell list.
+                draw.rectangle([d['px'], d['py'], d['px'] + d['pw'], d['py'] + d['ph']],
+                               outline=(110, 110, 110, 255), width=2)
+                draw_badge(draw, bx, by, 'GUN', bg=(80, 80, 80, 220))
+                skipped_weapons += 1
+                continue
 
             item_data = id_to_item.get(d['item_id'])
             if not item_data:
@@ -4130,6 +4182,7 @@ def _sell_scan_inner(from_calibration=False):
             'grid':        grid,
             'grid_failed': grid_failed,
             'warnings':    warnings,
+            'skipped_weapons': skipped_weapons,
         })
     finally:
         _scan_state.update({'running': False, 'phase': None, 'ts': time.time()})

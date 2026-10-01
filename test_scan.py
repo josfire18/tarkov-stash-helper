@@ -121,7 +121,7 @@ def run_v2(img_bgr, use_dino=True, use_ocr=True, warm=True):
     res = _v2_engines[key].scan(img_bgr)
     dt = time.perf_counter() - t
     dets = [{'rect': list(d.rect), 'item_id': d.item_id, 'name': d.name, 'uncertain': d.uncertain,
-             'conf': d.confidence, 'det': d} for d in res.detections]
+             'conf': d.confidence, 'category': d.category, 'det': d} for d in res.detections]
     return dets, dt, res
 
 
@@ -203,6 +203,10 @@ def score(truth, dets, cats, verbose=True):
         ident['n'] += 1
         c['n'] += 1
         ok = d['item_id'] == t['item_id'] or (bool(d.get('name')) and d.get('name') == t.get('name'))   # twin ids share a name
+        if cat == 'weapon':
+            # Weapons are never priced (a gun can be built from hundreds of parts), so the
+            # only thing that matters is recognising it AS a weapon so the sell list skips it.
+            ok = d.get('category') == 'weapon'
         if ok:
             ident['ok'] += 1
             c['ok'] += 1
