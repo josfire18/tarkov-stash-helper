@@ -60,6 +60,7 @@ LABEL_RIVAL_GAP = 5.0      # a label this much better than the chosen item's get
 LEARN_MAX_RES = 4.0        # stage-1 residual of a near-literal match to a cached icon
 NAMED_DINO_SLACK = 0.03    # a named candidate this close in DINO to a nameless winner may name it
 LEARN_DISTINCT = 2.0       # learn only if every different look-alike is at least this x worse
+LEARN_CONFIRMATIONS = 2    # independent confirmations before a learned name is used
 # logistic calibration of the reported confidence: p = sigmoid(b + sum(w * feature)); fitted by
 # `python -m identify.calibrate` on degraded variants of the labelled stash (see that module)
 CALIB = {'b': 1.753, 'margin': 0.372, 'res': -0.311, 'ocr': 3.225, 'dino': 0.947}
@@ -168,7 +169,7 @@ class Engine:
             return
         c = self.cat
         for r in np.where(c.src != 'api')[0]:
-            iid = self.learned.get(self._icon_key(int(r)))
+            iid = self.learned.get(self._icon_key(int(r)), min_seen=LEARN_CONFIRMATIONS)
             if iid and str(c.ids[r]) != iid:
                 self._name_row(int(r), iid)
 
@@ -176,12 +177,27 @@ class Engine:
         """Record a cached icon's item when the evidence is literal: the tile is a
         near pixel-exact match to that icon AND its label is an exact, unique read."""
         if (self.cat.src[row] == 'api' or residual > LEARN_MAX_RES
-                or label_score < 100.0 or twins != 1):
+                or label_score < 100.0 or twins != 1 or self._read_is_ambiguous(item_id)):
             return
         key = self._icon_key(row)
-        if key and self.learned.learn(key, item_id, str(self.cat.names[self._id_row[item_id]])
-                                      if item_id in self._id_row else item_id):
+        name = str(self.cat.names[self._id_row[item_id]]) if item_id in self._id_row else item_id
+        # one read is not proof (OCR can drop a letter and land on another real name),
+        # so a pairing takes effect only once it has been confirmed independently
+        if key and self.learned.learn(key, item_id, name) >= LEARN_CONFIRMATIONS:
             self._name_row(row, item_id)
+
+    def _read_is_ambiguous(self, item_id: str) -> bool:
+        """True when this item's short name sits inside another item's short name, so a
+        read of it could be that other name missing letters ("Diary" in "SDiary")."""
+        r = self._id_row.get(item_id)
+        if r is None:
+            return True
+        mine = ocr_mod.canon_nospace(str(self.cat.shorts[r]))
+        if not mine:
+            return True
+        if not hasattr(self, '_short_set'):
+            self._short_set = {ocr_mod.canon_nospace(str(self.cat.shorts[a])) for a in self._api}
+        return any(mine != s and mine in s for s in self._short_set)
 
     # ------------------------------------------------------------------
     def _use_dino(self) -> bool:
@@ -473,16 +489,17 @@ class Engine:
         # A build template (anonymous cache render of a modded item) or a poor visual match
         # only says what the footprint looks like: the identity comes from the printed label.
         auth = None
+        edge = _at_viewport_edge(it, panel, tile)
         if cat.src[c.row] == 'build' or (str(cat.cats[c.row]) == 'weapon' and c.score > 3.0) \
                 or best_res > 9.0:
             auth = self._label_authority(w.get('ocr_all') or [], tile,
                                          prefer_weapon=str(cat.cats[c.row]) in ('weapon', 'build'),
-                                         res_by_row=_best_res_by_id(cat, cands))
+                                         res_by_row=_best_res_by_id(cat, cands), at_edge=edge)
         elif text and (o is None or o < 60 or o < self._best_label(w, tile) - LABEL_RIVAL_GAP):
             # label conflict: the picture says one thing, a clean unambiguous printed name
             # says another (e.g. a 2x1 suppressor whose label names a 1x1 flash hider)
             auth = self._label_authority(w.get('ocr_all') or [], tile, prefer_weapon=False,
-                                         res_by_row=_best_res_by_id(cat, cands))
+                                         res_by_row=_best_res_by_id(cat, cands), at_edge=edge)
             if auth is not None and str(cat.ids[auth[0]]) == str(cat.ids[c.row]):
                 auth = None
         item_id = str(cat.ids[c.row])
@@ -603,7 +620,8 @@ class Engine:
                         break
         return self._api
 
-    def _label_authority(self, texts: list, tile: Tile, prefer_weapon: bool, res_by_row: dict | None = None):
+    def _label_authority(self, texts: list, tile: Tile, prefer_weapon: bool, res_by_row: dict | None = None,
+                         at_edge: bool = False):
         """Identity from the printed short name over *all* base items (any footprint no
         larger than the tile: a modded item draws bigger than its base; a viewport-clipped
         tile may hide up to 3 rows).  Needs a confident read (>= ``OCR_AUTH``) that beats
@@ -618,8 +636,16 @@ class Engine:
         for txt in texts:
             hits = self._label_hits(txt, tile.W)
             sc = [(s_, self._id_row[i]) for i, s_ in hits.items() if i in self._id_row]
-            sc = [(s_, r) for s_, r in sc
-                  if int(cat.tw[r]) * int(cat.th[r]) <= max_area or str(cat.cats[r]) == 'weapon']
+            # An exact read names one item even when it is bigger than the visible tile: the
+            # stash viewport cuts items in half at its edges, and clip detection can miss it.
+            fits = [(s_, r) for s_, r in sc
+                    if int(cat.tw[r]) * int(cat.th[r]) <= max_area or str(cat.cats[r]) == 'weapon']
+            exact_fits = any(s_ >= 100.0 for s_, _ in fits)
+            # ...but only where the viewport really cuts items (the tile touches the edge of
+            # the visible stash) and no exact twin fits the tile: OCR that drops a character
+            # can land on another item's real short name ("M80" read as "M8").
+            sc = fits if (exact_fits or not at_edge) else fits + [
+                (s_, r) for s_, r in sc if s_ >= 100.0 and (s_, r) not in fits]
             if not sc:
                 continue
             sc.sort(key=lambda t: -t[0])
@@ -643,6 +669,16 @@ class Engine:
             return (0 if (prefer_weapon and weap) else 1, abs(int(cat.tw[r]) * int(cat.th[r]) - area), rr, r)
         twins.sort(key=key)
         return twins[0], float(top), len(twins)
+
+
+def _at_viewport_edge(it, panel, tile) -> bool:
+    """True when an item tile touches the top or bottom of its visible panel, where the
+    stash viewport can cut an item in half (or clip detection already said so)."""
+    if getattr(tile, 'clip', '') or getattr(it, 'clipped_top', False) or getattr(it, 'clipped_bottom', False):
+        return True
+    x, y, w, h = it.rect
+    tol = max(3.0, 0.35 * h / max(int(it.h), 1))
+    return abs((y + h) - panel.y1) <= tol or abs(y - panel.y0) <= tol
 
 
 def _best_res_by_id(cat, cands) -> dict:

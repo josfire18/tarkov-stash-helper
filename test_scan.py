@@ -33,6 +33,7 @@ What is measured (``--score``)
 """
 import sys
 import os
+import tempfile
 import glob
 import json
 import time
@@ -106,6 +107,8 @@ def _legacy_truth_to_rects(truth, panel0):
 # ---------------------------------------------------------------------------
 
 _v2_engines = {}
+# a fresh, throwaway learned-names store per scoring run (see run_v2)
+_EVAL_LEARNED = os.path.join(tempfile.mkdtemp(prefix='tsh_eval_'), 'learned_icons.json')
 PITCH_HINT = None          # set by --pitch-hint (labelling aid for lattices the engine cannot lock by itself)
 
 
@@ -114,7 +117,10 @@ def run_v2(img_bgr, use_dino=True, use_ocr=True, warm=True):
     from identify.pipeline import Engine
     key = (use_dino, use_ocr)
     if key not in _v2_engines:
-        _v2_engines[key] = Engine(EngineSettings(use_dino=use_dino, use_ocr=use_ocr, pitch_hint=PITCH_HINT))
+        # Scoring must not read or write the app's learned icon names: a run would grade
+        # itself on what earlier runs taught it, and a bad experiment would poison the app.
+        _v2_engines[key] = Engine(EngineSettings(use_dino=use_dino, use_ocr=use_ocr, pitch_hint=PITCH_HINT,
+                                                 extra={'learned_path': _EVAL_LEARNED}))
         if warm:                       # first call pays model load / CUDA init: don't time it
             _v2_engines[key].scan(img_bgr)
     t = time.perf_counter()

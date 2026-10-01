@@ -51,24 +51,23 @@ class LearnedNames:
         except (OSError, ValueError):
             self.data = {}
 
-    def get(self, key: str | None) -> str | None:
+    def get(self, key: str | None, min_seen: int = 1) -> str | None:
         e = self.data.get(key) if key else None
-        return e['id'] if e else None
+        return e['id'] if e and e.get('seen', 1) >= min_seen else None
 
-    def learn(self, key: str | None, item_id: str, name: str) -> bool:
-        """Record ``key -> item_id``; returns True if this changed anything."""
+    def learn(self, key: str | None, item_id: str, name: str) -> int:
+        """Record one confirmation of ``key -> item_id``; returns how many times this
+        exact pairing has now been confirmed (a different item restarts the count)."""
         if not key or not item_id:
-            return False
+            return 0
         with _lock:
             e = self.data.get(key)
             if e and e['id'] == item_id:
                 e['seen'] = e.get('seen', 1) + 1
-                changed = False
             else:
-                self.data[key] = {'id': item_id, 'name': name, 'seen': 1, 'at': int(time.time())}
-                changed = True
+                e = self.data[key] = {'id': item_id, 'name': name, 'seen': 1, 'at': int(time.time())}
             self._save()
-        return changed
+            return e['seen']
 
     def _save(self) -> None:
         tmp = self.path + '.tmp'
