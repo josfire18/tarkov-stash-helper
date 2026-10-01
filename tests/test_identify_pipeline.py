@@ -161,3 +161,89 @@ def test_frames_without_a_stash_return_nothing_and_do_not_crash(world):
 def test_package_level_scan_function_exists():
     import identify
     assert callable(identify.scan)
+
+
+# --------------------------------------------------------------------------
+# label authority: twins, conflicting reads, literal matches (no game data, no OCR needed)
+# --------------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+from identify import pipeline as PL
+
+LABELLED = [  # (id, name, short, W, H)
+    (idof(1), 'Cal A BP pack', 'BP', 1, 1), (idof(2), 'Cal B BP pack', 'BP', 1, 1),
+    (idof(3), 'Cal C BP loose', 'BP', 1, 1), (idof(4), 'M80 pack', 'M80', 1, 1),
+    (idof(5), 'M82 magazine', 'M82', 1, 2), (idof(6), 'Cal A BP big pack', 'BP', 2, 1)]
+
+
+@pytest.fixture(scope='module')
+def label_engine(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp('labels')
+    (tmp / 'tmpl').mkdir()
+    prices = []
+    for k, (iid, name, short, w, h) in enumerate(LABELLED):
+        cv2.imwrite(str(tmp / 'tmpl' / f'{iid}.png'), make_icon(700 + k, w, h))
+        prices.append({'id': iid, 'name': name, 'shortName': short, 'width': w, 'height': h,
+                       'backgroundColor': 'blue', 'types': ['ammoBox']})
+    (tmp / 'p.json').write_text(json.dumps({'items': prices}), encoding='utf-8')
+    cat = C.build_catalog(str(tmp / 'p.json'), str(tmp / 'tmpl'), str(tmp / 'nc'), with_cache=False, log=lambda *_: None)
+    return Engine(EngineSettings(use_dino=False, use_ocr=False, accelerate=False), catalog=cat)
+
+
+def _row(eng, i):
+    return eng._id_row[idof(i)]
+
+
+def _tile(W=1, H=1):
+    return SimpleNamespace(W=W, H=H, clip='')
+
+
+def test_label_twins_are_ranked_by_the_supplied_picture_score(label_engine):
+    eng = label_engine
+    r1, r2, r3 = _row(eng, 1), _row(eng, 2), _row(eng, 3)
+    # residual alone would pick twin 1 (lowest); the picture score says twin 2
+    res = {r1: 5.0, r2: 9.0, r3: 7.0}
+    plain = eng._label_authority(['BP'], _tile(), False, res_by_row=res)
+    assert plain[0] == r1 and plain[2] == 3
+    ranked = eng._label_authority(['BP'], _tile(), False, res_by_row=res,
+                                  twin_rank=lambda rows: {r1: -6.0, r2: -1.0, r3: -4.0})
+    assert ranked[0] == r2 and ranked[2] == 3
+
+
+def test_twins_compete_only_among_equally_fitting_footprints(label_engine):
+    eng = label_engine
+    big = _row(eng, 6)
+    seen = []
+
+    def rank(rows):
+        seen.append(set(rows))
+        return {r: 0.0 for r in rows}
+    got = eng._label_authority(['BP'], _tile(2, 1), False, twin_rank=rank)
+    assert got[0] == big                      # the 2x1 pack is the closest footprint
+    assert seen == []                         # a single finalist needs no ranking
+    eng._label_authority(['BP'], _tile(1, 1), False, twin_rank=rank)
+    assert seen and _row(eng, 6) not in seen[0]
+
+
+def test_a_read_naming_a_fitting_item_beats_an_equal_read_naming_a_bigger_one(label_engine):
+    eng = label_engine
+    m80, m82 = _row(eng, 4), _row(eng, 5)
+    for texts in (['M82', 'M80'], ['M80', 'M82']):
+        got = eng._label_authority(texts, _tile(1, 1), False, at_edge=True)
+        assert got[0] == m80
+    # when only the bigger item's name was read, the viewport edge still allows it
+    assert eng._label_authority(['M82'], _tile(1, 1), False, at_edge=True)[0] == m82
+
+
+def test_literal_match_outranks_a_partial_label_only():
+    assert PL.literal_beats_label(1.9, 0.94, 90.0)          # 'Egg' read as 'Mass'
+    assert not PL.literal_beats_label(1.9, 0.94, 100.0)     # an exact read still overrules
+    assert not PL.literal_beats_label(6.0, 0.94, 90.0)      # not a literal match
+    assert not PL.literal_beats_label(1.9, 0.80, 90.0)      # DINO does not confirm
+    assert not PL.literal_beats_label(1.9, None, 90.0)      # no DINO: unproven
+
+
+def test_tie_detection():
+    assert PL.is_tie(0.0) and PL.is_tie(0.05)
+    assert not PL.is_tie(0.5) and not PL.is_tie(None)
