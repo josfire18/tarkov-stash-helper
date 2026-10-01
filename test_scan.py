@@ -106,6 +106,7 @@ def _legacy_truth_to_rects(truth, panel0):
 # ---------------------------------------------------------------------------
 
 _v2_engines = {}
+PITCH_HINT = None          # set by --pitch-hint (labelling aid for lattices the engine cannot lock by itself)
 
 
 def run_v2(img_bgr, use_dino=True, use_ocr=True, warm=True):
@@ -113,7 +114,7 @@ def run_v2(img_bgr, use_dino=True, use_ocr=True, warm=True):
     from identify.pipeline import Engine
     key = (use_dino, use_ocr)
     if key not in _v2_engines:
-        _v2_engines[key] = Engine(EngineSettings(use_dino=use_dino, use_ocr=use_ocr))
+        _v2_engines[key] = Engine(EngineSettings(use_dino=use_dino, use_ocr=use_ocr, pitch_hint=PITCH_HINT))
         if warm:                       # first call pays model load / CUDA init: don't time it
             _v2_engines[key].scan(img_bgr)
     t = time.perf_counter()
@@ -201,7 +202,7 @@ def score(truth, dets, cats, verbose=True):
         c = percat.setdefault(cat, {'n': 0, 'ok': 0})
         ident['n'] += 1
         c['n'] += 1
-        ok = d['item_id'] == t['item_id']
+        ok = d['item_id'] == t['item_id'] or (bool(d.get('name')) and d.get('name') == t.get('name'))   # twin ids share a name
         if ok:
             ident['ok'] += 1
             c['ok'] += 1
@@ -430,6 +431,8 @@ def relabel_mode(img_path, corr_path):
                 hits = [items[q]] if q in items else [it for it in items.values() if it['name'].lower() == q.lower()]
                 if not hits:
                     hits = ET.find_items(items, q)
+                if len(hits) > 1 and len({h['name'] for h in hits}) == 1:
+                    hits = hits[:1]        # twin ids with an identical name (tarkov.dev lists some items twice)
                 if len(hits) != 1:
                     raise SystemExit(f'#{k}: "{q}" matched {len(hits)} items: {[h["name"] for h in hits]}')
                 r['item_id'], r['name'] = hits[0]['id'], hits[0]['name']
@@ -500,6 +503,7 @@ def main():
     ap.add_argument('--no-dino', action='store_true')
     ap.add_argument('--no-ocr', action='store_true')
     ap.add_argument('--json')
+    ap.add_argument('--pitch-hint', type=float, help='px per slot, for --prefill of lattices the engine mis-locks')
     ap.add_argument('--robustness', metavar='IMG')
     ap.add_argument('--kinds', help='comma separated variants for --robustness')
     ap.add_argument('--prefill', metavar='IMG')
@@ -507,6 +511,8 @@ def main():
     ap.add_argument('--label', metavar='IMG')
     ap.add_argument('rest', nargs='*')
     a = ap.parse_args()
+    if a.pitch_hint:
+        globals()["PITCH_HINT"] = a.pitch_hint
     if a.score:
         paths = []
         for p in a.score:
