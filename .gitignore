@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.pyo
 *.pyd
@@ -16,6 +17,8 @@ data/eval/
 data/debug/
 data/prices_cache.json
 data/icon_db.npz
+data/identify_catalog_v2.npz
+data/identify_dino_v2.npz
 data/icon_model.pt
 data/icon_model_meta.json
 data/icon_index.json
