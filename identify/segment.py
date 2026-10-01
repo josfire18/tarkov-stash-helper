@@ -146,17 +146,25 @@ class _DSU:
             self.p[rb] = ra
 
 
-def segment_panel(img_bgr: np.ndarray, panel: Panel, panel_index: int = 0,
-                  ridge: bool | None = None) -> list[Item]:
-    """Footprints of every item (and every empty cell) in ``panel``.
+@dataclass
+class EdgeModel:
+    """Which edges of a panel carry a drawn line: per-boundary line coverage, the threshold
+    that splits "line" from "no line" and the mask model that produced them."""
+    name: str
+    thr: float
+    j: float
+    fv: dict          # (row, col) -> coverage of the vertical boundary left of cell (col, row)
+    fh: dict          # (row, col) -> coverage of the horizontal boundary above cell (col, row)
 
-    Edge presence is the fraction of a boundary segment covered by a line mask.  Two masks
-    are available - the exact border colour range (pristine PNG) and neutral-grey ridges
-    (survive JPEG / resampling) - and the threshold is **learned per image**: both masks
-    are evaluated on every interior boundary, the distribution of the fractions is
-    bimodal (a drawn line scores ~1, none scores low), the mask with the better
-    two-class separation wins and Otsu's threshold splits the classes.  ``ridge`` forces
-    a mask (True = ridge, False = strict)."""
+    def vertical_line(self, r: int, c: int) -> bool:
+        return self.fv[(r, c)] >= self.thr
+
+    def horizontal_line(self, r: int, c: int) -> bool:
+        return self.fh[(r, c)] >= self.thr
+
+
+def edge_model(img_bgr: np.ndarray, panel: Panel, ridge: bool | None = None) -> EdgeModel:
+    """Learn, per image, how to tell a drawn border line from art (see :func:`segment_panel`)."""
     nc, nr = panel.n_cols, panel.n_rows
     xs, ys = panel.xs, panel.ys
 
@@ -195,7 +203,7 @@ def segment_panel(img_bgr: np.ndarray, panel: Panel, panel_index: int = 0,
     strict_c = next((c for c in plausible if c[4] == 'strict'), None)
     if strict_c is not None and strict_c[0] >= 0.97:         # pristine capture: the exact model is decisive
         near = [strict_c]
-    j, thr, fv, fh, _name = max(near, key=share)
+    j, thr, fv, fh, name = max(near, key=share)
 
     # The border of an item that touches an *empty* slot is alpha-blended over the dark
     # backdrop (stash1: (84,81,73) between items, ~(67,65,59) against an empty cell), so the
@@ -203,7 +211,6 @@ def segment_panel(img_bgr: np.ndarray, panel: Panel, panel_index: int = 0,
     # fake a line there (one side is flat dark), so on those edges a one-sided step test counts:
     # a thin line clearly brighter than the empty side along the whole edge.
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    ridge_c = None
     empty = {(c, r): cell_is_empty(img_bgr, panel.rect(c, r, 1, 1)) for r in range(nr) for c in range(nc)}
     if any(empty.values()):
         fv = dict(fv)
@@ -216,6 +223,23 @@ def segment_panel(img_bgr: np.ndarray, panel: Panel, panel_index: int = 0,
             e0, e1 = empty[(c, r - 1)], empty[(c, r)]
             if f < thr and e0 != e1:
                 fh[(r, c)] = _step_fraction(gray, False, ys[r], xs[c] + 2, xs[c + 1] - 1, empty_before=e0)
+    return EdgeModel(name, float(thr), float(j), fv, fh)
+
+
+def segment_panel(img_bgr: np.ndarray, panel: Panel, panel_index: int = 0,
+                  ridge: bool | None = None) -> list[Item]:
+    """Footprints of every item (and every empty cell) in ``panel``.
+
+    Edge presence is the fraction of a boundary segment covered by a line mask.  Two masks
+    are available - the exact border colour range (pristine PNG) and neutral-grey ridges
+    (survive JPEG / resampling) - and the threshold is **learned per image**: both masks
+    are evaluated on every interior boundary, the distribution of the fractions is
+    bimodal (a drawn line scores ~1, none scores low), the mask with the better
+    two-class separation wins and Otsu's threshold splits the classes.  ``ridge`` forces
+    a mask (True = ridge, False = strict)."""
+    nc, nr = panel.n_cols, panel.n_rows
+    em = edge_model(img_bgr, panel, ridge)
+    fv, fh, thr = em.fv, em.fh, em.thr
 
     dsu = _DSU(nc * nr)
     idx = lambda c, r: r * nc + c
