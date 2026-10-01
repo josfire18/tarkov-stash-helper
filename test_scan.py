@@ -181,6 +181,27 @@ def match_rects(truth_rects, det_rects, thr=IOU_MIN):
     return mt
 
 
+_SELL = {}
+
+
+def sell_destination(item_id):
+    """Where the sell list would send one unit of this item: 'skip' (gun),
+    'flea', or 'trader:<name>' - computed with the app's own sell logic."""
+    if not _SELL:
+        import app as _app
+        with open(PRICES, encoding='utf-8') as fh:
+            _SELL['idx'] = {it['id']: it for it in json.load(fh)['items']}
+        _SELL['app'] = _app
+    item = _SELL['idx'].get(item_id)
+    if item is None:
+        return None
+    a = _SELL['app']
+    if a.is_unpriced_weapon(item):
+        return 'skip'
+    rec = a.sell_recommendation(item, flea_blocked=a.flea_block_reason(item, True, {}))
+    return 'flea' if rec['recommend'] == 'flea' else f"trader:{rec['trader_name']}"
+
+
 def score(truth, dets, cats, verbose=True):
     """Compute the metric dict for one image."""
     tr = [t['rect'] for t in truth]
@@ -196,12 +217,15 @@ def score(truth, dets, cats, verbose=True):
     caught = needless = flagged = 0
     e2e_ok = 0
     e2e_n = 0
+    dec = {'n': 0, 'ok': 0}     # same sell destination (trader / flea / skip), unmatched = wrong
     for i, t in enumerate(truth):
         if t.get('uncertain') or not t.get('item_id'):
             continue
         e2e_n += 1
         j = mt.get(i)
         if j is None:
+            if sell_destination(t['item_id']) is not None:
+                dec['n'] += 1
             continue
         d = dets[j]
         cat = t.get('category') or cats.get(t['item_id'], 'other')
@@ -219,6 +243,11 @@ def score(truth, dets, cats, verbose=True):
             e2e_ok += 1
         else:
             wrong.append((i, t, d))
+        want = sell_destination(t['item_id'])
+        if want is not None:
+            dec['n'] += 1
+            if ok or sell_destination(d['item_id']) == want:
+                dec['ok'] += 1
         if d.get('uncertain'):
             flagged += 1
             if ok:
@@ -235,6 +264,7 @@ def score(truth, dets, cats, verbose=True):
                       'wrong_flagged': caught, 'wrong_total': wrong_n,
                       'flagged_but_right': needless},
         'end_to_end': {'ok': e2e_ok, 'n': e2e_n, 'acc': e2e_ok / e2e_n if e2e_n else 0.0},
+        'sell_decision': {**dec, 'acc': dec['ok'] / dec['n'] if dec['n'] else 0.0},
         '_wrong': wrong, '_unmatched': [i for i in range(n_t) if i not in mt],
     }
 
@@ -254,6 +284,8 @@ def print_report(name, m, dt, truth, dets, show_wrong=True):
     print(f"  uncertain      {_pct(u['rate'])} of detections flagged; catches {u['wrong_flagged']}/{u['wrong_total']} "
           f"wrong answers; {u['flagged_but_right']} flagged answers were right")
     print(f"  end-to-end     {_pct(e['acc'])} ({e['ok']}/{e['n']})  right rectangle AND right item")
+    sd = m['sell_decision']
+    print(f"  sell decision  {_pct(sd['acc'])} ({sd['ok']}/{sd['n']})  sent to the same trader / flea / skip")
     if show_wrong:
         for idx, t, d in m['_wrong'][:30]:
             print(f"    WRONG #{idx} {t['rect']} want '{t.get('name')}'  got '{d['name']}'"
@@ -305,6 +337,8 @@ def score_mode(paths, engine, which, use_dino, use_ocr, json_out):
             a['dets'] += m['segmentation']['detections']
             a['ok'] += m['identification']['ok']; a['n'] += m['identification']['n']
             a['e2e_ok'] += m['end_to_end']['ok']; a['e2e_n'] += m['end_to_end']['n']
+            a['dec_ok'] = a.get('dec_ok', 0) + m['sell_decision']['ok']
+            a['dec_n'] = a.get('dec_n', 0) + m['sell_decision']['n']
             a['time'] += dt
             for k, v in m['per_category'].items():
                 c = a['cat'].setdefault(k, [0, 0])
@@ -320,6 +354,7 @@ def score_mode(paths, engine, which, use_dino, use_ocr, json_out):
         row('seg precision', lambda a: _pct(a['matched'] / a['dets']) if a['dets'] else '-')
         row('identification', lambda a: _pct(a['ok'] / a['n']) if a['n'] else '-')
         row('end-to-end', lambda a: _pct(a['e2e_ok'] / a['e2e_n']) if a['e2e_n'] else '-')
+        row('sell decision', lambda a: _pct(a['dec_ok'] / a['dec_n']) if a.get('dec_n') else '-')
         row('time/scan (s)', lambda a: f"{a['time'] / max(1, len(paths)):.2f}")
         allcats = sorted({k for e in engines for k in agg[e]['cat']})
         for k in allcats:
