@@ -97,6 +97,18 @@ def run(app_mod) -> dict:
         return 'ok'
     _check(C, 'desktop_shell_imports', desktop_shell)
 
+    def optional_modules():
+        import importlib
+        out = {}
+        for m in ('sellcalc', 'autoscan', 'dxcam', 'comtypes'):    # newer branches / lazy imports
+            try:
+                importlib.import_module(m)
+                out[m] = 'ok'
+            except ImportError as e:
+                out[m] = f'missing: {e}'
+        return out
+    _check(C, 'optional_modules', optional_modules, required=False)
+
     def catalog():
         have = os.path.exists(config.CATALOG_PATH)
         return {'catalog_present': have, 'prices_present': os.path.exists(config.PRICES_PATH),

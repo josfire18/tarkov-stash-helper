@@ -43,7 +43,8 @@ Optional, for the best accuracy (DINOv2 re-rank, +~1 point) and a GPU-resident s
 2x faster): `pip install -r requirements-dino.txt`, then for an NVIDIA GPU replace the CPU torch
 with a CUDA build, e.g. `pip install torch --index-url https://download.pytorch.org/whl/cu128`.
 The model (`facebook/dinov2-small`, ~88 MB) downloads once into the Hugging Face cache on first
-use. Without a GPU leave it out: DINO on a CPU takes about 20 s per scan.
+use. Without a GPU the CPU-only torch still works (same accuracy, ~+0.5 s per scan) but embedding the
+catalog the first time takes ~3 min.
 
 ## Packaging
 

@@ -10,7 +10,7 @@ Flavour (environment variable TSH_FLAVOUR):
   lean  (default, the release flavour)
         No torch / transformers.  Stage 1 runs on the CPU (numpy), stage 2 (DINOv2) is off,
         stage 3 (Tesseract OCR) is unchanged.  ~0.9 point less accurate than the full engine
-        and about twice as slow as a GPU stage 1, but a ~70 MB download instead of 0.3-3 GB.
+        and about twice as slow as a GPU stage 1, but a ~74 MB download instead of 237 MB (CPU torch) or 2.9 GB (CUDA).
   dino  (experiment; never released)
         Bundles whatever torch / transformers the *build* Python has installed, plus the
         modules transformers imports by name at run time.  Used to measure what the heavy
@@ -47,6 +47,21 @@ else:
     hidden += ['transformers.models.bit', 'transformers.models.dinov2.modeling_dinov2']
     excludes += ['tensorflow', 'jax', 'sklearn', 'pandas', 'matplotlib', 'numba', 'sympy',
                  'IPython', 'jupyter', 'notebook', 'onnxruntime', 'torchaudio']
+
+# Modules app.py (or code it calls) imports lazily or by name, which PyInstaller's static scan
+# can miss.  Listed explicitly and only when present, so this one spec builds every branch:
+#   sellcalc          top-level module (sell calculator)             - branch feat/sell
+#   autoscan          package (screen watcher; uses dxcam, else mss) - branch feat/autoscan
+#   dxcam, comtypes   imported lazily inside autoscan; comtypes builds COM wrappers at run time
+import importlib.util
+
+for mod in ('sellcalc',):
+    if os.path.exists(os.path.join(SPECPATH, mod + '.py')):
+        hidden.append(mod)
+for pkg in ('autoscan', 'dxcam', 'comtypes'):
+    local = os.path.isdir(os.path.join(SPECPATH, pkg))
+    if local or importlib.util.find_spec(pkg):
+        hidden += collect_submodules(pkg)
 
 a = Analysis(
     ['app.py'],

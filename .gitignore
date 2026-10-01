@@ -35,7 +35,7 @@ data/app.log
 venv/
 .venv/
 env/
-.buildvenv/
+.buildvenv*/
 
 # IDE
 .vscode/

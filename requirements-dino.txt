@@ -1,6 +1,6 @@
 # Optional extras for the DINOv2 re-rank (stage 2) and GPU-resident stage 1 - source runs only; the
-# release exe ships without them.  On Windows the PyPI torch wheel is CPU-only, which is far too
-# slow for stage 2 (~20 s per scan); for an NVIDIA GPU install torch from the CUDA index first:
+# release exe ships without them.  On Windows the PyPI torch wheel is CPU-only: stage 2 then costs
+# ~0.5 s per scan plus ~3 min once to embed the catalog; for an NVIDIA GPU install torch from the CUDA index first:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu128
 -r requirements.txt
 torch
