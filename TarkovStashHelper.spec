@@ -33,8 +33,7 @@ HEAVY = ['torch', 'torchvision', 'torchaudio', 'transformers', 'tokenizers', 'sa
          'huggingface_hub', 'onnxruntime', 'tensorflow', 'jax', 'sklearn', 'scipy', 'pandas',
          'matplotlib', 'numba', 'sympy', 'IPython', 'jupyter', 'notebook']
 # stdlib / dev packages nothing here imports (Tk is not used: the UI is a webview)
-UNUSED = ['tkinter', '_tkinter', 'pytest', '_pytest', 'pydoc', 'pydoc_data', 'lib2to3', 'distutils',
-          'setuptools', 'pip', 'wheel']
+UNUSED = ['tkinter', '_tkinter', 'pytest', '_pytest', 'pydoc', 'pydoc_data', 'lib2to3']
 
 hidden = []
 excludes = list(UNUSED)

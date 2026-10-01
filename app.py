@@ -4189,7 +4189,7 @@ def _sell_scan_inner(from_calibration=False):
 
 
 HOST = '127.0.0.1'
-PORT = 8877
+PORT = int(os.environ.get('TSH_PORT', 8877))   # env override: smoke tests next to a running instance
 URL = f'http://{HOST}:{PORT}'
 
 
