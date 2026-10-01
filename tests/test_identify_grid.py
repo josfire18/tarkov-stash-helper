@@ -106,3 +106,24 @@ def test_ridge_masks_see_a_blurred_line():
     img = cv2.GaussianBlur(img, (0, 0), 0.8)
     _, vertical = ridge_masks(img, contrast=7)
     assert vertical[:, 29:32].any(axis=1).mean() > 0.9
+
+
+def test_sub_grids_a_few_px_apart_are_both_found():
+    # a backpack drawn as a 4-column grid, a 12 px gap and a 2-column grid whose lattice is offset
+    # (the Terraframe pockets).  The two are one line mesh (the top/bottom borders run across
+    # the gap); the lattice fit alone keeps only the bigger half.
+    left, _, _, _ = render_panel(63.0, 4, 5, [(0, 0, 2, 2), (2, 1, 1, 3)], origin=(20, 20), chrome=False,
+                                 size=(520, 400))
+    right, _, _, _ = render_panel(63.0, 2, 5, [(0, 0, 2, 3), (0, 3, 1, 1)], origin=(20 + 4 * 63 + 12, 20),
+                                  chrome=False, size=(520, 400))
+    img = left.copy()
+    x0 = 20 + 4 * 63 + 12 - 2
+    img[:, x0:] = right[:, x0:]
+    y_top, y_bot = 20, 20 + 5 * 63
+    for y in (y_top, y_bot):
+        img[y, 20 + 4 * 63:20 + 4 * 63 + 13] = (84, 81, 73)
+    g = detect_grid(img)
+    spans = sorted((p.x0, p.x1, p.n_cols, p.n_rows) for p in g.panels)
+    assert len(g.panels) == 2, spans
+    assert [s[2] for s in spans] == [4, 2] and all(s[3] == 5 for s in spans)
+    assert abs(spans[1][0] - (20 + 4 * 63 + 12)) <= 1
