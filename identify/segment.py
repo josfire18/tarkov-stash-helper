@@ -70,6 +70,31 @@ def _edge_fraction(lm: np.ndarray, vertical: bool, pos: int, a: int, b: int, sla
     return float(seg.mean())
 
 
+def _step_fraction(gray: np.ndarray, vertical: bool, pos: int, a: int, b: int, empty_before: bool,
+                   rise: float = 22.0) -> float:
+    """Fraction of a boundary segment where a thin line (1-2 px) is at least ``rise`` grey levels
+    brighter than the flat *empty* side (``empty_before``: the empty cell is the one before the
+    line, i.e. above / left of it)."""
+    H, W = gray.shape
+    a, b = max(0, a), max(a + 1, b)
+    d = -1 if empty_before else 1
+    best = None
+    for off in (-1, 0, 1):
+        p = pos + off
+        q1, q2 = p + d * 3, p + d * 5
+        lim = W if vertical else H
+        if not (0 <= q1 < lim and 0 <= q2 < lim and 0 <= p < lim):
+            continue
+        if vertical:
+            line, side = gray[a:b, p], 0.5 * (gray[a:b, q1] + gray[a:b, q2])
+        else:
+            line, side = gray[p, a:b], 0.5 * (gray[q1, a:b] + gray[q2, a:b])
+        ok = (line - side) >= rise
+        fr = float(ok.mean()) if ok.size else 0.0
+        best = fr if best is None else max(best, fr)
+    return best or 0.0
+
+
 def _otsu_1d(vals: np.ndarray, lo: float, hi: float) -> tuple[float, float]:
     """Otsu threshold of values in [0, 1] and its separability J = sigma_B^2 / sigma_T^2."""
     if vals.size < 4:
@@ -171,6 +196,26 @@ def segment_panel(img_bgr: np.ndarray, panel: Panel, panel_index: int = 0,
     if strict_c is not None and strict_c[0] >= 0.97:         # pristine capture: the exact model is decisive
         near = [strict_c]
     j, thr, fv, fh, _name = max(near, key=share)
+
+    # The border of an item that touches an *empty* slot is alpha-blended over the dark
+    # backdrop (stash1: (84,81,73) between items, ~(67,65,59) against an empty cell), so the
+    # exact-colour model misses it and the item would be merged with the empties.  Art cannot
+    # fake a line there (one side is flat dark), so on those edges a one-sided step test counts:
+    # a thin line clearly brighter than the empty side along the whole edge.
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    ridge_c = None
+    empty = {(c, r): cell_is_empty(img_bgr, panel.rect(c, r, 1, 1)) for r in range(nr) for c in range(nc)}
+    if any(empty.values()):
+        fv = dict(fv)
+        fh = dict(fh)
+        for (r, c), f in list(fv.items()):
+            e0, e1 = empty[(c - 1, r)], empty[(c, r)]
+            if f < thr and e0 != e1:
+                fv[(r, c)] = _step_fraction(gray, True, xs[c], ys[r] + 2, ys[r + 1] - 1, empty_before=e0)
+        for (r, c), f in list(fh.items()):
+            e0, e1 = empty[(c, r - 1)], empty[(c, r)]
+            if f < thr and e0 != e1:
+                fh[(r, c)] = _step_fraction(gray, False, ys[r], xs[c] + 2, xs[c + 1] - 1, empty_before=e0)
 
     dsu = _DSU(nc * nr)
     idx = lambda c, r: r * nc + c
