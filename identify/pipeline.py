@@ -54,6 +54,8 @@ W_OCR = 5.0
 OCR_POOL_DELTA = 7.0       # OCR may consider items whose residual is within this of the best
 RES_PLAUSIBLE = 8.5        # mean level error above which a visual match needs the label's support
 OCR_AUTH = 90.0            # fuzzy score at/above which a label is considered a real read
+LABEL_PARTIAL_CAP = 94.0   # best score a non-exact label match can get (exact = 100)
+LABEL_RIVAL_GAP = 5.0      # a label this much better than the chosen item's gets a say
 # logistic calibration of the reported confidence: p = sigmoid(b + sum(w * feature)); fitted by
 # `python -m identify.calibrate` on degraded variants of the labelled stash (see that module)
 CALIB = {'b': 1.753, 'margin': 0.372, 'res': -0.311, 'ocr': 3.225, 'dino': 0.947}
@@ -360,6 +362,11 @@ class Engine:
                        key=lambda c: -oscores[c.row])[:6]
         w['dset'] = list(cands[:K]) + extra
 
+    def _best_label(self, w, tile) -> float:
+        """Best label score any item gets from this tile's OCR reads."""
+        return max((max(self._label_hits(t, tile.W).values(), default=0.0)
+                    for t in (w.get('ocr_all') or [])), default=0.0)
+
     def _label_hits(self, text: str, width: int = 1) -> dict:
         """item id -> fuzzy label score for the best matches of ``text`` among all
         catalog items (cached per text; presets excluded - they map to their base gun)."""
@@ -368,9 +375,16 @@ class Engine:
             rows = self._api_rows()
             idxs = ocr_mod.prefilter(text, self._api_fold, limit=80, folded=True)
             h = {}
+            exact = ocr_mod.canon_nospace(text)
             for i in idxs:
                 r = int(rows[i])
                 sc = ocr_mod.fuzzy_score(text, str(self.cat.names[r]), str(self.cat.shorts[r]), width)
+                # Only a read that IS the printed short name may score 100: a partial or
+                # truncated match ("Scdr." inside "F scdr.") must not tie the exact one.
+                if exact and ocr_mod.canon_nospace(str(self.cat.shorts[r])) == exact:
+                    sc = 100.0
+                else:
+                    sc = min(sc, LABEL_PARTIAL_CAP)
                 if sc >= 40:
                     iid = str(self.cat.ids[r])
                     if sc > h.get(iid, -1.0):
@@ -416,7 +430,7 @@ class Engine:
             auth = self._label_authority(w.get('ocr_all') or [], tile,
                                          prefer_weapon=str(cat.cats[c.row]) in ('weapon', 'build'),
                                          res_by_row=_best_res_by_id(cat, cands))
-        elif text and (o is None or o < 60):
+        elif text and (o is None or o < 60 or o < self._best_label(w, tile) - LABEL_RIVAL_GAP):
             # label conflict: the picture says one thing, a clean unambiguous printed name
             # says another (e.g. a 2x1 suppressor whose label names a 1x1 flash hider)
             auth = self._label_authority(w.get('ocr_all') or [], tile, prefer_weapon=False,
