@@ -40,7 +40,8 @@ from . import dino as dino_mod
 from . import digits as digits_mod
 from . import ocr as ocr_mod
 from .catalog import Catalog, load_catalog
-from .config import EngineSettings, SLOT
+from .config import EngineSettings, LEARNED_PATH, SLOT
+from .learned import LearnedNames, content_key
 from .fir import detect_fir
 from .grid import GridResult, detect_grid
 from .match import Cand, Tile, normalize_tile, stage1
@@ -56,6 +57,9 @@ RES_PLAUSIBLE = 8.5        # mean level error above which a visual match needs t
 OCR_AUTH = 90.0            # fuzzy score at/above which a label is considered a real read
 LABEL_PARTIAL_CAP = 94.0   # best score a non-exact label match can get (exact = 100)
 LABEL_RIVAL_GAP = 5.0      # a label this much better than the chosen item's gets a say
+LEARN_MAX_RES = 4.0        # stage-1 residual of a near-literal match to a cached icon
+NAMED_DINO_SLACK = 0.03    # a named candidate this close in DINO to a nameless winner may name it
+LEARN_DISTINCT = 2.0       # learn only if every different look-alike is at least this x worse
 # logistic calibration of the reported confidence: p = sigmoid(b + sum(w * feature)); fitted by
 # `python -m identify.calibrate` on degraded variants of the labelled stash (see that module)
 CALIB = {'b': 1.753, 'margin': 0.372, 'res': -0.311, 'ocr': 3.225, 'dino': 0.947}
@@ -134,6 +138,50 @@ class Engine:
         else:
             match_disable_torch()
         self._api_rows()
+        self.learned = LearnedNames(self.s.extra.get('learned_path', LEARNED_PATH))
+        self._row_key: dict = {}
+        self._apply_learned()
+
+    # ------------------------------------------------------------------
+    def _icon_key(self, row: int) -> str | None:
+        """Content key of a cached-icon row (None for tarkov.dev rows)."""
+        if row not in self._row_key:
+            path = self.cat.meta.get('paths', {}).get(int(row))
+            self._row_key[row] = content_key(path) if path and self.cat.src[row] != 'api' else None
+        return self._row_key[row]
+
+    def _name_row(self, row: int, item_id: str) -> bool:
+        """Point catalog row ``row`` at the api item ``item_id`` (in memory)."""
+        a = self._id_row.get(item_id)
+        if a is None:
+            return False
+        c = self.cat
+        for arr in (c.ids, c.names, c.shorts, c.cats, c.tint):
+            arr[row] = arr[a]
+        c.src[row] = 'cache'
+        return True
+
+    def _apply_learned(self) -> None:
+        """Name every cached icon the store has a confirmed item for, overriding
+        both anonymous builds and stale guessed associations."""
+        if not self.learned.data:
+            return
+        c = self.cat
+        for r in np.where(c.src != 'api')[0]:
+            iid = self.learned.get(self._icon_key(int(r)))
+            if iid and str(c.ids[r]) != iid:
+                self._name_row(int(r), iid)
+
+    def _learn(self, row: int, item_id: str, residual: float, label_score: float, twins: int) -> None:
+        """Record a cached icon's item when the evidence is literal: the tile is a
+        near pixel-exact match to that icon AND its label is an exact, unique read."""
+        if (self.cat.src[row] == 'api' or residual > LEARN_MAX_RES
+                or label_score < 100.0 or twins != 1):
+            return
+        key = self._icon_key(row)
+        if key and self.learned.learn(key, item_id, str(self.cat.names[self._id_row[item_id]])
+                                      if item_id in self._id_row else item_id):
+            self._name_row(row, item_id)
 
     # ------------------------------------------------------------------
     def _use_dino(self) -> bool:
@@ -452,7 +500,28 @@ class Engine:
             o = sc
             chosen_row = row
         elif item_id == '':
-            evidence['note'] = 'modded item / build with unreadable label'
+            # A nameless cached render won on pixels but the label was unreadable: take the
+            # best *named* candidate that looks as much like the tile (same DINO, within noise).
+            named = [(S2, c2, d2) for S2, c2, d2, _ in scored
+                     if str(cat.ids[c2.row]) and d2 is not None and s_dino is not None
+                     and d2 >= s_dino - NAMED_DINO_SLACK]
+            if named:
+                _, c2, _ = named[0]
+                item_id, name, chosen_row = str(cat.ids[c2.row]), str(cat.names[c2.row]), c2.row
+                evidence['note'] = 'nameless cached icon; named by closest look-alike'
+            else:
+                evidence['note'] = 'modded item / build with unreadable label'
+        # Literal evidence teaches the cache: the tile is a near pixel-exact match to a cached
+        # icon and the label reads one item exactly -> that icon IS that item, from now on.
+        if item_id and (o or 0) >= 100.0:
+            # ...and it must be distinctive: look-alikes (loose rounds of different calibres)
+            # sit within a hair of each other, and learning one would teach the wrong name.
+            best = cands[0]
+            rival = next((c2.score for c2 in cands[1:]
+                          if str(cat.ids[c2.row]) != str(cat.ids[best.row])
+                          or cat.src[c2.row] == 'build'), 99.0)
+            if rival >= LEARN_DISTINCT * max(best.score, 0.5):
+                self._learn(int(best.row), item_id, float(best.score), float(o), twins)
         if item_id in self.preset_base:          # a default-build preset icon -> its base gun
             base = self.preset_base[item_id]
             evidence['preset'] = name

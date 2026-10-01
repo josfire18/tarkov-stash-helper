@@ -48,3 +48,7 @@ data/tasks_cache.json
 data/progress.json
 data/prestige_wiki.json
 data/eft_hash_status.json
+
+# per-user: cache icons named from confirmed scans
+data/learned_icons.json
+data/learned_icons.json.tmp

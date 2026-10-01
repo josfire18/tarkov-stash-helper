@@ -34,6 +34,7 @@ TMPL_SRC_DIR = os.path.join(DATA_DIR, 'tmpl_src')
 PRICES_PATH = os.path.join(DATA_DIR, 'prices_cache.json')
 CATALOG_PATH = os.path.join(DATA_DIR, 'identify_catalog_v2.npz')
 EMB_PATH = os.path.join(DATA_DIR, 'identify_dino_v2.npz')
+LEARNED_PATH = os.path.join(DATA_DIR, 'learned_icons.json')   # cache icon -> item, from confirmed scans
 
 CATALOG_SCHEMA = 6             # bump when the .npz layout / semantics change
 STAGE1_SLOT = 32               # px/slot of the stage-1 (MAD) template stacks
