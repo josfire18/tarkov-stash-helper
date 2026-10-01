@@ -1858,6 +1858,10 @@ def scan_with_v2(img_bgr, settings, warnings):
     """
     from identify.config import EngineSettings
     from identify.pipeline import Engine
+    if not os.path.exists(PRICES_PATH) or next(os.scandir(TMPL_SRC_DIR), None) is None:
+        # clean install: the catalog is built from the price list + tarkov.dev base images
+        raise ScanError("The item database isn't built yet. Open the Sell Advisor page and click "
+                        "'Build Icon DB' first (needs internet; takes a few minutes the first time).")
     es = EngineSettings.from_settings(settings)
     if tesseract_path_override():
         es.tesseract_cmd = tesseract_path_override()
@@ -3941,6 +3945,7 @@ def icons_build_index():
             _invalidate_pitch_cache()   # pitch-resampled copies of the old DB are stale
             _index_build_state['done'] = _index_build_state['total']
             print(f"[icon_db] built: {sum(len(b['ids']) for b in db.values())} items")
+            _warm_v2_engine()
         except Exception as e:
             _index_build_state['error'] = str(e)
             print(f"[icon_db] build failed: {e}")
@@ -4152,7 +4157,7 @@ app.register_blueprint(autoscan.make_blueprint(
 
 
 HOST = '127.0.0.1'
-PORT = 8877
+PORT = int(os.environ.get('TSH_PORT', 8877))   # env override: smoke tests next to a running instance
 URL = f'http://{HOST}:{PORT}'
 
 
@@ -4184,6 +4189,10 @@ def _startup_maintenance():
         print(f"[kappa] startup sync skipped (offline?): {e}")
     # Warm the v2 identification engine (loads/builds the template catalog - ~35 s the first
     # time - and the optional DINO model) so the first hotkey scan isn't the one that pays for it.
+    _warm_v2_engine()
+
+
+def _warm_v2_engine():
     try:
         if identify_engine(load_json(SETTINGS_PATH, default_settings)) == 'v2' and os.path.exists(PRICES_PATH):
             from identify.config import EngineSettings
@@ -4286,6 +4295,9 @@ def _run_app():
 
 
 if __name__ == '__main__':
+    if '--selftest' in sys.argv:    # packaged-build smoke test: no window/tray/hotkey (selftest.py)
+        import selftest
+        sys.exit(selftest.main(sys.modules[__name__], sys.argv[sys.argv.index('--selftest') + 1:]))
     # Packaged windowed builds (PyInstaller --windowed) have no console and
     # sys.stdout is None, so print() would raise — route output to a log file.
     if FROZEN and sys.stdout is None:
