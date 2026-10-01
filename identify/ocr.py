@@ -113,7 +113,68 @@ def variants_of(strip: np.ndarray) -> list[np.ndarray]:
     up front (plain 74 / Otsu 80 / either-best 91 mean fuzzy score on 21 hand-checked
     labels)."""
     b = cv2.threshold(strip, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    return [strip, b]
+    out = [strip, b]
+    iso = isolate_label(strip)
+    if iso is not None:
+        out.extend(iso)
+    return out
+
+
+def isolate_label(strip: np.ndarray) -> list[np.ndarray] | None:
+    """The printed short name alone, without the item art around it.
+
+    Labels are thin bright strokes with a dark outline, right-aligned against
+    the cell edge; item art in the band (a silver DVD drive, a white bottle) is
+    thick.  Keep bright pixels that survive removal of thick bright regions,
+    take the run of text columns that starts at the right edge, and return that
+    crop as grey and as clean black-on-white text.  None if no text run is found.
+    """
+    g = 255 - strip                                   # back to original brightness
+    h, wd = g.shape
+    # label white is ~150-200 after scaling, so the cut comes from the strip itself
+    thr = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0]
+    bright = (g > max(110.0, thr)).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(bright, connectivity=8)
+    glyph = np.zeros(n, bool)
+    for i in range(1, n):
+        x, y, bw, bh, area = st[i]
+        letter_sized = 0.3 * h <= bh <= 0.9 * h       # letters may merge into a word: no width cap
+        sparse = area < 0.6 * bw * bh                 # strokes with gaps, not a solid blob
+        art = y + bh >= h - 1 or not sparse           # runs off the band, or solid
+        glyph[i] = letter_sized and not art
+    if not glyph.any():
+        return None
+    gy0 = min(st[i][1] for i in range(1, n) if glyph[i])
+    gy1 = max(st[i][1] + st[i][3] for i in range(1, n) if glyph[i])
+    gx0 = min(st[i][0] for i in range(1, n) if glyph[i])
+    for i in range(1, n):                             # hyphens, dots, apostrophes inside the run
+        x, y, bw, bh, area = st[i]
+        if not glyph[i] and bh < 0.3 * h and x >= gx0 - h * 0.6 and y >= gy0 and y + bh <= gy1:
+            glyph[i] = True
+    text = glyph[lab].astype(np.uint8)
+    cols = text.sum(axis=0) > 0
+    if not cols.any():
+        return None
+    gap_max = max(6, int(round(h * 0.55)))            # a word space, not the gap to the art
+    x1 = int(np.nonzero(cols)[0][-1])
+    if x1 < g.shape[1] * 0.6:                         # labels start at the right edge
+        return None
+    x0, gap = x1, 0
+    for x in range(x1, -1, -1):
+        if cols[x]:
+            x0, gap = x, 0
+        else:
+            gap += 1
+            if gap > gap_max:
+                break
+    pad = max(4, h // 10)
+    a, z = max(0, x0 - pad), min(g.shape[1], x1 + pad + 1)
+    if z - a < h * 0.4:
+        return None
+    crop = strip[:, a:z]
+    clean = np.full(crop.shape, 255, np.uint8)
+    clean[cv2.dilate(text[:, a:z], np.ones((2, 2), np.uint8)) > 0] = 0
+    return [crop, clean]
 
 
 # --------------------------------------------------------------------------
