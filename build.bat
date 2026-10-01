@@ -16,6 +16,7 @@ echo Building TarkovStashHelper.exe...
   --name TarkovStashHelper ^
   --icon assets\icon.ico ^
   --add-data "templates;templates" ^
+  --add-data "identifyssets;identifyssets" ^
   app.py
 echo.
 echo Done. Output: dist\TarkovStashHelper.exe

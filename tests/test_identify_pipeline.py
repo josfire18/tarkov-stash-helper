@@ -147,3 +147,17 @@ def test_fir_detector_three_valued():
         t2 = np.full((64, 64, 3), 25, np.uint8)
         t2[corner_y:corner_y + g.shape[0], 64 - 3 - g.shape[1]:64 - 3] = g[..., None]
         assert detect_fir(t2) is True
+
+
+def test_frames_without_a_stash_return_nothing_and_do_not_crash(world):
+    cat, _ = world
+    eng = engine(cat)
+    for img in (np.zeros((100, 100, 3), np.uint8), np.full((480, 640, 3), 90, np.uint8),
+                np.random.default_rng(0).integers(0, 255, (300, 300, 3)).astype(np.uint8)):
+        res = eng.scan(img)
+        assert res.detections == [] and res.grid.panels == []
+
+
+def test_package_level_scan_function_exists():
+    import identify
+    assert callable(identify.scan)

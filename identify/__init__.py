@@ -9,3 +9,11 @@ Pipeline (see :func:`identify.pipeline.scan`):
 5. ``pipeline`` - glue + calibrated confidence + ``Detection`` records
 """
 from .config import EngineSettings  # noqa: F401
+
+
+def scan(image, settings=None):
+    """Identify every item in a BGR screenshot -> ``list[Detection]`` (lazy import: torch /
+    Tesseract are only touched when the engine is first used)."""
+    from .pipeline import scan as _scan
+    return _scan(image, settings)
+

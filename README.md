@@ -41,18 +41,49 @@ python app.py
 
 ## How it works
 
-- `app.py` — Flask backend: screenshot capture (`mss`), stash-grid detection,
-  icon identification (masked NCC template matching against a catalog built
-  from tarkov.dev + EFT's local icon cache), OCR-based label fusion
-  (`pytesseract`) to resolve ambiguous matches, and price/sell-recommendation
-  logic.
-- `icon_cache.py` — reads EFT's local icon cache and visually associates each
-  cached icon with a tarkov.dev item ID.
-- The UI (`templates/`) is served locally and hosted in a native window via
-  `pywebview` — there's no browser tab or URL involved, it just looks like a
-  normal desktop app. A `pystray` tray icon handles minimize/reopen/quit.
-- `test_scan.py` — scoring harness for identification accuracy against
-  labeled screenshots in `data/eval/`.
+Item identification lives in the `identify/` package (the **v2** engine, default). Set
+`"identify_engine": "legacy"` in `data/settings.json` to fall back to the old masked-NCC
+icon DB that is still in `app.py`.
+
+1. `identify/grid.py` - finds the stash lattice from the 1 px border line EFT draws around
+   every item (colour range tolerant of the UI's top gradient, ridge fallbacks for
+   JPEG/resampled captures). Returns every panel with its pitch (per axis), all rows/columns
+   and viewport-clipped first/last rows.
+2. `identify/segment.py` - item footprints = cells joined across edges that have *no* border
+   line, so multi-cell items stay whole, identical neighbouring stacks stay separate and
+   rotated items need no special case. Empty cells are detected.
+3. `identify/catalog.py` - one `.npz` template catalog of **every** item (ammo, guns, presets
+   and containers included) from tarkov.dev base images plus EFT's icon cache (re-associated
+   to items on every build; unmatched cache renders are kept as anonymous "build" templates).
+   `data/identify_catalog_v2.npz` is rebuilt automatically when a source changes.
+4. `identify/match.py` + `ocr.py` + `dino.py` - stage 1 masked pixel residual against
+   same-footprint templates (overlay bands only down-weighted, background measured from the
+   tile), stage 2 DINOv2-small re-rank of the shortlist (optional: needs torch +
+   transformers; the exe ships without them), stage 3 OCR of the printed short name
+   (batched Tesseract, glyph-confusion-aware fuzzy match) which is authoritative for ammo
+   calibres and built weapons.
+5. `identify/pipeline.py` - `scan(image) -> list[Detection]` with footprint, rotation, item id,
+   calibrated confidence, an `uncertain` flag (a tile the catalog cannot explain is flagged,
+   not guessed), per-stage evidence, stack count and Found-in-Raid.
+
+Other pieces: `icon_cache.py` (legacy engine) reads EFT's local icon cache; the UI
+(`templates/`) is served locally and hosted in a native window via `pywebview`, with a
+`pystray` tray icon.
+
+## Evaluating / labelling
+
+```
+python -m pytest tests                                        # unit tests (no network, no game data)
+python test_scan.py --score data/eval/stash1.png --engine both  # v2 vs legacy, per-category metrics
+python test_scan.py --robustness data/eval/stash1.png          # JPEG / blur / rescale / stretch per stage
+python test_scan.py --prefill data/eval/new.png                # draft truth + contact sheets (crop | predicted icon | name)
+python test_scan.py --relabel data/eval/new.png fixes.json     # apply the corrections you read off the sheets
+python -m identify.calibrate data/eval/new.png                 # refit the confidence calibration
+```
+
+Truth files (`<name>.truth.full.json`) label *every* item with its pixel rectangle and mark
+items you cannot identify from the crop as `"uncertain": true` (excluded from accuracy, still
+counted for segmentation). See `identify/evaltools.py` for the format.
 
 ## Known limitations
 
@@ -60,3 +91,8 @@ python app.py
   Tesseract path are all Windows-specific).
 - OCR accuracy depends on screen resolution/scaling — a native-resolution
   capture of the stash region reads noticeably better than a downscaled one.
+- v2 needs about 50 px/slot or more (1080p UI scale 80%+) and, for JPEG captures, quality 70+;
+  below that the border lines are too degraded to segment reliably.
+- Items released after your last "Build Icon DB" / price refresh are not in the catalog; v2
+  flags them `uncertain` instead of guessing. Items that share an icon family (dogtags, colour
+  variants hidden under attachments) are flagged too.
