@@ -2086,6 +2086,7 @@ def default_settings():
         'skip_traders': ['Ref'],   # Ref pays GP coins, not roubles
         'trader_levels': {},       # e.g. {'Ref': 4} - only Ref's pay rate changes with loyalty level
         'identify_engine': 'v2',  # 'v2' (identify/ package) or 'legacy' (masked-NCC icon DB below)
+        'auto_scan': True,  # watch the game passively and scan the stash when it settles (autoscan/)
     }
 
 def default_keep_list():
@@ -3990,7 +3991,7 @@ def sell_scan():
     print(f"[sell_scan] ERROR:\n{tb}")
     return jsonify({'error': str(e), 'traceback': tb, 'image': None, 'results': [], 'grid': None})
 
-def _sell_scan_inner(from_calibration=False):
+def _sell_scan_inner(from_calibration=False, frame_bgr=None):
     settings = load_json(SETTINGS_PATH, default_settings)
 
     # --- Icon DB required (legacy engine only; v2 builds its own catalog) -----
@@ -4009,8 +4010,12 @@ def _sell_scan_inner(from_calibration=False):
 
         # --- Screenshot (region required for sell scans) ----------------------
         try:
-            img, img_bgr = capture_for_scan(settings, from_calibration,
-                                            require_region=True, warnings=warnings)
+            if frame_bgr is not None:      # full frame captured passively by autoscan.py
+                img_bgr = frame_bgr
+                img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+            else:
+                img, img_bgr = capture_for_scan(settings, from_calibration,
+                                                require_region=True, warnings=warnings)
         except ScanError as e:
             return jsonify({'image': None, 'results': [], 'grid': None,
                             'grid_failed': False, 'error': str(e)})
@@ -4125,6 +4130,27 @@ def _sell_scan_inner(from_calibration=False):
         _scan_state.update({'running': False, 'phase': None, 'ts': time.time()})
 
 
+# ---------------------------------------------------------------------------
+# Auto-scan (autoscan/): passive capture of the game window, scan on a settled stash
+# ---------------------------------------------------------------------------
+
+def _autoscan_scan(frame_bgr):
+    """Run the normal sell scan on an already-captured full frame; returns its JSON payload."""
+    with app.app_context():
+        return _sell_scan_inner(frame_bgr=frame_bgr).get_json()
+
+
+def _load_settings():
+    return load_json(SETTINGS_PATH, default_settings)
+
+
+import autoscan  # noqa: E402  (needs app + the helpers above)
+autoscanner = autoscan.AutoScanner(_autoscan_scan, _load_settings,
+                                   busy_fn=lambda: _scan_state['running'])
+app.register_blueprint(autoscan.make_blueprint(
+    autoscanner, _load_settings, lambda s: save_json(SETTINGS_PATH, s)))
+
+
 HOST = '127.0.0.1'
 PORT = 8877
 URL = f'http://{HOST}:{PORT}'
@@ -4188,6 +4214,10 @@ def _shutdown_desktop():
     quitting = _desktop.get('quitting')
     if quitting is not None:
         quitting.set()
+    try:
+        autoscanner.stop()      # releases the screen duplication
+    except Exception:
+        pass
     tray = _desktop.get('tray')
     if tray is not None:
         try:
@@ -4215,6 +4245,7 @@ def _run_app():
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=_startup_maintenance, daemon=True).start()
     start_hotkey_listener()
+    autoscanner.start()
 
     window = webview.create_window(
         'Tarkov Stash Helper', URL,

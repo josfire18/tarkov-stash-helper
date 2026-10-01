@@ -10,3 +10,4 @@ pystray
 pywebview
 opencv-python
 numpy
+dxcam
