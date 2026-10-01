@@ -51,23 +51,45 @@ class Item:
 # edge tests
 # --------------------------------------------------------------------------
 
-def _edge_fraction(lm: np.ndarray, vertical: bool, pos: int, a: int, b: int, slack: int = 1) -> float:
-    """Fraction of a boundary segment covered by the line mask.  ``pos`` is the line's x
-    (vertical boundary) or y, ``a..b`` the span along it; ``slack`` px either side absorb
-    sub-pixel lattice rounding and the 1-2 px smear of resampled captures."""
+def _edge_fraction(lm: np.ndarray, vertical: bool, pos: int, a: int, b: int, slack: int = 1,
+                   width: int = 1, thin: bool = True) -> float:
+    """Coverage of a boundary segment by the line mask: the best *straight* ``width``-px wide
+    strip within ``slack`` px of the nominal position (sub-pixel lattice rounding, the 1-2 px smear
+    of resampled captures), counting only positions where the line is thin.
+
+    ``pos`` is the line's x (vertical boundary) or y, ``a..b`` the span along it.  A drawn border
+    is one straight 1 px line, so (unlike "any mask pixel within +-1 px") art cannot fake it: a
+    diagonal hatch pattern or a grey strap crossing the edge covers only part of any single
+    column, and a grey *band* (cloth, a container lid) is rejected by ``thin``: a position whose
+    mask run continues 3 px away on both sides is a wide patch, not a line."""
     H, W = lm.shape
     a = max(0, a)
     b = max(a + 1, b)
-    lo, hi = pos - slack, pos + slack + 1
-    if vertical:
-        lo, hi = max(0, lo), min(W, hi)
-        seg = lm[a:b, lo:hi].any(axis=1) if hi > lo else None
-    else:
-        lo, hi = max(0, lo), min(H, hi)
-        seg = lm[lo:hi, a:b].any(axis=0) if hi > lo else None
-    if seg is None or seg.size == 0:
+    K = slack + width + 3
+    n = W if vertical else H
+    if not (0 <= pos < n):
         return 0.0
-    return float(seg.mean())
+    lo, hi = pos - K, pos + K + 1
+    if vertical:
+        strip = lm[a:b, max(0, lo):min(W, hi)]
+    else:
+        strip = lm[max(0, lo):min(H, hi), a:b].T
+    if strip.size == 0:
+        return 0.0
+    if lo < 0:
+        strip = np.pad(strip, ((0, 0), (-lo, 0)))
+    if hi > n:
+        strip = np.pad(strip, ((0, 0), (0, hi - n)))
+    best = 0.0
+    for s0 in range(-slack, slack + 1):
+        c0 = K + s0
+        hit = strip[:, c0]
+        for k in range(1, width):
+            hit = hit | strip[:, c0 + k]
+        if thin:
+            hit = hit & ~(strip[:, c0 - 3] & strip[:, c0 + width - 1 + 3])
+        best = max(best, float(hit.mean()))
+    return best
 
 
 def _step_fraction(gray: np.ndarray, vertical: bool, pos: int, a: int, b: int, empty_before: bool,
