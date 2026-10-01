@@ -37,7 +37,7 @@ LINE_HI = (114, 104, 94)
 
 RUN = 6                    # min vertical/horizontal run of line colour, in decimated samples
 MIN_LINES = 4              # lattice lines needed on EACH axis (= 3x3 cells)
-MIN_RATIO = 0.5            # inlier lines / strong peaks on each axis (lattice consistency)
+MIN_HEIGHT = 2.0           # each of the MIN_LINES tallest lattice lines must be this many cells long
 PITCH_REF_H = 1080.0       # EFT's UI is laid out for 1080 px height ...
 SLOT_REF = 63.0            # ... where one slot is 63 px
 PITCH_LO_SCALE = 0.45      # plausible UI scale range, relative to the 1080p layout
@@ -56,6 +56,7 @@ class AxisFit:
     n_peaks: int           # strong peaks (lattice or not)
     strength: float        # mean ridge height of the lattice lines, in samples
     ratio: float = 0.0     # share of the strong peaks' height the lattice explains
+    heights: tuple = ()    # inlier line heights, tallest first, in cells of line length
 
 
 @dataclass
@@ -127,7 +128,7 @@ def _peaks(proj: np.ndarray, min_val: float, min_sep: int) -> list[tuple[float, 
 
 
 def fit_lattice(peaks: list[tuple[float, float]], pitch_lo: float, pitch_hi: float,
-                rel_floor: float = 0.15) -> AxisFit | None:
+                step: int = 1, rel_floor: float = 0.15) -> AxisFit | None:
     """Best regular lattice through the peak positions, weighted by peak height.
 
     Real border lines are long, so they are the tallest peaks; art edges and text are short.
@@ -183,8 +184,10 @@ def fit_lattice(peaks: list[tuple[float, float]], pitch_lo: float, pitch_hi: flo
     kk = np.round((sel - sel[0]) / P)
     if len(np.unique(kk)) >= 2:                # refine the pitch through the inlier lattice indices
         P = float(np.polyfit(kk, sel, 1)[0])
+    cell = P / step                            # samples per cell along a line
+    hs = tuple(sorted((float(x) / cell for x in hgt[inl]), reverse=True))
     return AxisFit(int(inl.sum()), float(P), float(sel.min()), float(sel.max()), n,
-                   float(hgt[inl].mean()), float(hgt[inl].sum() / hgt.sum()))
+                   float(hgt[inl].mean()), float(hgt[inl].sum() / hgt.sum()), hs)
 
 
 # --------------------------------------------------------------------------
@@ -235,9 +238,9 @@ def menu_chrome(frame: np.ndarray) -> bool:
 class InventoryDetector:
     """``detect(frame) -> Detection`` for BGR frames of any size >= ~640x360."""
 
-    def __init__(self, min_lines: int = MIN_LINES, min_ratio: float = MIN_RATIO):
+    def __init__(self, min_lines: int = MIN_LINES, min_height: float = MIN_HEIGHT):
         self.min_lines = min_lines
-        self.min_ratio = min_ratio
+        self.min_height = min_height
 
     def detect(self, frame: np.ndarray, with_chrome: bool = True) -> Detection:
         t0 = time.perf_counter()
@@ -255,8 +258,8 @@ class InventoryDetector:
         vx = _line_projection(np.ascontiguousarray(frame[::s]), 0)
         # horizontal lines: every s-th column (rows stay full resolution -> y in real pixels)
         hy = _line_projection(np.ascontiguousarray(frame[:, ::s]), 1)
-        px = fit_lattice(_peaks(vx, min_val, min_sep), lo, hi)
-        py = fit_lattice(_peaks(hy, min_val, min_sep), lo, hi)
+        px = fit_lattice(_peaks(vx, min_val, min_sep), lo, hi, s)
+        py = fit_lattice(_peaks(hy, min_val, min_sep), lo, hi, s)
         det = self._decide(px, py)
         det.ms = (time.perf_counter() - t0) * 1e3
         if with_chrome and det.is_inventory:
@@ -267,14 +270,12 @@ class InventoryDetector:
     def _decide(self, px: AxisFit | None, py: AxisFit | None) -> Detection:
         if px is None or py is None:
             return Detection(False, 0.0, px, py, reason='no lattice on ' + ('x' if px is None else 'y'))
-        n = min(px.n_lines, py.n_lines)
-        ratio = min(px.ratio, py.ratio)
-        score = min(1.0, n / 12.0) * ratio
-        stretch = px.pitch / py.pitch
-        if n < self.min_lines:
-            return Detection(False, score, px, py, reason='too few lattice lines')
-        if ratio < self.min_ratio:
-            return Detection(False, score, px, py, reason='lattice explains too few lines')
-        if not 0.6 <= stretch <= 2.2:
-            return Detection(False, score, px, py, reason='implausible pitch ratio')
+        # The k-th tallest lattice line, in cells of line length: a real inventory has >= 4 border
+        # lines on each axis that each run for >= 2 cells; raid scenes (measured on ~400 frames of
+        # 720p-1440p recordings) never reach 1.5 and real screens never fall below 2.3.
+        hx = px.heights[self.min_lines - 1] if len(px.heights) >= self.min_lines else 0.0
+        hy = py.heights[self.min_lines - 1] if len(py.heights) >= self.min_lines else 0.0
+        score = min(1.0, min(hx, hy) / (2.0 * self.min_height))
+        if min(hx, hy) < self.min_height:
+            return Detection(False, score, px, py, reason='lattice lines too short')
         return Detection(True, score, px, py)
