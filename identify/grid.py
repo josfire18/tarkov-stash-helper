@@ -474,6 +474,13 @@ def _build_panel(hmc: np.ndarray, vmc: np.ndarray, ax: _Axis, ay: _Axis) -> Pane
     if rows_all is None:
         return None
     ymin, ymax = rows_all
+    # the top/bottom border itself is a horizontal line, which the vertical-run mask does not
+    # contain: pull the extent out to a horizontal line directly adjacent to it
+    hrows = np.where(hmc.any(axis=1))[0]
+    near_top = hrows[(hrows >= ymin - 3) & (hrows < ymin)]
+    near_bot = hrows[(hrows > ymax) & (hrows <= ymax + 3)]
+    ymin = int(near_top.min()) if near_top.size else ymin
+    ymax = int(near_bot.max()) if near_bot.size else ymax
     if ymax - ymin < 0.5 * py:
         return None
 

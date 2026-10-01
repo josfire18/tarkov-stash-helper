@@ -79,8 +79,9 @@ def label_strip(img_bgr: np.ndarray, rect: tuple, pitch_x: float, pitch_y: float
     if x1 - x0 < 6 or y1 - y0 < 5:
         return None
     g = cv2.cvtColor(img_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
-    f = UP * SLOT / max(pitch_y, 1.0)            # normalise to ~5x of the 63 px design size
-    g = cv2.resize(g, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC)
+    # normalise each axis to ~5x of the 63 px design size (undoes a stretched 4:3 -> 16:9 capture)
+    g = cv2.resize(g, None, fx=UP * SLOT / max(pitch_x, 1.0), fy=UP * SLOT / max(pitch_y, 1.0),
+                   interpolation=cv2.INTER_CUBIC)
     return 255 - g
 
 
@@ -286,15 +287,20 @@ def fuzzy_score(ocr: str, name: str, short: str = '', width: int | None = None) 
 
 
 def prefilter(ocr: str, choices: list[str], limit: int = 25, folded: bool = False) -> list[int]:
-    """Indices of the ``limit`` most plausible names for an OCR string (cheap C-speed
-    shape-folded partial match); the weighted alignment then runs on those only."""
+    """Indices of the most plausible names for an OCR string: the union of the best ``limit``
+    by whole-string ratio (right for complete labels, 'M395' -> 'M995') and by partial ratio
+    (right for truncated labels).  Cheap C-speed shape-folded matching; the weighted
+    alignment then runs on these only."""
     if not choices:
         return []
     if process is None:
-        return list(range(min(limit, len(choices))))
+        return list(range(min(2 * limit, len(choices))))
     q = fold(ocr)
     if len(q) < 2:
         return []
-    res = process.extract(q, choices if folded else [fold(c) for c in choices],
-                          scorer=fuzz.partial_ratio, limit=limit, score_cutoff=55)
-    return [i for _, _, i in res]
+    ch = choices if folded else [fold(c) for c in choices]
+    out = {}
+    for scorer in (fuzz.ratio, fuzz.partial_ratio):
+        for _, _, i in process.extract(q, ch, scorer=scorer, limit=limit, score_cutoff=55):
+            out[i] = True
+    return list(out)

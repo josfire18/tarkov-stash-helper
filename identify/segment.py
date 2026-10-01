@@ -151,17 +151,24 @@ def segment_panel(img_bgr: np.ndarray, panel: Panel, panel_index: int = 0,
             continue
         fv, fh = fractions(mh, mv)
         vals = np.array(list(fv.values()) + list(fh.values()), np.float64)
-        t, j = _otsu_1d(vals, 0.55, 0.9)
+        t, j = _otsu_1d(vals, 0.3, 0.9)
         cands.append((j, t, fv, fh, name))
-    jmax = max(c[0] for c in cands)
+    # A model that "separates" the classes only because it finds almost no lines at all (JPEG
+    # destroyed the thin line under the exact-colour test) is useless: in a real panel most
+    # interior boundaries are drawn (stash1: 77 %), so require a plausible share of lines.
+    def share(c):
+        vals = list(c[2].values()) + list(c[3].values())
+        return sum(1 for f in vals if f >= c[1]) / max(1, len(vals))
+    plausible = [c for c in cands if share(c) >= 0.3] or [max(cands, key=share)]
+    jmax = max(c[0] for c in plausible)
     # among the models that separate the two classes about equally well, take the most
     # inclusive one (more drawn lines recognised): a hue-agnostic ridge also sees the
     # orange 'attention' frames the neutral models lose after JPEG
-    near = [c for c in cands if c[0] >= jmax - 0.04]
-    if cands[0][4] == 'strict' and cands[0][0] >= 0.97:      # pristine capture: the exact model is decisive
-        near = [cands[0]]
-    j, thr, fv, fh, _name = max(near, key=lambda c: sum(1 for f in list(c[2].values()) + list(c[3].values())
-                                                        if f >= c[1]))
+    near = [c for c in plausible if c[0] >= jmax - 0.04]
+    strict_c = next((c for c in plausible if c[4] == 'strict'), None)
+    if strict_c is not None and strict_c[0] >= 0.97:         # pristine capture: the exact model is decisive
+        near = [strict_c]
+    j, thr, fv, fh, _name = max(near, key=share)
 
     dsu = _DSU(nc * nr)
     idx = lambda c, r: r * nc + c

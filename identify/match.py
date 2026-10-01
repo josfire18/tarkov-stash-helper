@@ -31,7 +31,7 @@ from .config import STAGE1_SLOT
 from .masks import band_rows, residual_weights
 
 S = STAGE1_SLOT
-REFINE = 160          # candidates kept after the coarse pass
+REFINE = 48           # candidates kept after the coarse pass
 
 
 @dataclass
@@ -102,20 +102,23 @@ def estimate_bg(tile: Tile) -> np.ndarray:
 _coarse_cache: dict[int, tuple] = {}
 
 
-def _pool2(a: np.ndarray) -> np.ndarray:
+COARSE = 4             # numpy path: first pass at 32/4 = 8 px/slot over every template
+
+
+def _pool(a: np.ndarray, f: int = COARSE) -> np.ndarray:
     n, h, w = a.shape[:3]
-    h2, w2 = h // 2, w // 2
-    a = a[:, :h2 * 2, :w2 * 2].astype(np.float32)
+    h2, w2 = h // f, w // f
+    a = a[:, :h2 * f, :w2 * f].astype(np.float32)
     if a.ndim == 4:
-        return a.reshape(n, h2, 2, w2, 2, -1).mean(axis=(2, 4))
-    return a.reshape(n, h2, 2, w2, 2).mean(axis=(2, 4))
+        return a.reshape(n, h2, f, w2, f, -1).mean(axis=(2, 4))
+    return a.reshape(n, h2, f, w2, f).mean(axis=(2, 4))
 
 
 def _coarse(stack: SizeStack) -> tuple[np.ndarray, np.ndarray]:
     k = id(stack)
     c = _coarse_cache.get(k)
     if c is None or c[0] is not stack:
-        c = (stack, _pool2(stack.prem), _pool2(stack.alpha))
+        c = (stack, _pool(stack.prem), _pool(stack.alpha))
         if len(_coarse_cache) > 64:
             _coarse_cache.clear()
         _coarse_cache[k] = c
@@ -127,18 +130,21 @@ BG_ALPHA_MAX = 12      # alpha (0-255) below which a template pixel counts as "b
 
 
 def _residual(prem: np.ndarray, alpha: np.ndarray, tile: np.ndarray, bg0: np.ndarray,
-              wp: np.ndarray, wn: np.ndarray, norm: float) -> np.ndarray:
+              wp: np.ndarray, wn: np.ndarray, norm: float, choose: np.ndarray | None = None):
     """Mean weighted abs residual of each template (axis 0) against the tile.
 
     The background is estimated *per template*: mean tile colour over the pixels where
     that template is transparent (a global strip estimate fails when the art touches
     the border strips - the 'Pile of meds' icon fills the whole tile).  Templates with
-    almost no transparent area fall back to the strip estimate ``bg0``."""
+    almost no transparent area fall back to the strip estimate ``bg0``.  Both estimates
+    are tried and the better one wins; ``choose`` (bool per template: use its own
+    estimate) skips the comparison when an earlier pass already decided.
+    Returns ``(residuals, choose)``."""
     a = alpha[..., None] * (1.0 / 255.0)
     m = ((alpha < BG_ALPHA_MAX) & (wp[None] > 0.5)).astype(np.float32)
     cnt = m.sum(axis=(1, 2))
     s_t = (m[..., None] * tile[None]).sum(axis=(1, 2))
-    bgc = np.where((cnt >= BG_MIN_PIXELS)[:, None], s_t / np.maximum(cnt, 1)[:, None], bg0[None])
+    own = np.where((cnt >= BG_MIN_PIXELS)[:, None], s_t / np.maximum(cnt, 1)[:, None], bg0[None])
 
     def one(bg):
         pred = prem + (1.0 - a) * bg[:, None, None, :]
@@ -146,7 +152,10 @@ def _residual(prem: np.ndarray, alpha: np.ndarray, tile: np.ndarray, bg0: np.nda
         r = np.maximum(d, 0) * wp[None, ..., None] + np.maximum(-d, 0) * wn[None, ..., None]
         return r.sum(axis=(1, 2, 3)) / (3.0 * norm)
 
-    return np.minimum(one(np.broadcast_to(bg0, bgc.shape)), one(bgc))
+    if choose is not None:
+        return one(np.where(choose[:, None], own, bg0[None])), choose
+    r0, r1 = one(np.broadcast_to(bg0, own.shape)), one(own)
+    return np.minimum(r0, r1), r1 < r0
 
 
 # --------------------------------------------------------------------------
@@ -170,6 +179,11 @@ def enable_torch(device: str | None = None) -> bool:
         return False
     _torch_state.update(dev=dev, torch=torch, stacks={})
     return True
+
+
+def disable_torch() -> None:
+    """Back to the pure numpy stage 1."""
+    _torch_state.update(dev=None, torch=None, stacks={})
 
 
 def torch_active() -> bool:
@@ -224,8 +238,10 @@ def _crop_stack(prem: np.ndarray, alpha: np.ndarray, tile: Tile):
     return prem[:, -v:], alpha[:, -v:]
 
 
-def score_stack(stack: SizeStack, tile: Tile) -> np.ndarray:
-    """Residual of every template in ``stack`` against ``tile`` (coarse then fine)."""
+def score_stack(stack: SizeStack, tile: Tile, force: np.ndarray | None = None) -> np.ndarray:
+    """Residual of every template in ``stack`` against ``tile`` (coarse then fine on the numpy
+    path).  ``force`` = boolean mask of templates that must be scored exactly even when the
+    coarse pass would drop them (items whose printed name matched the label)."""
     prem, alpha = _crop_stack(stack.prem, stack.alpha, tile)
     n = prem.shape[0]
     h, w = tile.img.shape[:2]
@@ -240,24 +256,28 @@ def score_stack(stack: SizeStack, tile: Tile) -> np.ndarray:
     if n > REFINE:
         cp, ca = _coarse(stack)
         if tile.clip:
-            v2 = tile.vis_rows // 2
+            v2 = tile.vis_rows // COARSE
             cp, ca = (cp[:, :v2], ca[:, :v2]) if tile.clip == 'bottom' else (cp[:, -v2:], ca[:, -v2:])
         th, tw = cp.shape[1:3]
         t2 = cv2.resize(timg, (tw, th), interpolation=cv2.INTER_AREA)
         wp2 = cv2.resize(wp, (tw, th), interpolation=cv2.INTER_AREA)
         wn2 = cv2.resize(wn, (tw, th), interpolation=cv2.INTER_AREA)
-        coarse = _residual(cp, ca, t2, tile.bg, wp2, wn2, float((wn2 > 0.5).sum()))
+        coarse, own = _residual(cp, ca, t2, tile.bg, wp2, wn2, float((wn2 > 0.5).sum()))
         keep = np.argpartition(coarse, REFINE)[:REFINE]
+        if force is not None and force.any():
+            keep = np.union1d(keep, np.where(force)[0])
         res = np.full(n, 1e3, np.float32)
-        res[keep] = _residual(prem[keep].astype(np.float32), alpha[keep].astype(np.float32),
-                              timg, tile.bg, wp, wn, norm)
+        res[keep], _ = _residual(prem[keep].astype(np.float32), alpha[keep].astype(np.float32),
+                                 timg, tile.bg, wp, wn, norm, choose=own[keep])
         return res
-    return _residual(prem.astype(np.float32), alpha.astype(np.float32), timg, tile.bg, wp, wn, norm)
+    return _residual(prem.astype(np.float32), alpha.astype(np.float32), timg, tile.bg, wp, wn, norm)[0]
 
 
-def stage1(cat: Catalog, tile: Tile, top_k: int | None = 10, rotations: bool = True) -> list[Cand]:
+def stage1(cat: Catalog, tile: Tile, top_k: int | None = 10, rotations: bool = True,
+           force_ids: set | None = None) -> list[Cand]:
     """Distinct items ranked by residual (one entry per item id; anonymous ``build``
-    templates stay separate).  ``top_k=None`` returns every item of the footprint."""
+    templates stay separate).  ``top_k=None`` returns every item of the footprint
+    (numpy path: items pruned by the coarse pass carry a residual of 1000 unless forced)."""
     heights = [tile.H] if not tile.clip else [tile.H + k for k in range(0, 4)]
     best: dict[str, Cand] = {}
     for Hh in heights:
@@ -265,7 +285,10 @@ def stage1(cat: Catalog, tile: Tile, top_k: int | None = 10, rotations: bool = T
             if tile.clip and st.rotated is False and st.H != Hh:
                 continue
             sub_tile = tile if not tile.clip else Tile(tile.img, tile.W, Hh, tile.clip, tile.vis_rows, tile.bg)
-            res = score_stack(st, sub_tile)
+            force = None
+            if force_ids:
+                force = np.fromiter((str(cat.ids[r]) in force_ids for r in st.idx), bool, len(st.idx))
+            res = score_stack(st, sub_tile, force)
             order = np.argsort(res)[:(max(top_k * 3, 30) if top_k else len(res))]
             for j in order:
                 row = int(st.idx[j])

@@ -45,7 +45,7 @@ class EngineSettings:
     use_dino: bool = True            # stage 2 (needs torch + transformers)
     use_ocr: bool = True             # stage 3 (needs pytesseract + Tesseract)
     accelerate: bool = True          # run stage 1 on the GPU when torch+CUDA are importable
-    top_k: int = 10                  # candidates handed from stage 1 to stage 2
+    top_k: int = 16                  # candidates handed from stage 1 to stage 2
     uncertain_below: float = 0.80    # calibrated confidence below this => uncertain
     pitch_hint: float | None = None  # expected px/slot when the UI scale is known
     device: str | None = None        # 'cuda' | 'cpu' | None (auto)
