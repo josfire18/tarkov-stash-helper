@@ -233,6 +233,7 @@ class Engine:
         ones and everything for viewport-clipped tiles are embedded on the fly."""
         if self.store is None:
             self.store = dino_mod.EmbeddingStore(self.cat)
+        self._associate_builds()
         q_imgs, q_idx = [], []
         for i, w in enumerate(work):
             hi = _hi_tile(img_bgr, w['it'], w['panel'], w['tile'])
@@ -274,6 +275,45 @@ class Engine:
                 if v is not None:
                     sims[(c.row, c.rot)] = float(qe[qi] @ v)
             work[i]['sims'] = sims
+
+    # ------------------------------------------------------------------
+    BUILD_SIM, BUILD_MARGIN = 0.90, 0.08
+
+    def _associate_builds(self) -> None:
+        """Give anonymous cache renders their item once, by picture.
+
+        The cache re-association at catalog build time only links a render that is nearly
+        pixel-identical to one tarkov.dev icon.  Many barter / loot items are rendered by the
+        game differently from the web icon and stay anonymous 'build' templates, which can then
+        only be named from an OCR read (and are flagged uncertain when that fails).  Here a
+        non-weapon build is assigned to the api item of the same footprint whose DINO embedding
+        is very close *and* clearly closer than any differently-named item.  Weapon builds
+        (modded guns) are never assigned: their identity is the label's job.  In-memory only."""
+        if getattr(self, '_builds_done', False) or self.store is None:
+            return
+        self._builds_done = True
+        c = self.cat
+        builds = [int(r) for r in np.where(c.src == 'build')[0]]
+        api = np.where((c.src == 'api') & (~c.preset) & (c.cats != 'weapon'))[0]
+        if not builds or not len(api):
+            return
+        Eb = self.store.get(builds)
+        Ea = self.store.get([int(r) for r in api])
+        for i, r in enumerate(builds):
+            same = [j for j, a in enumerate(api)
+                    if (c.tw[a], c.th[a]) == (c.tw[r], c.th[r]) or (c.tw[a], c.th[a]) == (c.th[r], c.tw[r])]
+            if len(same) < 2:
+                continue
+            sims = Ea[same] @ Eb[i]
+            order = np.argsort(-sims)
+            best = same[int(order[0])]
+            bname = str(c.names[api[best]])
+            rival = max((float(sims[k]) for k in order if str(c.names[api[same[int(k)]]]) != bname), default=0.0)
+            if sims[order[0]] >= self.BUILD_SIM and sims[order[0]] - rival >= self.BUILD_MARGIN:
+                a = api[best]
+                for arr in (c.ids, c.names, c.shorts, c.cats):
+                    arr[r] = arr[a]
+                c.src[r] = 'cache'
 
     # ------------------------------------------------------------------
     def _prepare_pool(self, w) -> None:
@@ -374,11 +414,13 @@ class Engine:
         if cat.src[c.row] == 'build' or (str(cat.cats[c.row]) == 'weapon' and c.score > 3.0) \
                 or best_res > 9.0:
             auth = self._label_authority(w.get('ocr_all') or [], tile,
-                                         prefer_weapon=str(cat.cats[c.row]) in ('weapon', 'build'))
+                                         prefer_weapon=str(cat.cats[c.row]) in ('weapon', 'build'),
+                                         res_by_row=_best_res_by_id(cat, cands))
         elif text and (o is None or o < 60):
             # label conflict: the picture says one thing, a clean unambiguous printed name
             # says another (e.g. a 2x1 suppressor whose label names a 1x1 flash hider)
-            auth = self._label_authority(w.get('ocr_all') or [], tile, prefer_weapon=False)
+            auth = self._label_authority(w.get('ocr_all') or [], tile, prefer_weapon=False,
+                                         res_by_row=_best_res_by_id(cat, cands))
             if auth is not None and str(cat.ids[auth[0]]) == str(cat.ids[c.row]):
                 auth = None
         item_id = str(cat.ids[c.row])
@@ -478,7 +520,7 @@ class Engine:
                         break
         return self._api
 
-    def _label_authority(self, texts: list, tile: Tile, prefer_weapon: bool):
+    def _label_authority(self, texts: list, tile: Tile, prefer_weapon: bool, res_by_row: dict | None = None):
         """Identity from the printed short name over *all* base items (any footprint no
         larger than the tile: a modded item draws bigger than its base; a viewport-clipped
         tile may hide up to 3 rows).  Needs a confident read (>= ``OCR_AUTH``) that beats
@@ -512,9 +554,35 @@ class Engine:
 
         def key(r):
             weap = str(cat.cats[r]) == 'weapon'
-            return (0 if (prefer_weapon and weap) else 1, abs(int(cat.tw[r]) * int(cat.th[r]) - area), r)
+            # equal-label twins (a loose round and its ammo pack share one short name): the
+            # picture decides - the twin whose icon is closest to the tile wins
+            rr = round(res_by_row.get(r, 99.0), 1) if res_by_row else 0.0
+            return (0 if (prefer_weapon and weap) else 1, abs(int(cat.tw[r]) * int(cat.th[r]) - area), rr, r)
         twins.sort(key=key)
         return twins[0], float(top), len(twins)
+
+
+def _best_res_by_id(cat, cands) -> dict:
+    """catalog 'api' row -> best stage-1 residual of any template of the same item (cache /
+    build templates are mapped back to their item), for resolving label twins by picture."""
+    ids = {}
+    for c in cands:
+        iid = str(cat.ids[c.row])
+        if iid and (iid not in ids or c.score < ids[iid]):
+            ids[iid] = c.score
+    return _ResByRow(cat, ids)
+
+
+class _ResByRow(dict):
+    def __init__(self, cat, ids):
+        super().__init__()
+        self._cat, self._ids = cat, ids
+
+    def get(self, row, default=None):
+        return self._ids.get(str(self._cat.ids[row]), default)
+
+    def __bool__(self):
+        return True
 
 
 TINT = dino_mod.TINT_BGR
