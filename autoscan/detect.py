@@ -128,7 +128,7 @@ def _peaks(proj: np.ndarray, min_val: float, min_sep: int) -> list[tuple[float, 
 
 
 def fit_lattice(peaks: list[tuple[float, float]], pitch_lo: float, pitch_hi: float,
-                step: int = 1, rel_floor: float = 0.15) -> AxisFit | None:
+                step: int = 1, cell_floor: float = 0.0, rel_floor: float = 0.15) -> AxisFit | None:
     """Best regular lattice through the peak positions, weighted by peak height.
 
     Real border lines are long, so they are the tallest peaks; art edges and text are short.
@@ -184,7 +184,7 @@ def fit_lattice(peaks: list[tuple[float, float]], pitch_lo: float, pitch_hi: flo
     kk = np.round((sel - sel[0]) / P)
     if len(np.unique(kk)) >= 2:                # refine the pitch through the inlier lattice indices
         P = float(np.polyfit(kk, sel, 1)[0])
-    cell = P / step                            # samples per cell along a line
+    cell = max(P, cell_floor) / step           # samples per (expected-size) cell along a line
     hs = tuple(sorted((float(x) / cell for x in hgt[inl]), reverse=True))
     return AxisFit(int(inl.sum()), float(P), float(sel.min()), float(sel.max()), n,
                    float(hgt[inl].mean()), float(hgt[inl].sum() / hgt.sum()), hs)
@@ -258,8 +258,8 @@ class InventoryDetector:
         vx = _line_projection(np.ascontiguousarray(frame[::s]), 0)
         # horizontal lines: every s-th column (rows stay full resolution -> y in real pixels)
         hy = _line_projection(np.ascontiguousarray(frame[:, ::s]), 1)
-        px = fit_lattice(_peaks(vx, min_val, min_sep), lo, hi, s)
-        py = fit_lattice(_peaks(hy, min_val, min_sep), lo, hi, s)
+        px = fit_lattice(_peaks(vx, min_val, min_sep), lo, hi, s, 0.7 * ref)
+        py = fit_lattice(_peaks(hy, min_val, min_sep), lo, hi, s, 0.7 * ref)
         det = self._decide(px, py)
         det.ms = (time.perf_counter() - t0) * 1e3
         if with_chrome and det.is_inventory:
@@ -275,7 +275,7 @@ class InventoryDetector:
         # 720p-1440p recordings) never reach 1.5 and real screens never fall below 2.3.
         hx = px.heights[self.min_lines - 1] if len(px.heights) >= self.min_lines else 0.0
         hy = py.heights[self.min_lines - 1] if len(py.heights) >= self.min_lines else 0.0
-        score = min(1.0, min(hx, hy) / (2.0 * self.min_height))
+        score = min(1.0, min(hx, hy) / (2.0 * max(self.min_height, 1e-6)))
         if min(hx, hy) < self.min_height:
             return Detection(False, score, px, py, reason='lattice lines too short')
         return Detection(True, score, px, py)
