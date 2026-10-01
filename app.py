@@ -1761,6 +1761,49 @@ def scan_all_panels(img_bgr, panels, matcher_db, label_matcher=None,
     return all_dets
 
 
+def identify_engine(settings):
+    """Which identification core a scan uses: 'v2' (default) or 'legacy'."""
+    e = (settings or {}).get('identify_engine', 'v2')
+    return e if e in ('v2', 'legacy') else 'v2'
+
+
+_v2_engine = [None, None]    # [settings key, Engine]
+
+
+def scan_with_v2(img_bgr, settings, warnings):
+    """
+    Run the v2 identification engine (identify/ package) and adapt its output to what the
+    scan routes consume: raw detections in the legacy shape (col,row,W,H,item_id,name,
+    rotated,score 0-100,fir,panel,px,py,pw,ph — plus uncertain/count), the panel list in
+    the legacy grid-dict shape, and whether the grid was found at all.
+    """
+    from identify.config import EngineSettings
+    from identify.pipeline import Engine
+    es = EngineSettings.from_settings(settings)
+    if tesseract_path_override():
+        es.tesseract_cmd = tesseract_path_override()
+    key = repr(es)
+    if _v2_engine[0] != key:
+        _v2_engine[:] = [key, Engine(es)]
+    res = _v2_engine[1].scan(img_bgr)
+    warnings.extend(res.warnings)
+    panels = [{**p.as_grid_dict(), 'strength': p.strength} for p in res.grid.panels]
+    if not panels:
+        warnings.append('Stash grid not detected — check the capture region covers '
+                        'the stash, or recalibrate.')
+        return [], [{'cell_w': 64.0, 'cell_h': 64.0, 'origin_x': 0.0, 'origin_y': 0.0,
+                     'x0': 0, 'y0': 0, 'x1': img_bgr.shape[1], 'y1': img_bgr.shape[0]}], True
+    print(f"[v2] {len(res.detections)} items in {res.timings.get('total', 0):.2f}s "
+          f"({', '.join(f'{k} {v:.2f}' for k, v in res.timings.items() if k != 'total')})")
+    return [d.to_legacy() for d in res.detections], panels, False
+
+
+def tesseract_path_override():
+    """pytesseract's command if app.py had to point it at the default Windows install."""
+    cmd = pytesseract.pytesseract.tesseract_cmd
+    return cmd if cmd and cmd != 'tesseract' else None
+
+
 def _estimate_occupied(img_bgr, panels):
     """
     Total occupied cells across all panels, using the SAME occupancy machinery
@@ -1991,6 +2034,7 @@ def default_settings():
         'grid': None,       # last-good detected grid, persisted so a noisy frame can't derail a scan
         'kappa_only_tasks': True,  # only kappaRequired tasks count toward task aggregate/KEEP totals
         'debug_dumps': True,  # save raw frame + detections of the last few scans under data/debug/
+        'identify_engine': 'v2',  # 'v2' (identify/ package) or 'legacy' (masked-NCC icon DB below)
     }
 
 def default_keep_list():
@@ -3156,7 +3200,12 @@ def run_keep_scan(from_calibration=False):
                                         require_region=False, warnings=warnings)
 
         _scan_state['phase'] = 'grid'
-        panels, grid_src = resolve_panels(img_bgr, settings, persist_fn=_persist_grid)
+        use_v2 = identify_engine(settings) == 'v2'
+        if use_v2:
+            v2_dets, panels, v2_failed = scan_with_v2(img_bgr, settings, warnings)
+            grid_src = 'v2'
+        else:
+            panels, grid_src = resolve_panels(img_bgr, settings, persist_fn=_persist_grid)
         grid = panels[0]
         print(f"Grid[{grid_src}]: {len(panels)} panel(s), "
               f"cell={grid['cell_w']:.2f}×{grid['cell_h']:.2f} "
@@ -3174,25 +3223,28 @@ def run_keep_scan(from_calibration=False):
                             f"catalog: {', '.join(unmapped[:3])}"
                             + ('…' if len(unmapped) > 3 else ''))
 
-        icon_db = get_icon_db()
-        if not icon_db:
+        icon_db = None if use_v2 else get_icon_db()
+        if not use_v2 and not icon_db:
             warnings.append('Icon DB not built — icon matching skipped '
                             '(build it from the Sell Advisor page)')
-        if icon_db and keepid_to_entry:
-            _scan_state['phase'] = 'resample'
-            matcher_db = get_matcher_db(grid)
-            _scan_state['phase'] = 'match'
+        if (use_v2 or icon_db) and keepid_to_entry:
             draw = ImageDraw.Draw(img, 'RGBA')
-            label_matcher = build_label_matcher(prices)
-            def _cb(done, total):
-                _scan_state['done'], _scan_state['total'] = done, total
-            all_dets = scan_all_panels(img_bgr, panels, matcher_db,
-                                       label_matcher=label_matcher,
-                                       progress_cb=_cb)
-            all_dets, grid, grid_src, grid_failed = _arbitrate_scan(
-                img_bgr, panels, all_dets, grid, grid_src, settings,
-                matcher_db, label_matcher, warnings, _persist_grid,
-                progress_cb=_cb)
+            if use_v2:
+                all_dets, grid_failed = v2_dets, v2_failed
+            else:
+                _scan_state['phase'] = 'resample'
+                matcher_db = get_matcher_db(grid)
+                _scan_state['phase'] = 'match'
+                label_matcher = build_label_matcher(prices)
+                def _cb(done, total):
+                    _scan_state['done'], _scan_state['total'] = done, total
+                all_dets = scan_all_panels(img_bgr, panels, matcher_db,
+                                           label_matcher=label_matcher,
+                                           progress_cb=_cb)
+                all_dets, grid, grid_src, grid_failed = _arbitrate_scan(
+                    img_bgr, panels, all_dets, grid, grid_src, settings,
+                    matcher_db, label_matcher, warnings, _persist_grid,
+                    progress_cb=_cb)
             if settings.get('debug_dumps', True):
                 _save_debug_bundle(img_bgr, panels, all_dets, 'keep')
             for d in all_dets:
@@ -3864,9 +3916,10 @@ def sell_scan():
 def _sell_scan_inner(from_calibration=False):
     settings = load_json(SETTINGS_PATH, default_settings)
 
-    # --- Icon DB required ----------------------------------------------------
-    icon_db = get_icon_db()
-    if not icon_db:
+    # --- Icon DB required (legacy engine only; v2 builds its own catalog) -----
+    use_v2 = identify_engine(settings) == 'v2'
+    icon_db = None if use_v2 else get_icon_db()
+    if not use_v2 and not icon_db:
         return jsonify({
             'image': None, 'results': [], 'grid': None, 'grid_failed': False,
             'error': 'Icon index not built yet. Click "Build Icon DB" first.',
@@ -3887,7 +3940,11 @@ def _sell_scan_inner(from_calibration=False):
 
         # --- Grid detection (any pitch, per-panel origins, persisted) --------
         _scan_state['phase'] = 'grid'
-        panels, grid_src = resolve_panels(img_bgr, settings, persist_fn=_persist_grid)
+        if use_v2:
+            v2_dets, panels, v2_failed = scan_with_v2(img_bgr, settings, warnings)
+            grid_src = 'v2'
+        else:
+            panels, grid_src = resolve_panels(img_bgr, settings, persist_fn=_persist_grid)
         grid = panels[0]
         print(f"Grid[{grid_src}]: {len(panels)} panel(s), "
               f"cell={grid['cell_w']:.2f}×{grid['cell_h']:.2f} "
@@ -3906,19 +3963,22 @@ def _sell_scan_inner(from_calibration=False):
             warnings.append('Tesseract OCR not installed — name reading disabled '
                             '(winget install UB-Mannheim.TesseractOCR)')
 
-        # --- NCC + OCR-label identification (uses existing icon DB) ----------
-        _scan_state['phase'] = 'resample'
-        matcher_db = get_matcher_db(grid)
-        _scan_state['phase'] = 'match'
-        def _cb(done, total):
-            _scan_state['done'], _scan_state['total'] = done, total
-        label_matcher = build_label_matcher(prices)
-        raw_detections = scan_all_panels(img_bgr, panels, matcher_db,
-                                         label_matcher=label_matcher,
-                                         progress_cb=_cb)
-        raw_detections, grid, grid_src, grid_failed = _arbitrate_scan(
-            img_bgr, panels, raw_detections, grid, grid_src, settings,
-            matcher_db, label_matcher, warnings, _persist_grid, progress_cb=_cb)
+        # --- identification (v2 engine, or legacy NCC + OCR-label via the icon DB) ----
+        if use_v2:
+            raw_detections, grid_failed = v2_dets, v2_failed
+        else:
+            _scan_state['phase'] = 'resample'
+            matcher_db = get_matcher_db(grid)
+            _scan_state['phase'] = 'match'
+            def _cb(done, total):
+                _scan_state['done'], _scan_state['total'] = done, total
+            label_matcher = build_label_matcher(prices)
+            raw_detections = scan_all_panels(img_bgr, panels, matcher_db,
+                                             label_matcher=label_matcher,
+                                             progress_cb=_cb)
+            raw_detections, grid, grid_src, grid_failed = _arbitrate_scan(
+                img_bgr, panels, raw_detections, grid, grid_src, settings,
+                matcher_db, label_matcher, warnings, _persist_grid, progress_cb=_cb)
         print(f"[sell_scan] matches: {len(raw_detections)}")
         if settings.get('debug_dumps', True):
             _save_debug_bundle(img_bgr, panels, raw_detections, 'sell')
