@@ -136,6 +136,12 @@
   }
   .region-chip.unset { color: #e0a030; background: #2a1e00; border-color: #5a3a00; }
 
+  /* ── Auto-scan toggle + status ── */
+  .auto-toggle { display: flex; align-items: center; gap: 5px; font-size: 12px; color: #c8c0b0; cursor: pointer; flex-shrink: 0; }
+  .auto-status { font-size: 11px; color: #6a9a4a; flex-shrink: 0; white-space: nowrap; }
+  .auto-status.warn { color: #e0a030; }
+  .auto-status.off { color: #555; }
+
   /* ── Click-to-highlight ring ── */
   #highlight-ring {
     position: absolute;
@@ -362,6 +368,10 @@
     <div class="screenshot-toolbar">
       <button id="btn-scan" class="primary" disabled title="Set stash region first">&#x1F4F7; Scan Stash</button>
       <span id="region-chip" class="region-chip unset">Region: …</span>
+      <label id="auto-wrap" class="auto-toggle" title="Watch the game passively and scan the stash by itself when it settles (no region or hotkey needed)">
+        <input type="checkbox" id="auto-toggle"> Auto
+      </label>
+      <span id="auto-status" class="auto-status"></span>
       <span id="scan-status" title="The scan hotkey works globally (even with the game focused). The stash region is captured from its saved position — no need to alt-tab.">Ready — click Scan Stash or press the scan hotkey</span>
     </div>
     <div class="screenshot-container">
@@ -1016,6 +1026,53 @@ async function runScan() {
 }
 
 document.getElementById('btn-scan').addEventListener('click', runScan);
+
+// ---------------------------------------------------------------------------
+// Auto-scan: server-side watcher (autoscan/) scans the settled stash by itself;
+// this polls its status and shows each new result like a manual scan.
+// ---------------------------------------------------------------------------
+let autoSeq = 0;
+let autoLastTs = 0;
+let autoBusyFetch = false;
+const AUTO_WARN = ['no_game', 'minimized', 'covered', 'blank', 'error', 'failed', 'raid_inventory'];
+
+function autoStatusText(st) {
+  if (!st.enabled) return 'Auto off';
+  if (st.state === 'scanned' && st.last_scan_ts) {
+    const age = Math.max(0, Math.round(Date.now() / 1000 - st.last_scan_ts));
+    return `Auto: last scan ${age} s ago`;
+  }
+  const extra = (st.state === 'error' || st.state === 'failed') && st.detail ? ` (${st.detail})` : '';
+  return 'Auto: ' + (st.message || st.state).replace(/\.\.\.$/, '…') + extra;
+}
+
+async function pollAuto() {
+  try {
+    const st = await api('GET', '/api/autoscan/status');
+    const tgl = document.getElementById('auto-toggle');
+    if (document.activeElement !== tgl) tgl.checked = !!st.enabled;
+    const el = document.getElementById('auto-status');
+    el.textContent = autoStatusText(st);
+    el.className = 'auto-status' + (!st.enabled ? ' off' : (AUTO_WARN.includes(st.state) ? ' warn' : ''));
+    el.title = st.game ? `Game ${st.game.size[0]}x${st.game.size[1]} on ${st.game.monitor}; capture: ${st.backend}` : '';
+    if (st.seq > autoSeq && !autoBusyFetch) {
+      autoBusyFetch = true;
+      const res = await api('GET', '/api/autoscan/result?since=' + autoSeq);
+      autoBusyFetch = false;
+      if (res.ready) {
+        autoSeq = res.seq;
+        applyScan(res);
+        document.getElementById('scan-status').textContent += ' (auto)';
+      }
+    }
+  } catch (_) { autoBusyFetch = false; }
+}
+document.getElementById('auto-toggle').addEventListener('change', async e => {
+  await api('POST', '/api/autoscan/toggle', { enabled: e.target.checked });
+  pollAuto();
+});
+setInterval(pollAuto, 1000);
+pollAuto();
 
 // ---------------------------------------------------------------------------
 // Search
