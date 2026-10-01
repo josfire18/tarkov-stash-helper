@@ -452,6 +452,46 @@ def _detect(img_bgr: np.ndarray, pitch_hint: float | None, min_cells: int,
     mh, mv = _line_masks(img_bgr, mode, contrast)
     hm = _runs(mh, L, True)
     vm = _runs(mv, L, False)
+
+    panels, pitch_x, pitch_y = _find_panels(hm, vm, pitch_hint, min_cells, None)
+    if not panels:
+        return GridResult([], None, None, warnings, pitch_hint, mode, 0.0)
+    # A container made of several sub-grids side by side (a backpack's pockets, drawn a few px
+    # apart and so off each other's lattice) is one mesh whose lattice fit keeps only the biggest
+    # sub-grid.  Blank out what was found and look again at the frame pitch: whatever still forms
+    # a lattice is another panel.
+    for _ in range(3):
+        hm2, vm2 = hm.copy(), vm.copy()
+        for q in panels:
+            hm2[max(0, q.y0 - 4):q.y1 + 4, max(0, q.x0 - 4):q.x1 + 4] = False
+            vm2[max(0, q.y0 - 4):q.y1 + 4, max(0, q.x0 - 4):q.x1 + 4] = False
+        more, _, _ = _find_panels(hm2, vm2, pitch_hint, min_cells, (pitch_x, pitch_y))
+        if not more:
+            break
+        panels += more
+    # art speckle can form a small bogus mesh *inside* a real panel: drop those
+    panels = [p for p in panels
+              if not any(q is not p and q.n_cols * q.n_rows > p.n_cols * p.n_rows
+                         and q.x0 - 2 <= p.x0 and p.x1 <= q.x1 + 2
+                         and q.y0 - 2 <= p.y0 and p.y1 <= q.y1 + 2 for q in panels)]
+    panels.sort(key=lambda p: (p.y0, p.x0))
+    if panels:
+        rh, rv = ridge_masks(img_bgr, contrast=10, neutral_only=True)
+        panels = [_extend_sides(p, rv, panels) for p in panels]
+
+    if pitch_hint and pitch_x and abs(pitch_x - pitch_hint) / pitch_hint > 0.08:
+        warnings.append(f'detected pitch {pitch_x:.1f}px differs from screen-implied '
+                        f'{pitch_hint:.1f}px (cropped capture or non-default UI scale)')
+    if pitch_x and pitch_y and abs(pitch_x - pitch_y) / max(pitch_x, pitch_y) > 0.02:
+        warnings.append(f'anisotropic cells {pitch_x:.2f}x{pitch_y:.2f}px (stretched capture)')
+    quality = float(sum(p.n_cols * p.n_rows * p.strength for p in panels))
+    return GridResult(panels, pitch_x, pitch_y, warnings, pitch_hint, mode, quality)
+
+
+def _find_panels(hm: np.ndarray, vm: np.ndarray, pitch_hint: float | None, min_cells: int,
+                 frame_pitch: tuple | None):
+    """Panels of the line meshes ``hm`` / ``vm``; returns ``(panels, pitch_x, pitch_y)``.
+    ``frame_pitch`` (pitch_x, pitch_y) is the already-known pitch of the frame (second pass)."""
     mesh_d = cv2.dilate((hm | vm).astype(np.uint8), np.ones((5, 5), np.uint8))
     n, lab, stats, _ = cv2.connectedComponentsWithStats(mesh_d, connectivity=8)
 
@@ -474,21 +514,24 @@ def _detect(img_bgr: np.ndarray, pitch_hint: float | None, min_cells: int,
         hmc, vmc = hm & cm, vm & cm
         raw.append((hmc, vmc, _analyse_axis(vmc.sum(axis=0), None, pitch_hint),
                     _analyse_axis(hmc.sum(axis=1), None, pitch_hint)))
-    xs_est = [a for _, _, a, _ in raw]
-    ys_est = [b for _, _, _, b in raw]
-    ref_x, ref_y = _consensus_pitch(xs_est), _consensus_pitch(ys_est)
-    pooled = _consensus_pitch(xs_est + ys_est)
-    if pooled is not None:
-        # a stretched capture (4:3 -> 16:9) has different x and y pitches; otherwise both
-        # axes share one pitch and each axis borrows the other's evidence
-        if ref_x is None or ref_y is None:
-            ref_x = ref_x or pooled
-            ref_y = ref_y or pooled
-        else:
-            r = max(ref_x, ref_y) / min(ref_x, ref_y)
-            k = round(r)
-            if abs(r - k) <= 0.04 * r and k >= 1 and not (k == 1 and abs(ref_x - ref_y) > 0.04 * ref_x):
-                ref_x = ref_y = pooled
+    if frame_pitch is not None:
+        ref_x, ref_y = frame_pitch
+    else:
+        xs_est = [a for _, _, a, _ in raw]
+        ys_est = [b for _, _, _, b in raw]
+        ref_x, ref_y = _consensus_pitch(xs_est), _consensus_pitch(ys_est)
+        pooled = _consensus_pitch(xs_est + ys_est)
+        if pooled is not None:
+            # a stretched capture (4:3 -> 16:9) has different x and y pitches; otherwise both
+            # axes share one pitch and each axis borrows the other's evidence
+            if ref_x is None or ref_y is None:
+                ref_x = ref_x or pooled
+                ref_y = ref_y or pooled
+            else:
+                r = max(ref_x, ref_y) / min(ref_x, ref_y)
+                k = round(r)
+                if abs(r - k) <= 0.04 * r and k >= 1 and not (k == 1 and abs(ref_x - ref_y) > 0.04 * ref_x):
+                    ref_x = ref_y = pooled
     first = []
     for hmc, vmc, ax, ay in raw:
         if ref_x is not None:
@@ -502,7 +545,7 @@ def _detect(img_bgr: np.ndarray, pitch_hint: float | None, min_cells: int,
             continue                                   # no real UI is that stretched
         first.append([hmc, vmc, ax, ay])
     if not first:
-        return GridResult([], None, None, warnings, pitch_hint, mode, 0.0)
+        return [], None, None
 
     # frame pitch = the pitch backed by the most line evidence (one UI scale per frame);
     # a bogus mesh (art speckle) is outvoted by the real panel's many consistent lines
@@ -518,23 +561,7 @@ def _detect(img_bgr: np.ndarray, pitch_hint: float | None, min_cells: int,
         if p is not None and p.n_cols * p.n_rows >= min_cells:
             p.strength = float(min(ax.ratio, ay.ratio))
             panels.append(p)
-    # art speckle can form a small bogus mesh *inside* a real panel: drop those
-    panels = [p for p in panels
-              if not any(q is not p and q.n_cols * q.n_rows > p.n_cols * p.n_rows
-                         and q.x0 - 2 <= p.x0 and p.x1 <= q.x1 + 2
-                         and q.y0 - 2 <= p.y0 and p.y1 <= q.y1 + 2 for q in panels)]
-    panels.sort(key=lambda p: (p.y0, p.x0))
-    if panels:
-        rh, rv = ridge_masks(img_bgr, contrast=10, neutral_only=True)
-        panels = [_extend_sides(p, rv, panels) for p in panels]
-
-    if pitch_hint and pitch_x and abs(pitch_x - pitch_hint) / pitch_hint > 0.08:
-        warnings.append(f'detected pitch {pitch_x:.1f}px differs from screen-implied '
-                        f'{pitch_hint:.1f}px (cropped capture or non-default UI scale)')
-    if pitch_x and pitch_y and abs(pitch_x - pitch_y) / max(pitch_x, pitch_y) > 0.02:
-        warnings.append(f'anisotropic cells {pitch_x:.2f}x{pitch_y:.2f}px (stretched capture)')
-    quality = float(sum(p.n_cols * p.n_rows * p.strength for p in panels))
-    return GridResult(panels, pitch_x, pitch_y, warnings, pitch_hint, mode, quality)
+    return panels, pitch_x, pitch_y
 
 
 def _extend_sides(p: Panel, rv: np.ndarray, others: list) -> Panel:

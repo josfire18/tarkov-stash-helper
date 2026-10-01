@@ -94,3 +94,71 @@ def test_otsu_splits_a_bimodal_distribution():
     vals = np.array([0.0, 0.05, 0.1, 0.1, 0.3, 0.95, 1.0, 1.0, 1.0, 0.98])
     t, j = _otsu_1d(vals, 0.5, 0.9)
     assert 0.5 <= t <= 0.9 and j > 0.8
+
+
+# ---------------------------------------------------------------------------
+# art that looks like a border line (large containers / backpacks / cloth)
+# ---------------------------------------------------------------------------
+
+import numpy as np
+
+from synth import LINE, make_icon
+
+
+def _paint(img, x0, y0, x1, y1, bgr):
+    img[y0:y1, x0:x1] = bgr
+
+
+def test_grey_band_inside_a_big_item_is_not_a_border():
+    # a container lid: a thick band in exactly the border colour runs along the row boundary
+    # of a 3x3 item (the Lucky Scav Junk box split into 3x1 + 3x2 because of it)
+    img, _, _, _ = render_panel(63.0, 6, 5, [(1, 1, 3, 3)])
+    panel, items = _segment(img)
+    y = panel.ys[2]
+    _paint(img, panel.xs[1] + 3, y - 4, panel.xs[4] - 2, y + 5, LINE)
+    _, items = _segment(img)
+    assert (1, 1, 3, 3) in _shapes(items)
+
+
+def test_diagonal_hatch_in_border_colour_is_not_a_border():
+    # the hatched background of an unexamined item: diagonal stripes of the border colour
+    img, _, _, _ = render_panel(63.0, 6, 5, [(1, 1, 3, 3)])
+    panel, _ = _segment(img)
+    x0, x1, y0, y1 = panel.xs[1] + 2, panel.xs[4] - 1, panel.ys[1] + 2, panel.ys[4] - 1
+    for yy in range(y0, y1):
+        for xx in range(x0, x1):
+            if (xx + yy) % 4 < 2:
+                img[yy, xx] = LINE
+    _, items = _segment(img)
+    assert (1, 1, 3, 3) in _shapes(items)
+
+
+def test_partial_grey_cloth_across_a_cell_boundary_does_not_split_a_2x1():
+    # Ripstop fabric: a grey patch in the border colour covering almost all of the shared edge
+    img, _, _, _ = render_panel(63.0, 6, 3, [(1, 1, 2, 1)])
+    panel, _ = _segment(img)
+    x = panel.xs[2]
+    _paint(img, x - 20, panel.ys[1] + 3, x + 20, panel.ys[2] - 2, LINE)
+    _, items = _segment(img)
+    assert (1, 1, 2, 1) in _shapes(items)
+
+
+def test_green_cloth_edge_next_to_flat_margin_is_not_a_border():
+    # a backpack icon: a flat dark margin column (looks like an empty slot) then green camo
+    # starting exactly at the cell boundary (the step-against-empty test used to call that a line)
+    img, _, _, _ = render_panel(63.0, 6, 5, [(1, 1, 3, 3)], icons={(1, 1): np.zeros((190, 190, 4), np.uint8)})
+    panel, _ = _segment(img)
+    x = panel.xs[2]
+    camo = np.zeros((panel.ys[4] - panel.ys[1] - 3, panel.xs[4] - x - 1, 3), np.uint8)
+    camo[:] = (66, 92, 76)
+    camo[::3, ::2] = (58, 80, 64)
+    img[panel.ys[1] + 2:panel.ys[4] - 1, x + 1:panel.xs[4]] = camo
+    _, items = _segment(img)
+    assert (1, 1, 3, 3) in _shapes(items)
+
+
+def test_real_border_next_to_an_empty_slot_still_counts():
+    # the other side of the step test: an item beside empty slots stays separate from them
+    img, _, expected, _ = render_panel(63.0, 6, 3, [(0, 0, 2, 2), (2, 0, 1, 1)])
+    _, items = _segment(img)
+    assert {(0, 0, 2, 2), (2, 0, 1, 1)} <= _shapes(items)

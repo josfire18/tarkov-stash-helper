@@ -51,30 +51,54 @@ class Item:
 # edge tests
 # --------------------------------------------------------------------------
 
-def _edge_fraction(lm: np.ndarray, vertical: bool, pos: int, a: int, b: int, slack: int = 1) -> float:
-    """Fraction of a boundary segment covered by the line mask.  ``pos`` is the line's x
-    (vertical boundary) or y, ``a..b`` the span along it; ``slack`` px either side absorb
-    sub-pixel lattice rounding and the 1-2 px smear of resampled captures."""
+def _edge_fraction(lm: np.ndarray, vertical: bool, pos: int, a: int, b: int, slack: int = 1,
+                   width: int = 1, thin: bool = True) -> float:
+    """Coverage of a boundary segment by the line mask: the best *straight* ``width``-px wide
+    strip within ``slack`` px of the nominal position (sub-pixel lattice rounding, the 1-2 px smear
+    of resampled captures), counting only positions where the line is thin.
+
+    ``pos`` is the line's x (vertical boundary) or y, ``a..b`` the span along it.  A drawn border
+    is one straight 1 px line, so (unlike "any mask pixel within +-1 px") art cannot fake it: a
+    diagonal hatch pattern or a grey strap crossing the edge covers only part of any single
+    column, and a grey *band* (cloth, a container lid) is rejected by ``thin``: a position whose
+    mask run continues 3 px away on both sides is a wide patch, not a line."""
     H, W = lm.shape
     a = max(0, a)
     b = max(a + 1, b)
-    lo, hi = pos - slack, pos + slack + 1
-    if vertical:
-        lo, hi = max(0, lo), min(W, hi)
-        seg = lm[a:b, lo:hi].any(axis=1) if hi > lo else None
-    else:
-        lo, hi = max(0, lo), min(H, hi)
-        seg = lm[lo:hi, a:b].any(axis=0) if hi > lo else None
-    if seg is None or seg.size == 0:
+    K = slack + width + 3
+    n = W if vertical else H
+    if not (0 <= pos < n):
         return 0.0
-    return float(seg.mean())
+    lo, hi = pos - K, pos + K + 1
+    if vertical:
+        strip = lm[a:b, max(0, lo):min(W, hi)]
+    else:
+        strip = lm[max(0, lo):min(H, hi), a:b].T
+    if strip.size == 0:
+        return 0.0
+    if lo < 0:
+        strip = np.pad(strip, ((0, 0), (-lo, 0)))
+    if hi > n:
+        strip = np.pad(strip, ((0, 0), (0, hi - n)))
+    best = 0.0
+    for s0 in range(-slack, slack + 1):
+        c0 = K + s0
+        hit = strip[:, c0]
+        for k in range(1, width):
+            hit = hit | strip[:, c0 + k]
+        if thin:
+            hit = hit & ~(strip[:, c0 - 3] & strip[:, c0 + width - 1 + 3])
+        best = max(best, float(hit.mean()))
+    return best
 
 
 def _step_fraction(gray: np.ndarray, vertical: bool, pos: int, a: int, b: int, empty_before: bool,
-                   rise: float = 22.0) -> float:
+                   rise: float = 22.0, hue_ok: np.ndarray | None = None) -> float:
     """Fraction of a boundary segment where a thin line (1-2 px) is at least ``rise`` grey levels
     brighter than the flat *empty* side (``empty_before``: the empty cell is the one before the
-    line, i.e. above / left of it)."""
+    line, i.e. above / left of it).  ``hue_ok`` (per-pixel: the border's grey-brown hue, see
+    :func:`_hue_ok`) keeps a coloured art edge (green camo, a red strap) that merely starts at
+    the boundary from passing as a line."""
     H, W = gray.shape
     a, b = max(0, a), max(a + 1, b)
     d = -1 if empty_before else 1
@@ -90,6 +114,8 @@ def _step_fraction(gray: np.ndarray, vertical: bool, pos: int, a: int, b: int, e
         else:
             line, side = gray[p, a:b], 0.5 * (gray[q1, a:b] + gray[q2, a:b])
         ok = (line - side) >= rise
+        if hue_ok is not None:
+            ok &= hue_ok[a:b, p] if vertical else hue_ok[p, a:b]
         fr = float(ok.mean()) if ok.size else 0.0
         best = fr if best is None else max(best, fr)
     return best or 0.0
@@ -146,28 +172,56 @@ class _DSU:
             self.p[rb] = ra
 
 
-def segment_panel(img_bgr: np.ndarray, panel: Panel, panel_index: int = 0,
-                  ridge: bool | None = None) -> list[Item]:
-    """Footprints of every item (and every empty cell) in ``panel``.
+def _hue_ok(img_bgr: np.ndarray) -> np.ndarray:
+    """Pixels with the border's hue (B-G 0..14, G-R 4..18), whatever their brightness."""
+    im = img_bgr.astype(np.int16)
+    bg = im[..., 0] - im[..., 1]
+    gr = im[..., 1] - im[..., 2]
+    return (bg >= 0) & (bg <= 14) & (gr >= 4) & (gr <= 18)
 
-    Edge presence is the fraction of a boundary segment covered by a line mask.  Two masks
-    are available - the exact border colour range (pristine PNG) and neutral-grey ridges
-    (survive JPEG / resampling) - and the threshold is **learned per image**: both masks
-    are evaluated on every interior boundary, the distribution of the fractions is
-    bimodal (a drawn line scores ~1, none scores low), the mask with the better
-    two-class separation wins and Otsu's threshold splits the classes.  ``ridge`` forces
-    a mask (True = ridge, False = strict)."""
+
+def _tight_line_mask(img_bgr: np.ndarray) -> np.ndarray:
+    """The border colour range of :func:`identify.grid.line_mask`, narrowed to the *hue* the game
+    really draws: on the 12 labelled screenshots 99 % of true line pixels have B-G in 2..9 and
+    G-R in 6..11 (nominal (84, 81, 73), a little brighter under the top gradient).  The wider box
+    the grid finder uses also passes green camo, olive tints and warm browns, which is how a
+    backpack's cloth edge became a 'line'."""
+    return line_mask(img_bgr) & _hue_ok(img_bgr)
+
+
+RIDGE_WIDTH = 2     # resampled / JPEG lines smear over 2 px; the exact-colour model needs exactly 1
+
+
+@dataclass
+class EdgeModel:
+    """Which edges of a panel carry a drawn line: per-boundary line coverage, the threshold
+    that splits "line" from "no line" and the mask model that produced them."""
+    name: str
+    thr: float
+    j: float
+    fv: dict          # (row, col) -> coverage of the vertical boundary left of cell (col, row)
+    fh: dict          # (row, col) -> coverage of the horizontal boundary above cell (col, row)
+
+    def vertical_line(self, r: int, c: int) -> bool:
+        return self.fv[(r, c)] >= self.thr
+
+    def horizontal_line(self, r: int, c: int) -> bool:
+        return self.fh[(r, c)] >= self.thr
+
+
+def edge_model(img_bgr: np.ndarray, panel: Panel, ridge: bool | None = None) -> EdgeModel:
+    """Learn, per image, how to tell a drawn border line from art (see :func:`segment_panel`)."""
     nc, nr = panel.n_cols, panel.n_rows
     xs, ys = panel.xs, panel.ys
 
-    def fractions(lm_h, lm_v):
-        fv = {(r, c): _edge_fraction(lm_v, True, xs[c], ys[r] + 2, ys[r + 1] - 1)
+    def fractions(lm_h, lm_v, width=1):
+        fv = {(r, c): _edge_fraction(lm_v, True, xs[c], ys[r] + 2, ys[r + 1] - 1, width=width)
               for r in range(nr) for c in range(1, nc)}
-        fh = {(r, c): _edge_fraction(lm_h, False, ys[r], xs[c] + 2, xs[c + 1] - 1)
+        fh = {(r, c): _edge_fraction(lm_h, False, ys[r], xs[c] + 2, xs[c + 1] - 1, width=width)
               for c in range(nc) for r in range(1, nr)}
         return fv, fh
 
-    strict = line_mask(img_bgr)
+    strict = _tight_line_mask(img_bgr)
     rh, rv = ridge_masks(img_bgr)
     cands = []
     lh, lv = ridge_masks(img_bgr, neutral_only=False)      # any hue: orange 'attention' frames
@@ -176,7 +230,7 @@ def segment_panel(img_bgr: np.ndarray, panel: Panel, panel_index: int = 0,
     for name, (mh, mv) in models:
         if ridge is not None and (name == 'ridge') != bool(ridge):
             continue
-        fv, fh = fractions(mh, mv)
+        fv, fh = fractions(mh, mv, 1 if name == 'strict' else RIDGE_WIDTH)
         vals = np.array(list(fv.values()) + list(fh.values()), np.float64)
         t, j = _otsu_1d(vals, 0.3, 0.9)
         cands.append((j, t, fv, fh, name))
@@ -195,7 +249,7 @@ def segment_panel(img_bgr: np.ndarray, panel: Panel, panel_index: int = 0,
     strict_c = next((c for c in plausible if c[4] == 'strict'), None)
     if strict_c is not None and strict_c[0] >= 0.97:         # pristine capture: the exact model is decisive
         near = [strict_c]
-    j, thr, fv, fh, _name = max(near, key=share)
+    j, thr, fv, fh, name = max(near, key=share)
 
     # The border of an item that touches an *empty* slot is alpha-blended over the dark
     # backdrop (stash1: (84,81,73) between items, ~(67,65,59) against an empty cell), so the
@@ -203,19 +257,45 @@ def segment_panel(img_bgr: np.ndarray, panel: Panel, panel_index: int = 0,
     # fake a line there (one side is flat dark), so on those edges a one-sided step test counts:
     # a thin line clearly brighter than the empty side along the whole edge.
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    ridge_c = None
+    hue_ok = _hue_ok(img_bgr)
     empty = {(c, r): cell_is_empty(img_bgr, panel.rect(c, r, 1, 1)) for r in range(nr) for c in range(nc)}
+
+    def _step(vertical, pos, a, b, e0, e1):
+        # one empty side: the line must stand out from it.  Both sides flat (two empty slots, or
+        # the flat margin of a big icon next to an empty slot): it must stand out from both.
+        if e0 and e1:
+            return min(_step_fraction(gray, vertical, pos, a, b, True, hue_ok=hue_ok),
+                       _step_fraction(gray, vertical, pos, a, b, False, hue_ok=hue_ok))
+        return _step_fraction(gray, vertical, pos, a, b, e0, hue_ok=hue_ok)
+
     if any(empty.values()):
         fv = dict(fv)
         fh = dict(fh)
         for (r, c), f in list(fv.items()):
             e0, e1 = empty[(c - 1, r)], empty[(c, r)]
-            if f < thr and e0 != e1:
-                fv[(r, c)] = _step_fraction(gray, True, xs[c], ys[r] + 2, ys[r + 1] - 1, empty_before=e0)
+            if f < thr and (e0 or e1):
+                fv[(r, c)] = _step(True, xs[c], ys[r] + 2, ys[r + 1] - 1, e0, e1)
         for (r, c), f in list(fh.items()):
             e0, e1 = empty[(c, r - 1)], empty[(c, r)]
-            if f < thr and e0 != e1:
-                fh[(r, c)] = _step_fraction(gray, False, ys[r], xs[c] + 2, xs[c + 1] - 1, empty_before=e0)
+            if f < thr and (e0 or e1):
+                fh[(r, c)] = _step(False, ys[r], xs[c] + 2, xs[c + 1] - 1, e0, e1)
+    return EdgeModel(name, float(thr), float(j), fv, fh)
+
+
+def segment_panel(img_bgr: np.ndarray, panel: Panel, panel_index: int = 0,
+                  ridge: bool | None = None) -> list[Item]:
+    """Footprints of every item (and every empty cell) in ``panel``.
+
+    Edge presence is the fraction of a boundary segment covered by a line mask.  Two masks
+    are available - the exact border colour range (pristine PNG) and neutral-grey ridges
+    (survive JPEG / resampling) - and the threshold is **learned per image**: both masks
+    are evaluated on every interior boundary, the distribution of the fractions is
+    bimodal (a drawn line scores ~1, none scores low), the mask with the better
+    two-class separation wins and Otsu's threshold splits the classes.  ``ridge`` forces
+    a mask (True = ridge, False = strict)."""
+    nc, nr = panel.n_cols, panel.n_rows
+    em = edge_model(img_bgr, panel, ridge)
+    fv, fh, thr = em.fv, em.fh, em.thr
 
     dsu = _DSU(nc * nr)
     idx = lambda c, r: r * nc + c
