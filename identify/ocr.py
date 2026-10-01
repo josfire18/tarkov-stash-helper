@@ -195,9 +195,11 @@ def isolate_label(strip: np.ndarray) -> list[np.ndarray] | None:
     thr = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0]
     bright = (g > max(110.0, thr)).astype(np.uint8)
     n, lab, st, _ = cv2.connectedComponentsWithStats(bright, connectivity=8)
-    dt = cv2.distanceTransform(bright, cv2.DIST_L2, 3)
+    # a component survives erosion by THICK_ART * h only if a disc that wide fits inside it
+    r = max(2, int(round(THICK_ART * h)))
+    core = cv2.erode(bright, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
     thick = np.zeros(n)
-    np.maximum.at(thick, lab.ravel(), dt.ravel())
+    thick[np.unique(lab[core > 0])] = h
     run = text_run(st, classify_components(st, h, thick), h, wd)
     if not run:
         return None
