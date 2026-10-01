@@ -1827,6 +1827,10 @@ def scan_with_v2(img_bgr, settings, warnings):
     """
     from identify.config import EngineSettings
     from identify.pipeline import Engine
+    if not os.path.exists(PRICES_PATH) or next(os.scandir(TMPL_SRC_DIR), None) is None:
+        # clean install: the catalog is built from the price list + tarkov.dev base images
+        raise ScanError("The item database isn't built yet. Open the Sell Advisor page and click "
+                        "'Build Icon DB' first (needs internet; takes a few minutes the first time).")
     es = EngineSettings.from_settings(settings)
     if tesseract_path_override():
         es.tesseract_cmd = tesseract_path_override()
@@ -3949,6 +3953,7 @@ def icons_build_index():
             _invalidate_pitch_cache()   # pitch-resampled copies of the old DB are stale
             _index_build_state['done'] = _index_build_state['total']
             print(f"[icon_db] built: {sum(len(b['ids']) for b in db.values())} items")
+            _warm_v2_engine()
         except Exception as e:
             _index_build_state['error'] = str(e)
             print(f"[icon_db] build failed: {e}")
@@ -4221,6 +4226,10 @@ def _startup_maintenance():
         print(f"[kappa] startup sync skipped (offline?): {e}")
     # Warm the v2 identification engine (loads/builds the template catalog - ~35 s the first
     # time - and the optional DINO model) so the first hotkey scan isn't the one that pays for it.
+    _warm_v2_engine()
+
+
+def _warm_v2_engine():
     try:
         if identify_engine(load_json(SETTINGS_PATH, default_settings)) == 'v2' and os.path.exists(PRICES_PATH):
             from identify.config import EngineSettings
