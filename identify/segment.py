@@ -93,10 +93,12 @@ def _edge_fraction(lm: np.ndarray, vertical: bool, pos: int, a: int, b: int, sla
 
 
 def _step_fraction(gray: np.ndarray, vertical: bool, pos: int, a: int, b: int, empty_before: bool,
-                   rise: float = 22.0) -> float:
+                   rise: float = 22.0, hue_ok: np.ndarray | None = None) -> float:
     """Fraction of a boundary segment where a thin line (1-2 px) is at least ``rise`` grey levels
     brighter than the flat *empty* side (``empty_before``: the empty cell is the one before the
-    line, i.e. above / left of it)."""
+    line, i.e. above / left of it).  ``hue_ok`` (per-pixel: the border's grey-brown hue, see
+    :func:`_hue_ok`) keeps a coloured art edge (green camo, a red strap) that merely starts at
+    the boundary from passing as a line."""
     H, W = gray.shape
     a, b = max(0, a), max(a + 1, b)
     d = -1 if empty_before else 1
@@ -112,6 +114,8 @@ def _step_fraction(gray: np.ndarray, vertical: bool, pos: int, a: int, b: int, e
         else:
             line, side = gray[p, a:b], 0.5 * (gray[q1, a:b] + gray[q2, a:b])
         ok = (line - side) >= rise
+        if hue_ok is not None:
+            ok &= hue_ok[a:b, p] if vertical else hue_ok[p, a:b]
         fr = float(ok.mean()) if ok.size else 0.0
         best = fr if best is None else max(best, fr)
     return best or 0.0
@@ -168,6 +172,23 @@ class _DSU:
             self.p[rb] = ra
 
 
+def _hue_ok(img_bgr: np.ndarray) -> np.ndarray:
+    """Pixels with the border's hue (B-G 0..14, G-R 4..18), whatever their brightness."""
+    im = img_bgr.astype(np.int16)
+    bg = im[..., 0] - im[..., 1]
+    gr = im[..., 1] - im[..., 2]
+    return (bg >= 0) & (bg <= 14) & (gr >= 4) & (gr <= 18)
+
+
+def _tight_line_mask(img_bgr: np.ndarray) -> np.ndarray:
+    """The border colour range of :func:`identify.grid.line_mask`, narrowed to the *hue* the game
+    really draws: on the 12 labelled screenshots 99 % of true line pixels have B-G in 2..9 and
+    G-R in 6..11 (nominal (84, 81, 73), a little brighter under the top gradient).  The wider box
+    the grid finder uses also passes green camo, olive tints and warm browns, which is how a
+    backpack's cloth edge became a 'line'."""
+    return line_mask(img_bgr) & _hue_ok(img_bgr)
+
+
 RIDGE_WIDTH = 2     # resampled / JPEG lines smear over 2 px; the exact-colour model needs exactly 1
 
 
@@ -200,7 +221,7 @@ def edge_model(img_bgr: np.ndarray, panel: Panel, ridge: bool | None = None) -> 
               for c in range(nc) for r in range(1, nr)}
         return fv, fh
 
-    strict = line_mask(img_bgr)
+    strict = _tight_line_mask(img_bgr)
     rh, rv = ridge_masks(img_bgr)
     cands = []
     lh, lv = ridge_masks(img_bgr, neutral_only=False)      # any hue: orange 'attention' frames
@@ -236,18 +257,28 @@ def edge_model(img_bgr: np.ndarray, panel: Panel, ridge: bool | None = None) -> 
     # fake a line there (one side is flat dark), so on those edges a one-sided step test counts:
     # a thin line clearly brighter than the empty side along the whole edge.
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    hue_ok = _hue_ok(img_bgr)
     empty = {(c, r): cell_is_empty(img_bgr, panel.rect(c, r, 1, 1)) for r in range(nr) for c in range(nc)}
+
+    def _step(vertical, pos, a, b, e0, e1):
+        # one empty side: the line must stand out from it.  Both sides flat (two empty slots, or
+        # the flat margin of a big icon next to an empty slot): it must stand out from both.
+        if e0 and e1:
+            return min(_step_fraction(gray, vertical, pos, a, b, True, hue_ok=hue_ok),
+                       _step_fraction(gray, vertical, pos, a, b, False, hue_ok=hue_ok))
+        return _step_fraction(gray, vertical, pos, a, b, e0, hue_ok=hue_ok)
+
     if any(empty.values()):
         fv = dict(fv)
         fh = dict(fh)
         for (r, c), f in list(fv.items()):
             e0, e1 = empty[(c - 1, r)], empty[(c, r)]
-            if f < thr and e0 != e1:
-                fv[(r, c)] = _step_fraction(gray, True, xs[c], ys[r] + 2, ys[r + 1] - 1, empty_before=e0)
+            if f < thr and (e0 or e1):
+                fv[(r, c)] = _step(True, xs[c], ys[r] + 2, ys[r + 1] - 1, e0, e1)
         for (r, c), f in list(fh.items()):
             e0, e1 = empty[(c, r - 1)], empty[(c, r)]
-            if f < thr and e0 != e1:
-                fh[(r, c)] = _step_fraction(gray, False, ys[r], xs[c] + 2, xs[c + 1] - 1, empty_before=e0)
+            if f < thr and (e0 or e1):
+                fh[(r, c)] = _step(False, ys[r], xs[c] + 2, xs[c + 1] - 1, e0, e1)
     return EdgeModel(name, float(thr), float(j), fv, fh)
 
 
