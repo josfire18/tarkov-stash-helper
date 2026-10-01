@@ -810,10 +810,14 @@ function buildResultRow(r) {
     : '';
 
   const numClass = r.recommend === 'keep' ? 'keep' : r.recommend;
+  const qty = r.count > 1
+    ? ` <span class="qty">×${r.count}</span>${r.total ? ` <span class="price-fee">= ${fmt(r.total)}</span>` : ''}`
+    : '';
+  const unsure = r.uncertain ? ` <span class="fir-warn">check</span>` : '';
   row.innerHTML = `
     <div class="item-num ${numClass}">${r.num}</div>
     <div>
-      <div class="item-name">${r.matched_name}</div>
+      <div class="item-name">${r.matched_name}${qty}${unsure}</div>
       <div class="match-text">${r.score}% match</div>
     </div>
     <div class="rec-badge ${badgeClass}">${badgeText}</div>
@@ -886,17 +890,12 @@ function renderResults(results) {
     }
   }
 
-  // Trader sections ordered by each group's total trader value, descending;
-  // rows within a section ordered by trader_price, descending.
-  const traderSections = [...traderGroups.entries()]
-    .map(([name, items]) => {
-      items.sort((a, b) => (b.trader_price || 0) - (a.trader_price || 0));
-      const total = items.reduce((s, r) => s + (r.trader_price || 0), 0);
-      return { name, items, total };
-    })
-    .sort((a, b) => b.total - a.total);
-
-  fleaItems.sort((a, b) => (b.flea_net || 0) - (a.flea_net || 0));
+  // The server already ordered results for selling (traders in in-game tab
+  // order, then flea by total profit) and numbered the image badges to match,
+  // so keep that order here - re-sorting would desync list and badges.
+  const traderSections = [...traderGroups.entries()].map(([name, items]) => ({
+    name, items, total: items.reduce((s, r) => s + (r.total || r.trader_price || 0), 0),
+  }));
 
   scroll.innerHTML = '';
 

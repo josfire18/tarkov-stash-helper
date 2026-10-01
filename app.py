@@ -142,8 +142,34 @@ TRADER_COLORS_RGB = {
     'Mechanic':    (154, 205, 50),   # yellow-green
     'Ragman':      (216, 27, 96),    # magenta
     'Jaeger':      (34, 139, 34),    # forest green
+    'Ref':         (230, 190, 40),   # yellow
+    'Fence':       (120, 120, 120),  # grey
 }
-DEFAULT_TRADER_BADGE_RGB = (180, 120, 20)  # fallback (e.g. Fence) — the old uniform trader-gold
+DEFAULT_TRADER_BADGE_RGB = (180, 120, 20)  # fallback — the old uniform trader-gold
+FLEA_RGB = (30, 150, 30)
+
+# The order of the trader tabs in game, so the sell list walks the traders
+# left to right and each trader is visited once.
+TRADER_ORDER = ['Prapor', 'Therapist', 'Fence', 'Skier', 'Peacekeeper',
+                'Mechanic', 'Ragman', 'Jaeger', 'Ref']
+
+
+def order_for_selling(entries):
+    """Sort sell entries into the order the player should sell them.
+
+    Trader sales first, grouped by trader in TRADER_ORDER and, within a
+    trader, by stack value (highest first); then flea sales by total net
+    profit, highest first.  Ties keep their stash reading order.
+    """
+    def trader_rank(name):
+        return TRADER_ORDER.index(name) if name in TRADER_ORDER else len(TRADER_ORDER)
+
+    traders = [e for e in entries if e['recommend'] == 'trader']
+    flea    = [e for e in entries if e['recommend'] == 'flea']
+    traders.sort(key=lambda e: (trader_rank(e['trader_name']), e['trader_name'] or '',
+                                -(e.get('total') or 0)))
+    flea.sort(key=lambda e: -(e.get('total') or 0))
+    return traders + flea
 
 # The scanner only cares about items / parts / components — NOT ammo, full
 # weapons, weapon presets, or storage containers.  Templates for these tarkov.dev
@@ -1972,10 +1998,26 @@ def price_420(target):
     p = (target - rem + 420) if rem >= 420 else (target - rem - 580)
     return p if p >= 420 else max(1, target - 1)
 
-def sell_recommendation(item_data):
+def flea_block_reason(item_data, fir, settings):
+    """Why this copy can't be listed on the flea, or None if it can.
+
+    noFlea items are banned outright.  When the flea requires Found-in-Raid
+    (the normal rule; Battlestate has lifted it for events, hence the setting),
+    a copy confidently read as non-FiR can't be listed.  An indeterminate FiR
+    read (None) is not treated as a block - the badge tells the player to check.
     """
-    Returns dict with trader, flea, and recommendation.
-    Flea is recommended only if net-after-fee exceeds trader by FLEA_MIN_PROFIT.
+    if 'noFlea' in (item_data.get('types') or ()):
+        return 'banned from flea'
+    if settings.get('flea_requires_fir', True) and fir is False:
+        return 'not FiR, cannot list on flea'
+    return None
+
+
+def sell_recommendation(item_data, flea_blocked=None):
+    """
+    Returns dict with trader, flea, and recommendation for ONE unit.
+    Flea is recommended only if it is allowed for this copy and its
+    net-after-fee beats the best trader by FLEA_MIN_PROFIT (or no trader buys it).
     """
     trader_name, trader_price = best_trader_price(item_data)
     base_price   = item_data.get('basePrice') or 0
@@ -1992,8 +2034,11 @@ def sell_recommendation(item_data):
         'reason':       '',
     }
 
-    if not flea_ref or not trader_price:
-        rec['reason'] = 'No flea data' if not flea_ref else 'No trader data'
+    if flea_blocked:
+        rec['reason'] = flea_blocked.capitalize()
+        return rec
+    if not flea_ref:
+        rec['reason'] = 'No flea data'
         return rec
 
     flea_list = price_420(flea_ref)
@@ -2002,7 +2047,10 @@ def sell_recommendation(item_data):
     rec['flea_list'] = flea_list
     rec['flea_net']  = flea_net
 
-    if flea_net - trader_price >= FLEA_MIN_PROFIT:
+    if not trader_price and flea_net > 0:
+        rec['recommend'] = 'flea'
+        rec['reason']    = 'No trader buys this'
+    elif flea_net - trader_price >= FLEA_MIN_PROFIT:
         rec['recommend'] = 'flea'
         rec['reason']    = f'+{(flea_net - trader_price):,} over trader after fees'
     else:
@@ -2034,6 +2082,7 @@ def default_settings():
         'grid': None,       # last-good detected grid, persisted so a noisy frame can't derail a scan
         'kappa_only_tasks': True,  # only kappaRequired tasks count toward task aggregate/KEEP totals
         'debug_dumps': True,  # save raw frame + detections of the last few scans under data/debug/
+        'flea_requires_fir': True,  # normal flea rule; Battlestate has lifted it for events
         'identify_engine': 'v2',  # 'v2' (identify/ package) or 'legacy' (masked-NCC icon DB below)
     }
 
@@ -3983,10 +4032,13 @@ def _sell_scan_inner(from_calibration=False):
         if settings.get('debug_dumps', True):
             _save_debug_bundle(img_bgr, panels, raw_detections, 'sell')
 
-        # --- Number items in reading order, KEEP items highlighted cyan ------
+        # --- Build every entry, then number them in SELL order ---------------
+        # The list and the badges on the image share one numbering, so badge 1
+        # is the first row to sell: trader items grouped in the game's trader
+        # order (one visit per trader), then flea items by total profit, then
+        # KEEP items.  Everything is outlined on the image in its own colour.
         draw    = ImageDraw.Draw(img, 'RGBA')
         results = []
-        num     = 1
 
         keep_results = []   # KEEP items — appended after numbered items
         for d in sorted(raw_detections, key=lambda r: (r['panel'], r['row'], r['col'])):
@@ -4032,18 +4084,18 @@ def _sell_scan_inner(from_calibration=False):
                 })
                 continue
 
-            rec = sell_recommendation(item_data)
+            rec = sell_recommendation(
+                item_data, flea_blocked=flea_block_reason(item_data, d.get('fir'), settings))
             if non_fir_note:
                 rec['reason'] += ' - not FIR, cannot be handed in'
-            if rec['recommend'] == 'flea':
-                bg = (30, 150, 30, 230)
-            else:
-                trader_rgb = TRADER_COLORS_RGB.get(rec['trader_name'], DEFAULT_TRADER_BADGE_RGB)
-                bg = trader_rgb + (230,)
-            draw_badge(draw, bx, by, str(num), bg=bg)
+            count = d.get('count') or 1
+            unit  = rec['flea_net'] if rec['recommend'] == 'flea' else rec['trader_price']
 
             results.append({
-                'num':          num,
+                'num':          None,   # assigned after sorting into sell order
+                'count':        count,
+                'total':        (unit or 0) * count,
+                'uncertain':    bool(d.get('uncertain')),
                 'matched_name': item_data['name'],
                 'score':        d['score'],
                 'col':          d['col'], 'row': d['row'],
@@ -4055,7 +4107,17 @@ def _sell_scan_inner(from_calibration=False):
                 'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph'],
                 **rec,
             })
-            num += 1
+
+        results = order_for_selling(results)
+        for num, r in enumerate(results, start=1):
+            r['num'] = num
+            if r['recommend'] == 'flea':
+                rgb = FLEA_RGB
+            else:
+                rgb = TRADER_COLORS_RGB.get(r['trader_name'], DEFAULT_TRADER_BADGE_RGB)
+            draw.rectangle([r['px'], r['py'], r['px'] + r['pw'], r['py'] + r['ph']],
+                           fill=rgb + (40,), outline=rgb + (255,), width=3)
+            draw_badge(draw, r['x'], r['y'], str(num), bg=rgb + (230,))
 
         results.extend(keep_results)   # KEEP items always at the end
 
