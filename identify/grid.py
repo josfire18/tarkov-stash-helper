@@ -524,6 +524,9 @@ def _detect(img_bgr: np.ndarray, pitch_hint: float | None, min_cells: int,
                          and q.x0 - 2 <= p.x0 and p.x1 <= q.x1 + 2
                          and q.y0 - 2 <= p.y0 and p.y1 <= q.y1 + 2 for q in panels)]
     panels.sort(key=lambda p: (p.y0, p.x0))
+    if panels:
+        rh, rv = ridge_masks(img_bgr, contrast=10, neutral_only=True)
+        panels = [_extend_sides(p, rv, panels) for p in panels]
 
     if pitch_hint and pitch_x and abs(pitch_x - pitch_hint) / pitch_hint > 0.08:
         warnings.append(f'detected pitch {pitch_x:.1f}px differs from screen-implied '
@@ -532,6 +535,37 @@ def _detect(img_bgr: np.ndarray, pitch_hint: float | None, min_cells: int,
         warnings.append(f'anisotropic cells {pitch_x:.2f}x{pitch_y:.2f}px (stretched capture)')
     quality = float(sum(p.n_cols * p.n_rows * p.strength for p in panels))
     return GridResult(panels, pitch_x, pitch_y, warnings, pitch_hint, mode, quality)
+
+
+def _extend_sides(p: Panel, rv: np.ndarray, others: list) -> Panel:
+    """A window's outer columns have no item-colour border on the viewport side (the frame
+    line, a dimmer grey, takes its place), so the lattice stops one column early.  If a
+    frame-like vertical ridge runs along most of the panel exactly one pitch outside the first
+    (last) lattice line, that column belongs to the panel."""
+    h0, h1 = p.y0 + 2, p.y1 - 2
+    if h1 - h0 < 3 * p.pitch_y:
+        return p
+    H, W = rv.shape
+    xs = list(p.xs)
+    for side in (-1, 1):
+        edge = xs[0] if side < 0 else xs[-1]
+        x = int(round(edge + side * p.pitch_x))
+        if x < 3 or x >= W - 3:
+            continue
+        if any(q is not p and q.x0 - 3 <= x <= q.x1 + 3 and q.y0 < p.y1 and q.y1 > p.y0 for q in others):
+            continue
+        cov = rv[h0:h1, max(0, x - 2):x + 3].any(axis=1).mean()
+        # nothing may sit on the far side of the frame line that looks like more panel
+        if cov >= 0.75:
+            if side < 0:
+                xs.insert(0, x)
+            else:
+                xs.append(x)
+    if len(xs) == len(p.xs):
+        return p
+    import dataclasses
+    return dataclasses.replace(p, xs=xs, n_cols=len(xs) - 1, x0=int(xs[0]), x1=int(xs[-1]) + 1,
+                               ox=float(xs[0]) if xs[0] != p.xs[0] else p.ox)
 
 
 def _build_panel(hmc: np.ndarray, vmc: np.ndarray, ax: _Axis, ay: _Axis) -> Panel | None:
