@@ -9,6 +9,7 @@ __pycache__/
 dist/
 build/
 *.spec
+!TarkovStashHelper.spec
 
 # Data — downloaded/generated locally, not committed
 data/icons/
