@@ -120,14 +120,74 @@ def variants_of(strip: np.ndarray) -> list[np.ndarray]:
     return out
 
 
+THICK_ART = 0.14          # a bright blob whose thickest point is wider than this x the strip height (as an
+                          # inscribed radius) is item art, not a stroke (letters measure 0.03-0.10)
+
+
+def classify_components(stats, h: int, thick=None) -> list:
+    """Label each bright connected component of a strip: 'letter', 'piece' or 'art'.
+
+    The label font's strokes are thin: a component only counts as art when it is *thick*
+    (``thick`` = the radius of its largest inscribed circle; an ``I``, a ``-``, a fat ``g`` or
+    half of a split ``T`` are all thin).  Art also runs off the band's bottom or is taller than
+    a glyph.  Letter-sized thin or hollow components are
+    letters; what is left (dots, hyphens, bars) are pieces that only count next to letters."""
+    kinds = ['art']
+    for i, (x, y, bw, bh, area) in enumerate(stats[1:], 1):
+        if y + bh >= h - 1 or bh > 0.9 * h or (thick is not None and thick[i] > THICK_ART * h):
+            kinds.append('art')
+        elif bh >= 0.3 * h:
+            kinds.append('letter')
+        elif max(bw, bh) <= 0.9 * h and area >= 6:
+            kinds.append('piece')
+        else:
+            kinds.append('art')
+    return kinds
+
+
+def text_run(stats, kinds, h: int, wd: int) -> list | None:
+    """Indices of the components that form the label: the run of letters that starts at the
+    right edge and continues leftwards while the next letter is within a word gap, sits on
+    the same line, and (for pieces) lies inside the letters' vertical range.  Item art and
+    dithering to the left of the label never join the run."""
+    idx = [i for i in range(1, len(stats)) if kinds[i] != 'art']
+    letters = [i for i in idx if kinds[i] == 'letter']
+    if not letters:
+        return None
+    gap_max = max(6, int(round(h * 0.55)))
+    anchor = max(letters, key=lambda i: stats[i][0] + stats[i][2])
+    if stats[anchor][0] + stats[anchor][2] < wd * 0.6:          # labels start at the right edge
+        return None
+    run = [anchor]
+    left = stats[anchor][0]
+    y0, y1 = stats[anchor][1], stats[anchor][1] + stats[anchor][3]
+    tol = 0.1 * h
+    for i in sorted(idx, key=lambda i: -(stats[i][0] + stats[i][2])):
+        if i == anchor:
+            continue
+        x, y, bw, bh, _ = stats[i]
+        if x + bw < left - gap_max:
+            break                                         # sorted by right edge: nothing further qualifies
+        if kinds[i] == 'letter':
+            ov = min(y1, y + bh) - max(y0, y)
+            if ov < 0.6 * min(bh, y1 - y0):
+                continue
+            y0, y1 = min(y0, y), max(y1, y + bh)
+        elif y < y0 - tol or y + bh > y1 + tol:
+            continue
+        run.append(i)
+        left = min(left, x)
+    return run
+
+
 def isolate_label(strip: np.ndarray) -> list[np.ndarray] | None:
     """The printed short name alone, without the item art around it.
 
     Labels are thin bright strokes with a dark outline, right-aligned against
     the cell edge; item art in the band (a silver DVD drive, a white bottle) is
-    thick.  Keep bright pixels that survive removal of thick bright regions,
-    take the run of text columns that starts at the right edge, and return that
-    crop as grey and as clean black-on-white text.  None if no text run is found.
+    thick.  Keep the bright components that form the label run (see
+    :func:`text_run`) and return that crop as grey and as clean black-on-white
+    text.  None if no text run is found.
     """
     g = 255 - strip                                   # back to original brightness
     h, wd = g.shape
@@ -135,40 +195,17 @@ def isolate_label(strip: np.ndarray) -> list[np.ndarray] | None:
     thr = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0]
     bright = (g > max(110.0, thr)).astype(np.uint8)
     n, lab, st, _ = cv2.connectedComponentsWithStats(bright, connectivity=8)
-    glyph = np.zeros(n, bool)
-    for i in range(1, n):
-        x, y, bw, bh, area = st[i]
-        letter_sized = 0.3 * h <= bh <= 0.9 * h       # letters may merge into a word: no width cap
-        sparse = area < 0.6 * bw * bh                 # strokes with gaps, not a solid blob
-        art = y + bh >= h - 1 or not sparse           # runs off the band, or solid
-        glyph[i] = letter_sized and not art
-    if not glyph.any():
+    dt = cv2.distanceTransform(bright, cv2.DIST_L2, 3)
+    thick = np.zeros(n)
+    np.maximum.at(thick, lab.ravel(), dt.ravel())
+    run = text_run(st, classify_components(st, h, thick), h, wd)
+    if not run:
         return None
-    gy0 = min(st[i][1] for i in range(1, n) if glyph[i])
-    gy1 = max(st[i][1] + st[i][3] for i in range(1, n) if glyph[i])
-    gx0 = min(st[i][0] for i in range(1, n) if glyph[i])
-    for i in range(1, n):                             # hyphens, dots, apostrophes inside the run
-        x, y, bw, bh, area = st[i]
-        if not glyph[i] and bh < 0.3 * h and x >= gx0 - h * 0.6 and y >= gy0 and y + bh <= gy1:
-            glyph[i] = True
-    text = glyph[lab].astype(np.uint8)
-    cols = text.sum(axis=0) > 0
-    if not cols.any():
-        return None
-    gap_max = max(6, int(round(h * 0.55)))            # a word space, not the gap to the art
-    x1 = int(np.nonzero(cols)[0][-1])
-    if x1 < g.shape[1] * 0.6:                         # labels start at the right edge
-        return None
-    x0, gap = x1, 0
-    for x in range(x1, -1, -1):
-        if cols[x]:
-            x0, gap = x, 0
-        else:
-            gap += 1
-            if gap > gap_max:
-                break
+    text = np.isin(lab, run).astype(np.uint8)
+    x0 = min(int(st[i][0]) for i in run)
+    x1 = max(int(st[i][0] + st[i][2]) for i in run) - 1
     pad = max(4, h // 10)
-    a, z = max(0, x0 - pad), min(g.shape[1], x1 + pad + 1)
+    a, z = max(0, x0 - pad), min(wd, x1 + pad + 1)
     if z - a < h * 0.4:
         return None
     crop = strip[:, a:z]
