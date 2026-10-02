@@ -785,9 +785,7 @@ function startScanProgress(statusEl) {
     try {
       const s = await api('GET', '/api/scan-status');
       if (!s.running) return;
-      if (s.phase === 'match' && s.total) {
-        statusEl.textContent = `Matching cells ${s.done}/${s.total}…`;
-      } else if (s.phase) {
+      if (s.phase) {
         statusEl.textContent = `Scanning — ${s.phase}…`;
       }
     } catch (_) {}

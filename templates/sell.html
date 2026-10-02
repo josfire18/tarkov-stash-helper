@@ -536,7 +536,9 @@ async function updateModelStatus() {
     if (ms.running) {
       const pct = ms.total ? Math.round(100 * ms.done_count / ms.total) : 0;
       el.style.color = '#8ab4f8';
-      el.textContent = `Building icon DB… ${ms.done_count}/${ms.total} (${pct}%)`;
+      el.textContent = ms.phase === 'catalog'
+        ? 'Building item catalog… (about a minute)'
+        : `Downloading item images… ${ms.done_count}/${ms.total} (${pct}%)`;
       startStatusPoll();
       indexReady = false;
     } else if (ms.error) {
@@ -546,12 +548,12 @@ async function updateModelStatus() {
       stopStatusPoll();
     } else if (ms.ready) {
       el.style.color = '#4ade80';
-      el.textContent = `✓ Icon DB ready — ${ms.item_count.toLocaleString()} items`;
+      el.textContent = `✓ Item catalog ready — ${ms.item_count.toLocaleString()} items`;
       indexReady = true;
       stopStatusPoll();
     } else {
       el.style.color = '#f59e0b';
-      el.textContent = 'No icon DB — click Build Icon DB';
+      el.textContent = 'No item catalog — click Build Icon DB';
       indexReady = false;
       stopStatusPoll();
     }
@@ -566,7 +568,7 @@ document.getElementById('btn-build-index').addEventListener('click', async () =>
   try {
     const r = await api('POST', '/api/icons/build-index');
     if (!r.ok) { toast(r.message || 'Failed'); btn.disabled = false; return; }
-    toast('Downloading & indexing icons… check status bar.');
+    toast('Downloading item images & building the catalog… check status bar.');
     startStatusPoll();
   } catch(e) {
     toast('Failed: ' + e.message);
@@ -1019,9 +1021,7 @@ function startScanProgress() {
     try {
       const s = await api('GET', '/api/scan-status');
       if (!s.running) return;
-      if (s.phase === 'match' && s.total) {
-        status.textContent = `Matching cells ${s.done}/${s.total}…`;
-      } else if (s.phase) {
+      if (s.phase) {
         status.textContent = `Scanning — ${s.phase}…`;
       }
     } catch(_) {}

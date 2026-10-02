@@ -90,8 +90,8 @@ class Detection:
     category: str = ''
     short: str = ''
 
-    def to_legacy(self) -> dict:
-        """The record shape the legacy engine produced (what app.py consumes)."""
+    def to_record(self) -> dict:
+        """The flat dict shape app.py's scan routes consume."""
         x, y, w, h = self.rect
         return {'col': self.col, 'row': self.row, 'W': self.w, 'H': self.h,
                 'item_id': self.item_id, 'name': self.name, 'rotated': self.rotated,

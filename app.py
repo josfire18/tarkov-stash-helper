@@ -9,7 +9,6 @@ import time
 import subprocess
 from io import BytesIO
 
-import math
 import re
 import requests as http_requests
 
@@ -25,7 +24,7 @@ import numpy as np
 import sellcalc
 # The sell-advice economics live in sellcalc.py (pure functions); the historical
 # names stay importable from here (test_scan.py scores sell decisions via app.*).
-from sellcalc import (best_trader_price, calc_flea_fee, price_420, flea_block_reason,
+from sellcalc import (best_trader_price, calc_flea_fee, price_420, flea_block_reason,  # noqa: F401
                       sell_recommendation, order_for_selling, TRADER_ORDER)
 
 APP_VERSION = '0.3.1'
@@ -55,10 +54,8 @@ KAPPA_WIKI_PATH  = os.path.join(DATA, 'kappa_wiki.json')   # cached Collector it
 PRESTIGE_WIKI_PATH = os.path.join(DATA, 'prestige_wiki.json')  # cached Prestige requirements from the wiki
 TASKS_CACHE_PATH = os.path.join(DATA, 'tasks_cache.json')  # cached tasks + hideout requirements (tarkov.dev)
 PROGRESS_PATH    = os.path.join(DATA, 'progress.json')     # user task/hideout completion + have-counts
-ICONS_DIR      = os.path.join(DATA, 'icons')          # legacy 64×64 iconLink thumbnails (UI only)
 TMPL_SRC_DIR   = os.path.join(DATA, 'tmpl_src')        # transparent per-slot base images (BGRA PNG)
 os.makedirs(DATA, exist_ok=True)
-os.makedirs(ICONS_DIR, exist_ok=True)
 os.makedirs(TMPL_SRC_DIR, exist_ok=True)
 
 # Tesseract-OCR is an external (non-pip) dependency the user must install
@@ -92,48 +89,7 @@ COLLECTOR_WIKI_API   = ('https://escapefromtarkov.fandom.com/api.php'
 # must be fetched through the MediaWiki API too, never the plain page URL.
 PRESTIGE_WIKI_API    = ('https://escapefromtarkov.fandom.com/api.php'
                         '?action=parse&page=Prestige&prop=text&format=json&formatversion=2')
-ICON_MATCH_THRESHOLD = 0.68  # cv2.TM_CCOEFF_NORMED score cutoff for icon matching
-CANONICAL_PER_SLOT   = 64    # px per 1×1 slot in the canonical-size template
-ICON_MATCH_MIN_SCORE = 0.40  # NCC threshold to accept an icon match
-# Match-quality gate: a grid that passes validate_grid can still be wrong (a
-# chrome-forged fallback), and a wrong grid emits few, low-scoring detections
-# where a correct one claims most occupied cells at high scores.  Below either
-# floor the scan is "suspect" → grid-hypothesis arbitration kicks in.
-SCAN_MIN_ACCEPT_RATE = 0.25  # accepted detections / occupied cells floor
-SCAN_MIN_MEDIAN_PCT  = 55.0  # median accepted score (%) floor (scores are 0–100)
-LABEL_BLANK_PX       = 13    # top rows of each cell to overwrite with bg colour (removes item-name label)
-CORNER_BLANK_PX      = 18    # top-right (FiR ✓) and bottom-right (stack count) corner blanking
-FIR_BRIGHT           = 170   # grayscale floor for a pixel to count as part of the FiR ✓ mark
-FIR_MIN_PX           = 6     # below this many bright px, too little signal to call it FiR (indeterminate)
-FIR_MAX_FRAC         = 0.5   # above this fraction of the corner window lit up, probably not a clean ✓ (indeterminate)
-NCC_MARGIN_MIN       = 0.04  # require top-1 NCC to beat top-2 by this much (rejects ambiguous matches)
-ICON_DB_PATH         = os.path.join(DATA, 'icon_db.npz')
-DB_VERSION           = 7     # bump whenever the vector format changes; forces a rebuild
-CACHE_INCLUDE_PRESETS = False  # preset-tier cache templates ('(build)', FLOOR<=score<STRONG)
-                               # are only ever low-confidence guesses that the association
-                               # pass couldn't tell apart from another same-silhouette item
-                               # (guns/presets are already excluded from DB targets, so these
-                               # are guesses about *non-gun* items) — excluding them stops a
-                               # mislabeled pixel-perfect render from outscoring the true item
-_STASH_BG_BGR        = (38, 42, 44)  # Tarkov stash cell background colour (BGR) — used for blanked (masked-out) regions
-GRID_PITCH_1080P     = 63    # px per slot in-game @ 1080p reference (icon-cache geometry); captures may be ANY pitch
 
-# EFT rarity background tints (BGR), calibrated by diffing tarkov.dev grid-image
-# (background baked) against base-image (transparent alpha) over 6 items/colour.
-# Templates are alpha-composited onto these so anti-aliased icon edges match the
-# real tinted stash cell.  Keyed by the tarkov.dev `backgroundColor` field.
-EFT_BG_TINTS = {
-    'black':   (20, 19, 19),
-    'grey':    (30, 29, 28),
-    'default': (54, 54, 53),
-    'blue':    (45, 39, 29),
-    'violet':  (41, 29, 38),
-    'yellow':  (33, 48, 47),
-    'green':   (24, 34, 27),
-    'orange':  (24, 30, 37),
-    'red':     (29, 32, 49),
-}
-DEFAULT_TINT = (54, 54, 53)
 
 # Per-trader badge colours (RGB — PIL's ImageDraw, unlike the OpenCV/BGR
 # pipeline above, takes RGB(A) tuples) so the sell-scan screenshot's numbered
@@ -155,17 +111,6 @@ DEFAULT_TRADER_BADGE_RGB = (180, 120, 20)  # fallback — the old uniform trader
 FLEA_RGB = (30, 150, 30)
 FLEA_QUEUE_RGB = (95, 125, 95)   # flea picks beyond the offer slots: same family, visibly dimmer
 
-# The scanner only cares about items / parts / components — NOT ammo, full
-# weapons, weapon presets, or storage containers.  Templates for these tarkov.dev
-# `types` are never built, so they can't be matched or become distractors.
-# (Weapon *parts* — barrels, stocks, scopes, grips, suppressors — are type
-# 'mods' and are kept.)
-EXCLUDED_TYPES = {'ammo', 'ammoBox', 'gun', 'preset', 'container'}
-
-
-def is_target_item(item):
-    """True if the item is a match target (not ammo / gun / preset / container)."""
-    return not (set(item.get('types') or ()) & EXCLUDED_TYPES)
 
 PRICE_QUERY = '''{
   items {
@@ -517,11 +462,14 @@ def map_keep_entries_to_ids(keep_list, price_idx):
     return mapped, unmapped
 
 # ---------------------------------------------------------------------------
-# Icon download + template matching helpers
+# Item catalog build (the "Build Icon DB" button on the Sell Advisor page)
+#
+# The identification engine (identify/) matches against a template catalog made from the
+# price list plus one tarkov.dev base image per item (every item - ammo, guns, presets and
+# containers included - because the engine identifies those too).  These helpers fetch the
+# images into data/tmpl_src/; identify.catalog.load_catalog then turns them into
+# data/identify_catalog_v2.npz.
 # ---------------------------------------------------------------------------
-
-def icon_cache_path(item_id):
-    return os.path.join(ICONS_DIR, f'{item_id}.png')
 
 _icon_session = None
 def _get_icon_session():
@@ -534,62 +482,6 @@ def _get_icon_session():
         _icon_session = s
     return _icon_session
 
-def download_icon(item_id, icon_url):
-    """Download icon PNG from tarkov.dev and cache it. Returns local path or None."""
-    path = icon_cache_path(item_id)
-    if os.path.exists(path) and os.path.getsize(path) > 0:
-        return path
-    try:
-        r = _get_icon_session().get(icon_url, timeout=10)
-        if r.status_code == 200:
-            with open(path, 'wb') as f:
-                f.write(r.content)
-            return path
-    except Exception:
-        pass
-    return None
-
-# match_icon() (whole-screenshot cv2.matchTemplate against 64×64 iconLink
-# thumbnails) was retired: it stretched aspect-wrong thumbnails and drifted
-# across the grid.  Keep-list highlighting now runs through the same masked-NCC
-# icon DB as the sell scanner (see /api/screenshot).
-
-
-# ---------------------------------------------------------------------------
-# Icon matching via canonical-resolution normalized cross-correlation (NCC).
-#
-# Strategy:
-#   1. At DB build time: composite every item icon on a dark stash-like bg,
-#      resize it to a CANONICAL size (CANONICAL_PER_SLOT × W, CANONICAL_PER_SLOT × H),
-#      convert to grayscale, and store the flattened uint8 vector.
-#   2. At scan time: crop each candidate cell block, resize to the same
-#      canonical size, flatten, and compute NCC against every template of
-#      that (W,H) size via a single batched dot product.
-#
-# Because every cell is resized independently, sub-pixel grid drift across
-# the screenshot does NOT accumulate — each cell is normalized to the same
-# reference frame as the database icons.
-# ---------------------------------------------------------------------------
-
-_UINT64 = np.uint64   # kept for backwards compat, unused by NCC
-
-def _composite_on_dark(icon_bgra, bg_rgb=(38, 42, 44)):
-    """Composite a BGRA icon onto a solid background colour (BGR tuple)."""
-    if icon_bgra.ndim == 2:
-        return cv2.cvtColor(icon_bgra, cv2.COLOR_GRAY2BGR)
-    if icon_bgra.shape[2] == 3:
-        return icon_bgra
-    rgb = icon_bgra[:, :, :3].astype(np.float32)
-    alpha = (icon_bgra[:, :, 3:4].astype(np.float32)) / 255.0
-    bg = np.full_like(rgb, bg_rgb, dtype=np.float32)
-    out = rgb * alpha + bg * (1.0 - alpha)
-    return out.astype(np.uint8)
-
-
-def tint_for(item):
-    """Return the EFT stash-cell background tint (BGR) for an item's rarity colour."""
-    return EFT_BG_TINTS.get(item.get('backgroundColor') or 'default', DEFAULT_TINT)
-
 
 def base_image_path(item_id):
     return os.path.join(TMPL_SRC_DIR, f'{item_id}.png')
@@ -597,11 +489,8 @@ def base_image_path(item_id):
 
 def download_base_image(item_id, url):
     """
-    Download a tarkov.dev base-image (transparent, per-slot resolution) and
-    cache it as a BGRA PNG.  Returns local path or None.
-
-    The base-image is the correct-geometry, real-alpha source that replaces the
-    fatal 64×64 iconLink thumbnail for template matching.
+    Download a tarkov.dev base image (transparent, per-slot resolution) and cache it as a
+    BGRA PNG in data/tmpl_src/.  Returns the local path, or None when it could not be fetched.
     """
     path = base_image_path(item_id)
     if os.path.exists(path) and os.path.getsize(path) > 0:
@@ -612,1249 +501,64 @@ def download_base_image(item_id, url):
         r = _get_icon_session().get(url, timeout=12)
         if r.status_code != 200:
             return None
-        arr = np.frombuffer(r.content, np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)   # decodes webp → BGRA
+        img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_UNCHANGED)   # webp -> BGRA
         if img is None or img.size == 0:
             return None
-        if img.ndim == 3 and img.shape[2] == 4:
-            cv2.imwrite(path, img)
-        else:
-            # No alpha (rare) — store as-is; mask falls back to saturation heuristic
-            cv2.imwrite(path, img)
+        tmp = path + '.tmp.png'          # write-then-rename: a killed build never leaves a half file
+        cv2.imwrite(tmp, img)
+        os.replace(tmp, path)
         return path
     except Exception:
         return None
 
-def _apply_label_blank(img_bgr, slot=None):
-    """
-    Overwrite Tarkov UI overlay regions with the stash background colour:
-      - top label strip          → erases the white item-name label
-      - top-right corner         → erases the Found-in-Raid ✓
-      - bottom-right corner      → erases the white stack-count digits
 
-    Game crops: removes UI artefacts the game overlays on the cell.
-    Icon templates: those regions are already transparent-composited to bg,
-                    so this is effectively a no-op (kept for symmetry).
-
-    `slot` is the px-per-slot of the image being blanked.  When given, the
-    blank regions scale as LABEL_BLANK_PX/CORNER_BLANK_PX fractions of the
-    canonical slot — so a 42px screen cell blanks the same *fraction* the
-    template masks blank at canonical resolution (floor'd, to stay inside the
-    mask-zeroed region).  When None (template-build path, ~63px sources), the
-    legacy fixed-pixel constants apply unchanged.
-
-    Overwriting (not cropping) preserves image dimensions so the downstream
-    resize step has no geometry distortion.
-    """
-    h, w = img_bgr.shape[:2]
-    out = img_bgr.copy()
-    if slot is None:
-        blank_px, corner_px = LABEL_BLANK_PX, CORNER_BLANK_PX
-    else:
-        blank_px  = int(LABEL_BLANK_PX  * slot / CANONICAL_PER_SLOT)
-        corner_px = int(CORNER_BLANK_PX * slot / CANONICAL_PER_SLOT)
-    n = min(blank_px, h // 4)
-    if n > 0:
-        out[:n, :] = _STASH_BG_BGR
-    c = min(corner_px, h // 3, w // 3)
-    if c > 0:
-        # top-right corner (FiR check mark)
-        out[:c, w - c:] = _STASH_BG_BGR
-        # bottom-right corner (stack-count digits)
-        out[h - c:, w - c:] = _STASH_BG_BGR
-    return out
-
-
-def detect_fir(img_bgr, grid, col, row, W, H):
-    """
-    Read the Found-in-Raid ✓ out of the RAW frame (call this BEFORE any
-    _apply_label_blank crop-copy has blanked the corner — `img_bgr` here is
-    the full screenshot, not a per-cell copy, so the mark is still present).
-
-    The game draws a small white/bright checkmark in the top-right corner of
-    the item's FOOTPRINT (not each individual cell), so the sample window is
-    anchored off the footprint's right edge, scaled to the same 18px@63px-cell
-    ratio _apply_label_blank uses.
-
-    Three-valued return — True / False / None — and this is load-bearing:
-      True  = confidently FiR (a checkmark-shaped bright cluster was found).
-      False = confidently NOT FiR (corner is clean background).
-      None  = indeterminate (label overflow into the corner, off-image window,
-              or ambiguous pixel count). Callers must NEVER treat None as
-              "not FiR" — a caller that downgrades/unprotects an item on None
-              risks incorrectly letting a real FiR item be sold or excluding
-              it from a Kappa checklist it actually satisfies.
-    """
-    x2 = int(round(grid['origin_x'] + (col + W) * grid['cell_w']))
-    y1 = int(round(grid['origin_y'] + row * grid['cell_h']))
-    c = round(18 * grid['cell_w'] / 63)
-    if c < 1:
-        return None
-    sh, sw = img_bgr.shape[:2]
-    wx1, wy1 = max(0, x2 - c), max(0, y1)
-    wx2, wy2 = min(sw, x2), min(sh, y1 + c)
-    if wy2 - wy1 < 3 or wx2 - wx1 < 3:
-        return None
-    window = img_bgr[wy1:wy2, wx1:wx2]
-
-    gray = cv2.cvtColor(window, cv2.COLOR_BGR2GRAY)
-    hsv  = cv2.cvtColor(window, cv2.COLOR_BGR2HSV)
-    sat  = hsv[:, :, 1]
-    bright_mask = (gray > FIR_BRIGHT) & (sat < 60)
-
-    # If the bright mask touches the window's left edge, it's very likely the
-    # item's name label overflowing into the corner (long names run the full
-    # cell width) rather than the checkmark glyph — indeterminate, not False.
-    if bright_mask[:, 0].any():
-        return None
-
-    n = int(bright_mask.sum())
-    if n == 0:
-        return False
-    # FIR_MIN_PX was calibrated on 63px cells (18px corner window); the ✓
-    # glyph's pixel count shrinks with the window AREA, so scale quadratically
-    # for low-pitch captures (floor 2 keeps a couple of stray bright px from
-    # reading as a checkmark).
-    min_px = max(2, round(FIR_MIN_PX * (grid['cell_w'] / 63.0) ** 2))
-    max_px = FIR_MAX_FRAC * window.shape[0] * window.shape[1]
-    if min_px <= n <= max_px:
-        return True
-    return None
-
-
-def _canonical_bgr_flat(img_bgr, W, H):
-    """
-    Resize a BGR image to the canonical grid size (W*SLOT × H*SLOT) and return a
-    flat float32 array of shape (W*SLOT * H*SLOT * 3,).
-
-    Full BGR colour gives the NCC 3× the signal of grayscale and lets per-item
-    colour signatures drive matching.  The [0,210] clip suppresses residual
-    white UI artefacts that have no equivalent in the clean templates.
-
-    NOTE: near-identical items that share a silhouette and differ only by a
-    small coloured region + printed label (the whole stimulant-injector family)
-    are NOT reliably separable here — the shared shape dominates NCC.  Chroma
-    amplification was tried and made it worse (it turned the neutral body into
-    matching noise / universal high correlation).  Exact separation of those
-    needs the game's index.json hash → item mapping (see icon_cache notes).
-    """
-    tw = W * CANONICAL_PER_SLOT
-    th = H * CANONICAL_PER_SLOT
-    resized = cv2.resize(img_bgr, (tw, th), interpolation=cv2.INTER_AREA)
-    resized = np.clip(resized, 0, 210)   # suppress residual white UI artefacts
-    return resized.astype(np.float32).reshape(-1)
-
-
-def _build_foreground_mask(raw, w, h):
-    """
-    Build a per-pixel foreground mask at canonical resolution, BGR-replicated
-    flat (size W*SLOT * H*SLOT * 3).  Used to weight NCC so background pixels
-    don't dominate matches on icons with mostly-transparent assets (Meds,
-    screws, ornaments, etc.).
-
-    Source preference:
-      1. PNG alpha channel (alpha > 32) — most accurate.
-      2. Saturation fallback for non-alpha sources: |max(BGR) - min(BGR)| > 12
-         excludes near-uniform dark/grey areas.
-    """
-    tw = w * CANONICAL_PER_SLOT
-    th = h * CANONICAL_PER_SLOT
-    if raw.ndim == 3 and raw.shape[2] == 4:
-        alpha = raw[:, :, 3]
-        mask2d = (alpha > 32).astype(np.uint8)
-    else:
-        bgr = raw if raw.ndim == 3 else cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
-        bgr = bgr[:, :, :3].astype(np.int16)
-        sat = bgr.max(axis=2) - bgr.min(axis=2)
-        mask2d = (sat > 12).astype(np.uint8)
-    mask2d = cv2.resize(mask2d, (tw, th), interpolation=cv2.INTER_NEAREST)
-    # Zero out regions that get blanked by _apply_label_blank so they don't
-    # contribute to NCC — keeps the mask consistent with the BGR templates.
-    n = min(LABEL_BLANK_PX, th // 4)
-    if n > 0:
-        mask2d[:n, :] = 0
-    c = min(CORNER_BLANK_PX, th // 3, tw // 3)
-    if c > 0:
-        mask2d[:c, tw - c:] = 0
-        mask2d[th - c:, tw - c:] = 0
-    # Replicate per-pixel mask across BGR channels and flatten
-    mask3 = np.repeat(mask2d[:, :, None], 3, axis=2)
-    return mask3.reshape(-1).astype(np.uint8)
-
-
-def _template_from_bgra(src, W, H, tint):
-    """
-    From a BGRA (or BGR) source image at any resolution, produce a
-    (canonical BGR vector, foreground mask) pair for footprint W×H, or None
-    if the icon has no usable foreground.
-
-    `src` is composited onto the item's rarity `tint` so anti-aliased edges
-    match the real tinted stash cell.  The alpha channel drives the foreground
-    mask; masked-out (background) pixels never contribute to NCC.
-    """
-    composited = _composite_on_dark(src, tint)
-    composited = _apply_label_blank(composited)   # consistent with crop-side blanking
-    canon = _canonical_bgr_flat(composited, W, H)   # clip + chroma-weighted Lab applied inside
-    mask = _build_foreground_mask(src, W, H)
-    if mask.sum() < 16:
-        return None
-    return canon, mask
-
-
-def _load_template_source(item):
-    """
-    Return a BGRA (or BGR) source image for an item's template, preferring the
-    correct-geometry tarkov.dev base-image (transparent, per-slot resolution).
-    Falls back to the grid-image (background baked, no alpha) if base is absent.
-    Returns (src_ndarray, has_alpha) or (None, False).
-    """
-    path = download_base_image(item['id'], item.get('baseImageLink'))
-    if path:
-        src = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if src is not None and src.size and src.ndim == 3 and src.shape[2] == 4:
-            return src, True
-    # Fallback: grid image (baked background — weaker foreground mask)
-    gpath = download_base_image(item['id'] + '-g', item.get('gridImageLink'))
-    if gpath:
-        src = cv2.imread(gpath, cv2.IMREAD_UNCHANGED)
-        if src is not None and src.size:
-            return src, (src.ndim == 3 and src.shape[2] == 4)
-    return None, False
-
-
-def _rotations_for(src, W, H):
-    """
-    Yield (footprint_wh, rotated_flag, rotated_src) variants for a template.
-
-    Always yields the native orientation.  For non-square items, also yields
-    both 90° rotations (game rotates the icon pixels when placed rotated) into
-    the transposed (H,W) footprint bucket.  Both CW and CCW are indexed because
-    the in-game rotation direction is orientation-dependent; the id-aware margin
-    check keeps the two same-item variants from rejecting each other.
-    """
-    yield (W, H), False, src
-    if W != H:
-        yield (H, W), True, cv2.rotate(src, cv2.ROTATE_90_CLOCKWISE)
-        yield (H, W), True, cv2.rotate(src, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-
-def _build_one_template(item):
-    """
-    Worker: download the base image and produce API-source template record(s).
-
-    Returns a list of records
-        (footprint_wh, item_id, name, source, rotated, canon_vec, mask)
-    — one native plus (for non-square items) two rotated variants — or [].
-    """
-    W = item.get('width') or 1
-    H = item.get('height') or 1
-    tint = tint_for(item)
-    src, _has_alpha = _load_template_source(item)
-    if src is None:
-        return []
-    records = []
-    for (fw, fh), rotated, rsrc in _rotations_for(src, W, H):
-        made = _template_from_bgra(rsrc, fw, fh, tint)
-        if made is None:
-            continue
-        canon, mask = made
-        records.append(((fw, fh), item['id'], item['name'], 'api', rotated, canon, mask))
-    return records
-
-
-def _stack_raw(by_size_raw):
-    """
-    Convert {(w,h): {'ids': [...], ..., 'tmpls': [uint8 vec, ...], 'masks': [...]}}
-    into the compact RAW runtime form kept in memory:
-        {(w,h): {'ids','names','sources','rotated', 'T': (N,D) uint8, 'M': (N,D) uint8}}
-    Templates stay at canonical resolution (CANONICAL_PER_SLOT px/slot); the
-    matcher-ready float vectors are derived per screen pitch by get_db_at_pitch.
-    """
-    out = {}
-    for (w, h), b in by_size_raw.items():
-        if not b['tmpls']:
-            continue
-        n = len(b['ids'])
-        out[(w, h)] = {
-            'ids':     b['ids'],
-            'names':   b['names'],
-            'sources': b.get('sources', ['api'] * n),
-            'rotated': b.get('rotated', [False] * n),
-            'T':       np.vstack(b['tmpls']).astype(np.uint8),
-            'M':       np.vstack(b['masks']).astype(np.uint8),
-        }
-    return out
-
-
-def _finalize_arrays(tmpls, masks):
-    """
-    Precompute masked-NCC vectors from float32 (N, D) template/mask matrices.
-
-    Each template is masked-mean-centred and unit-normed using ITS OWN mask,
-    so at match time:
-        scores = (tmpls_unit @ cell) / sqrt(masks @ cell² - (masks @ cell)² / mask_counts)
-    correctly computes NCC restricted to each template's foreground region.
-    """
-    mask_counts = masks.sum(axis=1)                      # (N,)
-    # Per-template masked mean = Σ(mask * tmpl) / Σ(mask)
-    masked_means = (masks * tmpls).sum(axis=1) / np.maximum(mask_counts, 1.0)  # (N,)
-    # Mean-centre INSIDE the mask, zero OUTSIDE — multiply-by-mask handles both
-    centered = (tmpls - masked_means[:, None]) * masks
-    norms = np.linalg.norm(centered, axis=1, keepdims=True)
-    norms = np.where(norms > 1e-6, norms, 1.0)
-    tmpls_unit = (centered / norms).astype(np.float32)
-    return tmpls_unit, masks.astype(np.float32), mask_counts.astype(np.float32)
-
-
-def _slot_px(grid):
-    """
-    Matching slot size (px/slot) for a detected grid: the screen's own pitch,
-    capped at canonical (matching above canonical adds no information, only
-    memory), floored to keep degenerate grids from producing empty templates.
-    """
-    spw = max(16, min(CANONICAL_PER_SLOT, int(round(grid['cell_w']))))
-    sph = max(16, min(CANONICAL_PER_SLOT, int(round(grid['cell_h']))))
-    return spw, sph
-
-
-_pitch_db_cache = {}          # (spw, sph) -> matcher db; only most recent kept
-_pitch_db_lock = threading.Lock()
-
-
-def _invalidate_pitch_cache():
-    with _pitch_db_lock:
-        _pitch_db_cache.clear()
-
-
-def get_db_at_pitch(raw_db, spw, sph):
-    """
-    Matcher-ready DB at slot size (spw, sph): templates and masks resampled
-    from canonical resolution to the screen's own pitch (INTER_AREA — mirrors
-    the game's own downscale when it renders 63px cache icons in a smaller
-    window), then masked-NCC finalized.  Cached; a pitch change (rare) evicts
-    the previous pitch's arrays.
-    """
-    key = (spw, sph)
-    with _pitch_db_lock:
-        if key in _pitch_db_cache:
-            return _pitch_db_cache[key]
-        canonical = (spw == CANONICAL_PER_SLOT and sph == CANONICAL_PER_SLOT)
-        t0 = time.time()
-        out = {}
-        for (w, h), b in raw_db.items():
-            T, M = b['T'], b['M']
-            if canonical:
-                tmpls = T.astype(np.float32)
-                masks = (M > 0).astype(np.float32)
-            else:
-                n = T.shape[0]
-                src_h, src_w = h * CANONICAL_PER_SLOT, w * CANONICAL_PER_SLOT
-                dst_h, dst_w = h * sph, w * spw
-                D = dst_h * dst_w * 3
-                tmpls = np.empty((n, D), dtype=np.float32)
-                masks = np.empty((n, D), dtype=np.float32)
-                for i in range(n):
-                    img = T[i].reshape(src_h, src_w, 3)
-                    tmpls[i] = cv2.resize(img, (dst_w, dst_h),
-                                          interpolation=cv2.INTER_AREA).reshape(-1)
-                    m = M[i].reshape(src_h, src_w, 3)
-                    masks[i] = cv2.resize(m, (dst_w, dst_h),
-                                          interpolation=cv2.INTER_NEAREST).reshape(-1)
-                masks = (masks > 0).astype(np.float32)
-            tmpls_unit, masks_f, mask_counts = _finalize_arrays(tmpls, masks)
-            out[(w, h)] = {
-                'ids':         b['ids'],
-                'names':       b['names'],
-                'sources':     b['sources'],
-                'rotated':     b['rotated'],
-                'tmpls_unit':  tmpls_unit,
-                'masks':       masks_f,
-                'mask_counts': mask_counts,
-            }
-        if not canonical:
-            total = sum(len(b['ids']) for b in out.values())
-            print(f"[icon_db] resampled {total} templates to {spw}×{sph}px/slot "
-                  f"in {time.time() - t0:.1f}s")
-        _pitch_db_cache.clear()          # keep only the active pitch in RAM
-        _pitch_db_cache[key] = out
-        return out
-
-
-def get_matcher_db(grid):
-    """Raw DB → matcher DB at the grid's own pitch (None if no DB built)."""
-    raw = get_icon_db()
-    if not raw:
-        return None
-    spw, sph = _slot_px(grid)
-    return get_db_at_pitch(raw, spw, sph)
-
-
-def _append_record(by_size_raw, wh, item_id, name, source, rotated, vec, mask):
-    b = by_size_raw.setdefault(wh, {'ids': [], 'names': [], 'sources': [],
-                                    'rotated': [], 'tmpls': [], 'masks': []})
-    b['ids'].append(item_id)
-    b['names'].append(name)
-    b['sources'].append(source)
-    b['rotated'].append(bool(rotated))
-    b['tmpls'].append(vec)
-    b['masks'].append(mask)
-
-
-def build_icon_db(price_cache, progress_cb=None, workers=24, use_cache=True):
-    """
-    Build a size-bucketed database of BGR colour templates ready for masked NCC.
-
-    Two template sources are merged:
-      1. The game's local icon cache (pixel-perfect, includes modded builds) —
-         associated to item IDs by icon_cache.build_cache_templates().  Preferred.
-      2. tarkov.dev base-images composited onto the rarity tint — full catalog
-         coverage, including items this account has never rendered.
-
-    Non-square items also get 90°-rotated variants so rotated placements match.
-    Persists to ICON_DB_PATH (npz).  Returns runtime dict.
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    # Only build templates for match targets — dropping ammo/guns/presets/cases
-    # removes ~1k distractors (esp. near-identical ammo) and can't be matched.
-    all_items = price_cache.get('items', [])
-    items = [it for it in all_items if is_target_item(it)]
-    print(f"[icon_db] target items: {len(items)} of {len(all_items)} "
-          f"(excluded {len(all_items) - len(items)} ammo/gun/preset/container)")
-    total = len(items)
-    done = 0
-    by_size_raw = {}
-
-    # --- Source 1: game icon cache (visually associated) ---------------------
-    cache_ids = set()
-    if use_cache:
-        try:
-            import icon_cache
-            cache_recs = icon_cache.build_cache_templates(
-                items, _template_from_bgra, tint_for, _load_template_source)
-            n_skipped_preset = 0
-            for (wh, item_id, name, rotated, vec, mask, exact, preset) in cache_recs:
-                if preset and not CACHE_INCLUDE_PRESETS:
-                    n_skipped_preset += 1
-                    continue
-                src = 'cache-exact' if exact else 'cache'
-                _append_record(by_size_raw, wh, item_id, name, src, rotated, vec, mask)
-                cache_ids.add(item_id)
-            print(f"[icon_db] cache templates: {len(cache_recs) - n_skipped_preset} "
-                  f"({len(cache_ids)} distinct items, {n_skipped_preset} preset-tier skipped)")
-        except Exception as e:
-            print(f"[icon_db] icon-cache pass skipped: {e}")
-
-    # --- Source 2: tarkov.dev base-images (full catalog) ---------------------
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(_build_one_template, it) for it in items]
-        for fut in as_completed(futures):
-            done += 1
-            if progress_cb and done % 25 == 0:
-                progress_cb(done, total)
-            try:
-                records = fut.result()
-            except Exception:
-                continue
-            for (wh, item_id, name, source, rotated, vec, mask) in records:
-                _append_record(by_size_raw, wh, item_id, name, source, rotated, vec, mask)
+def download_missing_base_images(price_cache, progress_cb=None, workers=24):
+    """Fetch the base image of every item that does not have one yet, in parallel.
+    Returns (downloaded, failed).  progress_cb(done, total) counts only the missing ones."""
+    from concurrent.futures import ThreadPoolExecutor
+    todo = [it for it in price_cache.get('items', [])
+            if it.get('baseImageLink') and not os.path.exists(base_image_path(it['id']))]
+    done = ok = 0
     if progress_cb:
-        progress_cb(done, total)
-
-    save_icon_db(by_size_raw)
-    return _stack_raw(by_size_raw)
-
-
-def save_icon_db(by_size_raw):
-    """Save raw uint8 BGR templates + foreground masks + metadata to .npz."""
-    meta = {'_version': DB_VERSION}   # version stamp — mismatches trigger rebuild
-    saves = {}
-    for (w, h), b in by_size_raw.items():
-        if not b['tmpls']:
-            continue
-        key = f'{w}x{h}'
-        n = len(b['ids'])
-        saves[f'T_{key}'] = np.vstack(b['tmpls']).astype(np.uint8)
-        saves[f'M_{key}'] = np.vstack(b['masks']).astype(np.uint8)
-        meta[key] = {
-            'ids':     b['ids'],
-            'names':   b['names'],
-            'sources': b.get('sources', ['api'] * n),
-            'rotated': [bool(x) for x in b.get('rotated', [False] * n)],
-        }
-    meta_bytes = json.dumps(meta).encode('utf-8')
-    saves['META'] = np.frombuffer(meta_bytes, dtype=np.uint8)
-    # Write-then-rename so no reader can ever observe a half-written archive:
-    # the compressed write takes tens of seconds for a full DB, and the status
-    # endpoints poll get_icon_db() the whole time — np.load on a partial zip
-    # raises BadZipFile ("File is not a zip file"). The tmp name must already
-    # end in .npz or numpy appends the extension and os.replace misses it.
-    tmp_path = ICON_DB_PATH + '.tmp.npz'
-    try:
-        np.savez_compressed(tmp_path, **saves)
-        os.replace(tmp_path, ICON_DB_PATH)
-    finally:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        progress_cb(0, len(todo))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for path in ex.map(lambda it: download_base_image(it['id'], it['baseImageLink']), todo):
+            done += 1
+            ok += bool(path)
+            if progress_cb and done % 25 == 0:
+                progress_cb(done, len(todo))
+    if progress_cb:
+        progress_cb(len(todo), len(todo))
+    return ok, len(todo) - ok
 
 
-def load_icon_db():
-    """Load the persisted icon DB, or None if missing/invalid/outdated."""
-    global _icon_db_error
-    if not os.path.exists(ICON_DB_PATH):
+def catalog_summary():
+    """What the Sell Advisor's status line shows: whether the engine's catalog file exists and
+    how many tarkov.dev items it covers (None when not built or unreadable)."""
+    from identify.config import CATALOG_PATH
+    if not os.path.exists(CATALOG_PATH):
         return None
     try:
-        z = np.load(ICON_DB_PATH, allow_pickle=False)
-        meta = json.loads(bytes(z['META']).decode('utf-8'))
-        db_ver = meta.get('_version', 1)
-        if db_ver != DB_VERSION:
-            print(f"[icon_db] version mismatch (file={db_ver}, code={DB_VERSION}) — "
-                  "rebuild required (click Build Icon DB)")
-            return None
-        by_size_raw = {}
-        for key, info in meta.items():
-            if key.startswith('_'):      # skip internal fields like _version
-                continue
-            w, h = (int(x) for x in key.split('x'))
-            arr = z[f'T_{key}']   # (N, D) uint8
-            marr = z[f'M_{key}']  # (N, D) uint8
-            n = len(info['ids'])
-            by_size_raw[(w, h)] = {
-                'ids':     info['ids'],
-                'names':   info['names'],
-                'sources': info.get('sources', ['api'] * n),
-                'rotated': info.get('rotated', [False] * n),
-                'tmpls':   [arr[i] for i in range(arr.shape[0])],
-                'masks':   [marr[i] for i in range(marr.shape[0])],
-            }
-        db = _stack_raw(by_size_raw)
-        _icon_db_error = None   # a good load supersedes any earlier failure
-        return db
+        with np.load(CATALOG_PATH, allow_pickle=False) as z:     # lazy: only meta_json is read
+            return {'items': int(json.loads(str(z['meta_json'])).get('n_api', 0))}
     except Exception as e:
-        _icon_db_error = f'Icon DB load failed: {e}'
-        print(f"[icon_db] load failed: {e}")
+        print(f'[catalog] unreadable: {e}')
         return None
-
-
-# Global in-memory DB (populated on first use)
-_icon_db = None
-_icon_db_error = None
-_icon_db_lock = threading.Lock()
-
-def get_icon_db():
-    """Return the runtime icon DB, loading from disk if needed.
-
-    While a rebuild is in flight, don't touch the disk at all — the status
-    endpoints poll this several times a second, and each miss would re-read
-    (and re-log a version mismatch for) a file that's about to be replaced
-    anyway. The build thread publishes the fresh DB directly into _icon_db
-    when it finishes.
-    """
-    global _icon_db
-    if _icon_db is None and not _index_build_state['running']:
-        with _icon_db_lock:
-            if _icon_db is None:
-                _icon_db = load_icon_db()
-    return _icon_db
 
 
 # ---------------------------------------------------------------------------
-# Grid-cell identification using the canonical-template DB
+# Identification: the identify/ package (grid -> segmentation -> template/DINO/OCR matching)
 # ---------------------------------------------------------------------------
-
-def _cell_block(img_bgr, col, row, W, H, grid, pad=0, dx=0, dy=0):
-    """
-    Pixel rect of a W×H cell block starting at (col, row), optionally padded
-    and shifted by (dx, dy) whole pixels (alignment-refinement search).
-
-    Grid pitch/origin are floats (non-integer pitch is the norm for windowed
-    captures — 63·900/1080 = 52.5); each edge is rounded independently off the
-    accumulated float position so rounding error never drifts across the panel.
-    """
-    ox, oy = grid['origin_x'], grid['origin_y']
-    cw, ch = grid['cell_w'], grid['cell_h']
-    x1 = int(round(ox + col * cw)) + dx - pad
-    y1 = int(round(oy + row * ch)) + dy - pad
-    x2 = int(round(ox + (col + W) * cw)) + dx + pad
-    y2 = int(round(oy + (row + H) * ch)) + dy + pad
-    sh, sw = img_bgr.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(sw, x2), min(sh, y2)
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return img_bgr[y1:y2, x1:x2]
-
-
-def _cell_is_empty(img_bgr, col, row, grid):
-    """
-    Empty stash cells are pure background — very uniform dark pixels.
-    Tarkov background ≈ (38,42,44) BGR → gray ≈ 41.
-    An item will raise either the std (texture/shape) OR have pixels
-    meaningfully above the background level, even if the item is dark.
-    """
-    crop = _cell_block(img_bgr, col, row, 1, 1, grid)
-    if crop is None or crop.size == 0:
-        return True
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    if gray.shape[0] > 8 and gray.shape[1] > 8:
-        gray = gray[4:-4, 4:-4]
-    # Pixels meaningfully above the dark stash background (~41 gray)
-    above_bg = float((gray > 58).mean())
-    # Empty = essentially uniform AND almost nothing above background
-    return float(gray.std()) < 5.0 and above_bg < 0.04
-
-
-def _native_cell_vec(img_bgr, col, row, W, H, grid, spw, sph, dx=0, dy=0):
-    """
-    Extract the (W×H) cell block from the screenshot and return a flat
-    float32 BGR vector at the matching slot size (spw×sph px/slot — the
-    screen's own pitch, capped at canonical), ready for masked NCC against
-    a get_db_at_pitch DB of the same slot size.
-
-    Preprocessing:
-      1. Resize to the exact bucket dims (±1px rounding normalization; a
-         no-op when the pitch is integral).
-      2. _apply_label_blank(slot=sph) — overwrites top rows + right corners
-         with bg colour to remove Tarkov's label, FiR ✓, and stack-count
-         overlays, scaled to the slot size.
-      3. Clip [0, 210] — suppresses residual white UI artefacts that have
-         no equivalent in the clean icon templates.
-
-    (dx, dy) shifts the source crop by whole pixels for the alignment-
-    refinement search.  Per-template masked-mean-centring + unit-norming is
-    done at match time, since each template uses its own mask.
-    """
-    crop = _cell_block(img_bgr, col, row, W, H, grid, dx=dx, dy=dy)
-    if crop is None or crop.shape[0] < 8 or crop.shape[1] < 8:
-        return None
-    tw, th = W * spw, H * sph
-    if crop.shape[1] != tw or crop.shape[0] != th:
-        crop = cv2.resize(crop, (tw, th), interpolation=cv2.INTER_AREA)
-    crop = _apply_label_blank(crop, slot=sph)
-    crop = np.clip(crop, 0, 210)
-    return crop.astype(np.float32).reshape(-1)
-
-
-OCR_FULL_MIN_PITCH  = 40  # px/slot at/above which the OCR label may override NCC identity
-OCR_AGREE_MIN_PITCH = 30  # px/slot at/above which the OCR label may confirm (never override) NCC
-OCR_LABEL_BASE   = 78   # rapidfuzz WRatio floor to consider an OCR name candidate at all
-OCR_AGREE_CUTOFF = 78   # OCR agrees with NCC → accept (mutual confirmation)
-OCR_OVER_CUTOFF  = 84   # OCR overrides a *different* NCC identity → needs this
-OCR_SHORT_OVER   = 99   # short OCR tokens (≤3 chars) overriding NCC need near-exact (blocks 'Li'→Splint)
-
-
-def _ocr_tokens_contained(text, name, short):
-    """
-    True iff every OCR token is equal to, or a prefix of, some token of the
-    candidate's `name + ' ' + short` (case-insensitive).  Empty OCR token list
-    (e.g. blank/whitespace-only OCR text) always fails.
-
-    Guards the OCR override tier: rapidfuzz's WRatio scores on overall string
-    similarity, so a misread label can still cross OCR_OVER_CUTOFF against an
-    unrelated item purely by chance substring overlap — the reproduced failure
-    was a PMAG label OCR'd as 'gen m3' scoring 85.5 against "Benelli M3 …
-    charging handle" (>= the old 84 cutoff).  'gen' is not a token (or prefix
-    of a token) of any Benelli name/shortName token, so this correctly rejects
-    it, while still allowing legitimate partial reads like 'benel m3' (a
-    prefix of 'benelli') or 'pmag 30 gen m3' (all exact tokens) through.
-    """
-    ocr_tokens = [t for t in re.split(r'[^A-Za-z0-9]+', text.lower()) if len(t) >= 2]
-    if not ocr_tokens:
-        return False
-    ref_tokens = [t for t in re.split(r'[^A-Za-z0-9]+', (name + ' ' + short).lower()) if t]
-    return all(any(rt.startswith(ot) for rt in ref_tokens) for ot in ocr_tokens)
-
-
-def _ocr_cell_label(img_bgr, col, row, W, grid):
-    """
-    OCR the item name the game prints across the top of a cell (single line,
-    left-aligned).  This is the signal NCC lacks: it separates same-shape items
-    like L1 / SJ12 / eTG-c that share one injector silhouette.
-    Returns cleaned text (leading UI junk stripped) or ''.
-    """
-    x = int(round(grid['origin_x'] + col * grid['cell_w']))
-    y = int(round(grid['origin_y'] + row * grid['cell_h']))
-    w = int(round(W * grid['cell_w']))
-    lh = max(12, int(round(grid['cell_h'] * 0.30)))
-    sh, sw = img_bgr.shape[:2]
-    x1, y1 = max(0, x), max(0, y)
-    x2, y2 = min(sw, x + w), min(sh, y + lh)
-    if x2 - x1 < 8 or y2 - y1 < 6:
-        return ''
-    if not tesseract_available():
-        return ''
-    strip = cv2.cvtColor(img_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-    # Upscale to a fixed ~80px strip height (min 4×): low-pitch captures need
-    # proportionally more magnification for Tesseract to resolve the label
-    # (measured +2–4% accuracy at 42–52px/slot over the flat 4×).
-    f = max(4, int(round(80.0 / strip.shape[0])))
-    strip = cv2.resize(strip, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC)
-    try:
-        txt = pytesseract.image_to_string(strip, config='--psm 7')
-    except Exception:
-        return ''
-    txt = txt.strip().replace('\n', ' ')
-    # Strip leading non-alphanumeric OCR junk (FiR tick / tint speckle) but keep
-    # inner punctuation like CALOK-B, AHF1-M, #FireKlean.
-    while txt and not (txt[0].isalnum() or txt[0] == '#'):
-        txt = txt[1:]
-    return txt.strip()
-
-
-def build_label_matcher(price_cache):
-    """
-    Build a fuzzy matcher from OCR'd cell text → item over the whole target
-    catalogue (not ammo/gun/preset/container).  Identity is decided by the
-    printed name; the footprint is then taken from the item's own catalogue size
-    (see identify_items_by_icon) rather than NCC's guessed size — so a 1×2 MGT
-    can't be mislabelled a 2×1 and over-claim its neighbour.
-
-    Restricting candidates to the detected footprint (plus 1×1, the common
-    fallback when NCC over-sizes) keeps short tokens like 'L1' from colliding
-    with different-size items and avoids same-name cross-size ambiguity
-    (CAT tourniquet vs Cat figurine).
-
-    Returns matcher(text, fw, fh) -> (item_id, score, name, short, native_w, native_h) | None.
-    """
-    from rapidfuzz import process, fuzz
-    by_size = {}   # (w,h) -> (choices, ids, names, shorts)
-    for it in price_cache.get('items', []):
-        if not is_target_item(it):
-            continue
-        wh = (it.get('width') or 1, it.get('height') or 1)
-        b = by_size.setdefault(wh, ([], [], [], []))
-        for s in {it.get('shortName') or '', it.get('name') or ''}:
-            if s:
-                b[0].append(s.lower())
-                b[1].append(it['id'])
-                b[2].append(it['name'])
-                b[3].append(it.get('shortName') or '')
-
-    def matcher(text, fw, fh):
-        if not text or len(text) < 2:
-            return None
-        best = None
-        for wh in {(fw, fh), (fh, fw)}:
-            b = by_size.get(wh)
-            if not b:
-                continue
-            r = process.extractOne(text.lower(), b[0], scorer=fuzz.WRatio,
-                                   score_cutoff=OCR_LABEL_BASE)
-            if r and (best is None or r[1] > best[1]):
-                _, score, idx = r
-                best = (b[1][idx], score, b[2][idx], b[3][idx], wh[0], wh[1])
-        return best
-
-    return matcher
-
-
-def _min_score_for_size(W, H):
-    """Adaptive NCC threshold: looser for tiny sparse icons, tighter for big rich ones."""
-    area = W * H
-    if area == 1:
-        return 0.35
-    if area <= 2:
-        return 0.40
-    return 0.50
-
-
-OCC_FRAC          = 0.72   # a footprint is a size candidate only if this fraction of its cells are occupied
-CACHE_SRC_BONUS   = 0.02   # adjust-score bias favouring exact game-cache templates over API templates
-CACHE_EXACT_BONUS = 0.04   # additional bias for cache-exact templates (validated hash identity, not just visual)
-
-
-def _build_occupancy(img_bgr, grid, n_rows, n_cols):
-    """Boolean [n_rows, n_cols] occupancy map (True = item present in cell)."""
-    occ = np.zeros((n_rows, n_cols), dtype=bool)
-    for r in range(n_rows):
-        for c in range(n_cols):
-            occ[r, c] = not _cell_is_empty(img_bgr, c, r, grid)
-    return occ
-
-
-def _footprint_fits(occ, claimed, col, row, W, H, n_cols, n_rows):
-    """
-    Return the occupied fraction of the W×H block at (col,row) if it is fully
-    unclaimed and in-bounds, else -1.  Used to gate which sizes are even tested,
-    so a 2×1 template can't claim a footprint whose second cell is empty.
-    """
-    if col + W > n_cols or row + H > n_rows:
-        return -1.0
-    occ_cells = 0
-    for dc in range(W):
-        for dr in range(H):
-            if claimed[row + dr, col + dc]:
-                return -1.0
-            if occ[row + dr, col + dc]:
-                occ_cells += 1
-    return occ_cells / float(W * H)
-
-
-def _best_with_margin(scores, ids):
-    """
-    Return (best_index, best_score, id_aware_margin).
-
-    The margin compares the top score to the best score belonging to a
-    *different* item ID, so near-duplicate rotations/presets of the same item
-    never reject each other.
-    """
-    i = int(np.argmax(scores))
-    top1 = float(scores[i])
-    top1_id = ids[i]
-    top2 = 0.0
-    for j in np.argsort(scores)[::-1]:
-        if ids[int(j)] != top1_id:
-            top2 = float(scores[int(j)])
-            break
-    return i, top1, top1 - top2
-
-
-GRID_ASPECT_TOL   = 0.10  # max |cell_w - cell_h| / max(...) — EFT slots are square on-screen
-GRID_MIN_STRENGTH = 1.6   # autocorr peak decisiveness floor (≈1 = no periodicity at all)
-GRID_ASPECT_MAX   = 1.45  # max cell aspect for a GENUINELY stretched capture (4:3→16:9 = 1.333)
-GRID_AXIS_DISAGREE = 0.06  # |cw-ch|/max above which the two axes are treated as disagreeing
-# When the axes disagree, one may be a real stretch and the other chrome corruption
-# (a sidebar's icon strip forges a false pitch on one axis).  Strength alone can't tell
-# them apart — measured: the false 47px axis on stash1.png is STRONGER (5.22) than the
-# true 63px axis (3.78).  The discriminator that DOES work is cross-axis corroboration:
-# a real (square) grid pitch shows a decisive comb response on BOTH projections, a chrome
-# pitch only on its own.  A candidate period is the true square pitch when its min-across-
-# axes normalized comb clears GRID_CORROB_MIN and beats the rival period's by ×RATIO.
-# Measured: stash1 chrome → winner 3.03 vs loser 1.90 (ratio 1.60, rescue fires);
-#           genuine 84×63 stretch → 2.57 vs 2.16 (ratio 1.19, no rescue, both kept).
-GRID_CORROB_MIN   = 2.5   # winner's cross-axis min normalized comb floor to call it square
-GRID_CORROB_RATIO = 1.35  # winner must beat the rival period's corroboration by this factor
-
-
-def validate_grid(grid):
-    """
-    True if a detected/persisted grid is internally plausible.
-
-    Deliberately does NOT compare against 63px or any absolute pitch: the
-    captured game window can be any resolution (windowed, Lossless Scaling,
-    stretched res), so the pitch is whatever it is.  Checks instead:
-      - pitch within the supported range on both axes,
-      - cells either near-square (EFT slots are square at native aspect) OR
-        genuinely stretched with two independently-confident axes (a 4:3 grid
-        rendered on a 16:9 monitor stretches cells to ~1.33:1 — real, not noise),
-      - a decisive autocorrelation peak when the detection carries one
-        (persisted grids were validated when saved and carry none).
-    """
-    if not grid:
-        return False
-    cw, ch = grid.get('cell_w', 0), grid.get('cell_h', 0)
-    if not (GRID_PITCH_LO - 1 <= cw <= GRID_PITCH_HI + 1
-            and GRID_PITCH_LO - 1 <= ch <= GRID_PITCH_HI + 1):
-        return False
-    aspect = max(cw, ch) / min(cw, ch) if min(cw, ch) > 0 else 1e9
-    if aspect > 1 + GRID_ASPECT_TOL:
-        # Beyond near-square: accept ONLY a genuine stretch — two confident axes.
-        # A chrome-corrupted grid has one false axis; a real stretch has two real
-        # ones.  (The false 47×63 grid on stash1.png is prevented upstream: its
-        # detection is rescued to a square 63×63 before it can be returned — see
-        # detect_stash_grid.  Strengths alone cannot reject a raw 47×63 here,
-        # because both its axes read strong; that discrimination needs the image,
-        # so it lives in detection where corroboration runs.)
-        sx = grid.get('strength_x')
-        sy = grid.get('strength_y')
-        if sx is None or sy is None:
-            return False  # older grid without per-axis strengths → near-square only
-        if aspect > GRID_ASPECT_MAX:
-            return False
-        if not (sx >= GRID_MIN_STRENGTH and sy >= GRID_MIN_STRENGTH):
-            return False
-    strength = grid.get('strength')
-    if strength is not None and strength < GRID_MIN_STRENGTH:
-        return False
-    return True
-
-
-def resolve_grid(img_bgr, settings, persist_fn=None):
-    """
-    Detect the stash grid at whatever pitch the capture actually has, validate
-    it for internal plausibility, and fall back to the last-good persisted grid
-    (settings['grid']) or the flat cell_size when detection is noisy.  On a
-    fresh valid detection, persist it via persist_fn(grid) so one bad frame
-    can't derail future scans.
-    """
-    grid = detect_stash_grid(img_bgr)
-    if validate_grid(grid):
-        if persist_fn:
-            # 'alt' is an in-memory hypothesis for later arbitration, not part of
-            # the persisted last-good grid — strip it so settings.json stays a
-            # clean grid record.
-            persist_fn({k: v for k, v in grid.items() if k != 'alt'})
-        return grid, 'detected'
-    saved = settings.get('grid')
-    if validate_grid(saved):
-        return dict(saved), 'persisted'
-    cs = settings.get('cell_size', 64)
-    return {'cell_w': float(cs), 'cell_h': float(cs),
-            'origin_x': 0.0, 'origin_y': 0.0}, 'fallback'
-
-
-def resolve_panels(img_bgr, settings, persist_fn=None):
-    """
-    Panel-aware grid resolution: detect every container/stash panel with its
-    own origin (see detect_panels).  Falls back to the single-grid chain
-    (resolve_grid: detect → persisted → flat cell_size) wrapped as one
-    full-frame panel, so it is never worse than the old behaviour.
-
-    Panels themselves are NOT persisted — open container windows move
-    between scans; only the pitch-bearing single grid persists (via
-    resolve_grid's persist_fn on the fallback path, or the first panel here).
-
-    Returns (panels, src) — panels is a non-empty list of grid dicts with
-    x0/y0/x1/y1 span bounds.
-    """
-    panels = detect_panels(img_bgr)
-    if panels:
-        if persist_fn:
-            # Persist the first panel as the last-good single grid: its pitch
-            # is frame-global, so it keeps the fallback chain plausible.
-            persist_fn({k: panels[0][k] for k in
-                        ('cell_w', 'cell_h', 'origin_x', 'origin_y')})
-        return panels, 'panels'
-    grid, src = resolve_grid(img_bgr, settings, persist_fn=persist_fn)
-    sh, sw = img_bgr.shape[:2]
-    return [{**grid, 'x0': 0, 'y0': 0, 'x1': sw, 'y1': sh}], src
-
-
-def _masked_ncc_scores(cell_vec, bucket):
-    """
-    Per-template masked NCC against all templates in a size bucket.
-
-    For each template t with mask m_t (per-pixel 0/1, BGR-replicated):
-        cm_t        = (m_t · cell)  / Σ(m_t)                       # cell mean inside m_t
-        num_t       = (m_t * (cell - cm_t)) · tmpl_unit_t          # numerator
-                    = tmpl_unit_t · cell        (since tmpl_unit·m_t = 0 by construction)
-        denom_t²    = Σ m_t * (cell - cm_t)²
-                    = (m_t · cell²) - (m_t · cell)² / Σ(m_t)
-        score_t     = num_t / denom_t
-
-    Returns (N,) float32 NCC scores.
-    """
-    masks       = bucket['masks']         # (N, D) float32
-    mask_counts = bucket['mask_counts']   # (N,)   float32
-    tmpls_unit  = bucket['tmpls_unit']    # (N, D) float32
-
-    cell_sq    = cell_vec * cell_vec
-    sums_c     = masks @ cell_vec               # (N,)
-    sums_c2    = masks @ cell_sq                # (N,)
-    var_c      = sums_c2 - (sums_c * sums_c) / np.maximum(mask_counts, 1.0)
-    denom      = np.sqrt(np.maximum(var_c, 1e-6))
-    num        = tmpls_unit @ cell_vec          # (N,)
-    return num / denom
-
-
-def _masked_ncc_scores_multi(cell_mat, masks, mask_counts, tmpls_unit):
-    """
-    Masked NCC of several cell vectors at once against a (sub)set of templates.
-    `cell_mat` is (S, D); returns (N, S) scores — same math as
-    _masked_ncc_scores, batched over the S candidate crops.
-    """
-    cm      = cell_mat.T                          # (D, S)
-    sums_c  = masks @ cm                          # (N, S)
-    sums_c2 = masks @ (cm * cm)                   # (N, S)
-    var_c   = sums_c2 - (sums_c * sums_c) / np.maximum(mask_counts, 1.0)[:, None]
-    denom   = np.sqrt(np.maximum(var_c, 1e-6))
-    num     = tmpls_unit @ cm                     # (N, S)
-    return num / denom
-
-
-SHIFT_RESCUE_TOP = 64    # templates re-scored against shifted crops
-SHIFT_RESCUE_PX  = 2     # ± whole-pixel alignment search radius
-SHIFT_GOOD_SCORE = 0.90  # unshifted match at/above this skips the rescue
-
-
-def _shift_rescue(img_bgr, col, row, W, H, grid, spw, sph, bucket, scores):
-    """
-    Re-score the current top templates against crops shifted ±SHIFT_RESCUE_PX
-    in x/y, keeping each template's best score over all shifts.  Absorbs the
-    residual grid-phase error that survives detection (sub-pixel pitch,
-    panel-edge rounding) — exactly the error that otherwise depresses the
-    correct template's NCC below its rivals'.
-    Returns an updated copy of `scores` (never lower than the input).
-    """
-    top = np.argsort(scores)[::-1][:SHIFT_RESCUE_TOP]
-    mats = []
-    for dy in range(-SHIFT_RESCUE_PX, SHIFT_RESCUE_PX + 1):
-        for dx in range(-SHIFT_RESCUE_PX, SHIFT_RESCUE_PX + 1):
-            if dx == 0 and dy == 0:
-                continue
-            v = _native_cell_vec(img_bgr, col, row, W, H, grid, spw, sph,
-                                 dx=dx, dy=dy)
-            if v is not None:
-                mats.append(v)
-    if not mats:
-        return scores
-    cell_mat = np.stack(mats)
-    shifted = _masked_ncc_scores_multi(cell_mat,
-                                       bucket['masks'][top],
-                                       bucket['mask_counts'][top],
-                                       bucket['tmpls_unit'][top])
-    out = scores.copy()
-    out[top] = np.maximum(out[top], shifted.max(axis=1))
-    return out
-
-
-def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCORE,
-                           label_matcher=None, progress_cb=None):
-    """
-    Footprint-first identification, with optional OCR-label fusion.
-
-    1. Build a per-cell occupancy map from the image.
-    2. Walk occupied, unclaimed cells row-major.  For each anchor, only test
-       (W,H) sizes whose footprint is actually occupied (measured, not guessed),
-       so a wrong multi-cell size can't over-claim empty neighbours.
-    3. Masked NCC against every template of that size (rotations + presets
-       included).  The winning (item, size) needs to clear the size-adaptive
-       threshold AND beat the best *different-item* score by >NCC_MARGIN_MIN.
-    4. Ties within NCC_MARGIN prefer exact game-cache templates over API ones.
-    5. If `label_matcher` is given, OCR the game's printed name across the top of
-       the footprint.  A confident name match is AUTHORITATIVE for identity
-       (NCC keeps the footprint/rotation) — this is what separates same-shape
-       items (L1 vs SJ12 vs eTG-c) that NCC alone cannot.
-
-    Detections carry `rotated` and `source` (ncc / cache / cache-exact / api /
-    ocr / ncc+ocr).  `cache-exact` is a validation-gated exact hash identity
-    (see eft_hash.py) and is trusted enough to bypass the NCC margin check
-    and to require a near-perfect OCR read before being overridden.
-    """
-    if not icon_db:
-        return []
-
-    sh, sw = img_bgr.shape[:2]
-    cw, ch = grid['cell_w'], grid['cell_h']
-    ox, oy = grid['origin_x'], grid['origin_y']
-    n_cols = max(0, int((sw - ox) // cw))
-    n_rows = max(0, int((sh - oy) // ch))
-    if n_cols == 0 or n_rows == 0:
-        return []
-
-    spw, sph = _slot_px(grid)
-    # OCR legibility gate: the printed label shrinks with the capture pitch.
-    # Below OCR_AGREE_MIN_PITCH Tesseract output is noise — overriding NCC with
-    # it is exactly the failure mode this gate exists to stop; between the two
-    # thresholds it may only *confirm* an NCC identity, never overturn one.
-    pitch = min(cw, ch)
-    if pitch >= OCR_FULL_MIN_PITCH:
-        ocr_mode = 'full'
-    elif pitch >= OCR_AGREE_MIN_PITCH:
-        ocr_mode = 'agree'
-    else:
-        ocr_mode = 'off'
-    if label_matcher is not None and ocr_mode == 'off':
-        label_matcher = None
-
-    occ = _build_occupancy(img_bgr, grid, n_rows, n_cols)
-    claimed = np.zeros((n_rows, n_cols), dtype=bool)
-
-    # Test larger footprints first so a correct multi-cell item claims its cells
-    # before any 1×1 sub-region can.
-    sizes = sorted(icon_db.keys(), key=lambda wh: -wh[0] * wh[1])
-
-    detections = []
-    n_ambig = 0
-    occ_total = int(occ.sum())
-    # Row-major cumulative count of occupied cells — monotonic progress even
-    # when multi-cell claims let the walk skip ahead.
-    occ_cum = np.cumsum(occ.reshape(-1))
-
-    for row in range(n_rows):
-        for col in range(n_cols):
-            if claimed[row, col] or not occ[row, col]:
-                continue
-            if progress_cb:
-                progress_cb(int(occ_cum[row * n_cols + col]), occ_total)
-
-            best = None   # (adj, sc, margin, i, W, H)
-            for (W, H) in sizes:
-                frac = _footprint_fits(occ, claimed, col, row, W, H, n_cols, n_rows)
-                if frac < OCC_FRAC and not (W == 1 and H == 1):
-                    continue
-                if frac < 0:
-                    continue
-
-                vec = _native_cell_vec(img_bgr, col, row, W, H, grid, spw, sph)
-                if vec is None:
-                    continue
-                bucket = icon_db[(W, H)]
-                scores = _masked_ncc_scores(vec, bucket)
-                i, sc, margin = _best_with_margin(scores, bucket['ids'])
-
-                # Size preference + exact-cache-source bias.
-                adj = sc + (W * H - 1) * 0.012
-                if bucket['sources'][i] in ('cache', 'cache-exact'):
-                    adj += CACHE_SRC_BONUS
-                if bucket['sources'][i] == 'cache-exact':
-                    adj += CACHE_EXACT_BONUS
-                if best is None or adj > best[0]:
-                    best = (adj, sc, margin, i, W, H, bucket, scores)
-
-            # Footprint / NCC identity (may be None if no vector could be built).
-            if best is not None:
-                _, sc, margin, i, W, H, bucket, scores = best
-                # Alignment rescue: a weak or ambiguous winner is retried with
-                # ±2px-shifted crops before we trust (or reject) it.
-                if sc < SHIFT_GOOD_SCORE or margin < NCC_MARGIN_MIN:
-                    scores = _shift_rescue(img_bgr, col, row, W, H, grid,
-                                           spw, sph, bucket, scores)
-                    i, sc, margin = _best_with_margin(scores, bucket['ids'])
-                ncc_id, ncc_name = bucket['ids'][i], bucket['names'][i]
-                rotated, ncc_src = bool(bucket['rotated'][i]), bucket['sources'][i]
-            else:
-                W = H = 1; sc = margin = 0.0
-                ncc_id = ncc_name = None; rotated = False; ncc_src = 'ncc'
-
-            # OCR-label fusion — the printed name is authoritative for identity,
-            # but tiered so a short OCR token can't partial-match its way over a
-            # different NCC identity (e.g. 'Li' → 'Splint').
-            ocr_hit = None
-            if label_matcher is not None:
-                text = _ocr_cell_label(img_bgr, col, row, W, grid)
-                cand = label_matcher(text, W, H)
-                if cand is not None:
-                    o_id, o_sc, o_name, o_short, o_w, o_h = cand
-                    agrees = ncc_id is not None and o_id == ncc_id
-                    if agrees:
-                        passes = o_sc >= OCR_AGREE_CUTOFF
-                    elif ocr_mode != 'full':
-                        # Agree-only tier (45–55px pitch): a barely-legible label
-                        # may confirm the NCC identity but never overturn it.
-                        passes = False
-                    elif len(text) <= 3:
-                        passes = o_sc >= OCR_SHORT_OVER
-                    else:
-                        # Override tier: OCR disagrees with (or NCC found no)
-                        # identity.  A cache-exact NCC identity (validated hash
-                        # match, not just visual) is trusted enough that only a
-                        # near-perfect OCR read should override it.
-                        need = OCR_SHORT_OVER if ncc_src == 'cache-exact' else OCR_OVER_CUTOFF
-                        # Token-containment guard: blocks a short/partial OCR
-                        # misread (e.g. a PMAG label OCR'd as 'gen m3') from
-                        # WRatio-matching an unrelated item's name ('Benelli M3
-                        # … charging handle', WRatio 85.5 >= old 84 cutoff).
-                        passes = o_sc >= need and _ocr_tokens_contained(text, o_name, o_short)
-                    if passes:
-                        ocr_hit = cand
-
-            if ocr_hit is not None:
-                item_id, ocr_sc, name, _o_short, _o_w, _o_h = ocr_hit
-                detections.append({
-                    'col': col, 'row': row, 'W': W, 'H': H,
-                    'item_id': item_id, 'name': name,
-                    'rotated': rotated,
-                    'source':  'ocr' if (ncc_id is None or item_id != ncc_id) else 'ncc+ocr',
-                    'score':   round(float(ocr_sc), 1),
-                })
-                claimed[row:row + H, col:col + W] = True
-                continue
-
-            # Over-sizing rescue: NCC's area bias can pick W>1 for a 1×1 item,
-            # which garbles the OCR crop.  If nothing matched, retry OCR at 1×1.
-            # Override-class action, so it needs the full-legibility OCR tier.
-            if (label_matcher is not None and ocr_mode == 'full' and (W > 1 or H > 1)
-                    and _footprint_fits(occ, claimed, col, row, 1, 1, n_cols, n_rows) >= 0):
-                text1 = _ocr_cell_label(img_bgr, col, row, 1, grid)
-                cand1 = label_matcher(text1, 1, 1)
-                if cand1 is not None:
-                    o_id, o_sc, o_name, o_short, _w, _h = cand1
-                    if len(text1) <= 3:
-                        passes = o_sc >= OCR_SHORT_OVER
-                    else:
-                        passes = (o_sc >= OCR_OVER_CUTOFF
-                                  and _ocr_tokens_contained(text1, o_name, o_short))
-                    if passes:
-                        detections.append({
-                            'col': col, 'row': row, 'W': 1, 'H': 1,
-                            'item_id': o_id, 'name': o_name,
-                            'rotated': False, 'source': 'ocr',
-                            'score': round(float(o_sc), 1),
-                        })
-                        claimed[row, col] = True
-                        continue
-
-            if best is None:
-                continue
-            size_min = _min_score_for_size(W, H)
-            # A cache-exact identity (validated hash match — see eft_hash.py)
-            # is authoritative on its own: accept it even below the NCC margin
-            # floor, provided the raw score still clears a stricter bar.  This
-            # is what separates the stimulant-injector family (shared
-            # silhouette dominates plain NCC — see comment at _canonical_bgr_flat).
-            exact_authoritative = ncc_src == 'cache-exact' and sc >= max(size_min, 0.75)
-            if sc >= size_min and (margin >= NCC_MARGIN_MIN or exact_authoritative):
-                detections.append({
-                    'col': col, 'row': row, 'W': W, 'H': H,
-                    'item_id': ncc_id, 'name': ncc_name,
-                    'rotated': rotated,
-                    'source':  ncc_src,
-                    'score':   round(sc * 100, 1),
-                })
-                claimed[row:row + H, col:col + W] = True
-            elif sc >= size_min and margin < NCC_MARGIN_MIN:
-                n_ambig += 1
-                print(f"[ncc] AMBIG ({col:2d},{row:2d}) {W}×{H}  "
-                      f"sc={sc:.3f} m={margin:.3f}  '{ncc_name}'")
-
-    if detections:
-        scores = [d['score'] for d in detections]
-        print(f"[ncc] matched {len(detections)} items ({n_ambig} ambiguous) | "
-              f"scores {min(scores):.1f}–{max(scores):.1f}%  avg {sum(scores)/len(scores):.1f}%")
-
-    # Found-in-Raid pass — reads the raw (un-blanked) frame, so this must run
-    # after all NCC/OCR matching (which works off label/corner-blanked crops).
-    for d in detections:
-        d['fir'] = detect_fir(img_bgr, grid, d['col'], d['row'], d['W'], d['H'])
-    return detections
-
-
-def scan_all_panels(img_bgr, panels, matcher_db, label_matcher=None,
-                    progress_cb=None):
-    """
-    Run identify_items_by_icon over each detected panel's sub-image (so a
-    panel's occupancy/OCR/FiR never bleeds into a neighbour) and return one
-    flat detection list.  Each detection keeps its panel-local col/row and
-    gains `panel` (index) plus the absolute pixel rect `px, py, pw, ph` —
-    callers draw and hit-test with those and never need panel awareness.
-    """
-    all_dets = []
-    for pi, p in enumerate(panels):
-        crop = img_bgr[p['y0']:p['y1'], p['x0']:p['x1']]
-        local = {'cell_w': p['cell_w'], 'cell_h': p['cell_h'],
-                 'origin_x': p['origin_x'] - p['x0'],
-                 'origin_y': p['origin_y'] - p['y0']}
-        dets = identify_items_by_icon(crop, local, matcher_db,
-                                      label_matcher=label_matcher,
-                                      progress_cb=progress_cb)
-        for d in dets:
-            x1, y1, x2, y2 = grid_rect(d['col'], d['row'], d['W'], d['H'],
-                                       local, pad=0)
-            d['panel'] = pi
-            d['px'], d['py'] = x1 + p['x0'], y1 + p['y0']
-            d['pw'], d['ph'] = x2 - x1, y2 - y1
-        all_dets.extend(dets)
-    return all_dets
-
-
-def identify_engine(settings):
-    """Which identification core a scan uses: 'v2' (default) or 'legacy'."""
-    e = (settings or {}).get('identify_engine', 'v2')
-    return e if e in ('v2', 'legacy') else 'v2'
-
 
 _v2_engine = [None, None]    # [settings key, Engine]
 
 
 def scan_with_v2(img_bgr, settings, warnings):
     """
-    Run the v2 identification engine (identify/ package) and adapt its output to what the
-    scan routes consume: raw detections in the legacy shape (col,row,W,H,item_id,name,
-    rotated,score 0-100,fir,panel,px,py,pw,ph — plus uncertain/count), the panel list in
-    the legacy grid-dict shape, and whether the grid was found at all.
+    Run the identification engine (identify/ package) and adapt its output to what the
+    scan routes consume: raw detections as dicts (col,row,W,H,item_id,name,rotated,
+    score 0-100,fir,panel,px,py,pw,ph — plus uncertain/count), the panel list as grid dicts
+    (cell_w/cell_h/origin_x/origin_y/...), and whether the grid was found at all.
     """
     from identify.config import EngineSettings
     from identify.pipeline import Engine
@@ -1878,153 +582,13 @@ def scan_with_v2(img_bgr, settings, warnings):
                      'x0': 0, 'y0': 0, 'x1': img_bgr.shape[1], 'y1': img_bgr.shape[0]}], True
     print(f"[v2] {len(res.detections)} items in {res.timings.get('total', 0):.2f}s "
           f"({', '.join(f'{k} {v:.2f}' for k, v in res.timings.items() if k != 'total')})")
-    return [d.to_legacy() for d in res.detections], panels, False
+    return [d.to_record() for d in res.detections], panels, False
 
 
 def tesseract_path_override():
     """pytesseract's command if app.py had to point it at the default Windows install."""
     cmd = pytesseract.pytesseract.tesseract_cmd
     return cmd if cmd and cmd != 'tesseract' else None
-
-
-def _estimate_occupied(img_bgr, panels):
-    """
-    Total occupied cells across all panels, using the SAME occupancy machinery
-    identify_items_by_icon builds from (per-panel, on the panel-local grid) so
-    the count matches exactly what the matcher walked.  This is the denominator
-    of the match-quality gate's acceptance rate.
-    """
-    total = 0
-    for p in panels:
-        crop = img_bgr[p['y0']:p['y1'], p['x0']:p['x1']]
-        local = {'cell_w': p['cell_w'], 'cell_h': p['cell_h'],
-                 'origin_x': p['origin_x'] - p['x0'],
-                 'origin_y': p['origin_y'] - p['y0']}
-        ch, cw = crop.shape[:2]
-        n_cols = max(0, int((cw - local['origin_x']) // local['cell_w']))
-        n_rows = max(0, int((ch - local['origin_y']) // local['cell_h']))
-        if n_cols == 0 or n_rows == 0:
-            continue
-        total += int(_build_occupancy(crop, local, n_rows, n_cols).sum())
-    return total
-
-
-def _scan_suspect(detections, occupied):
-    """
-    True when a scan's quality looks like a misdetected grid: too few accepted
-    detections relative to occupied cells, or accepted scores clustering low.
-    occupied == 0 (empty stash) is a legitimate result, never suspect.
-    Detection scores are 0–100 (see identify_items_by_icon), matching
-    SCAN_MIN_MEDIAN_PCT.
-    """
-    if occupied <= 0:
-        return False
-    if len(detections) / occupied < SCAN_MIN_ACCEPT_RATE:
-        return True
-    if not detections:
-        return True
-    return float(np.median([d['score'] for d in detections])) < SCAN_MIN_MEDIAN_PCT
-
-
-def _arbitrate_scan(img_bgr, panels, initial_dets, grid, grid_src, settings,
-                    matcher_db, label_matcher, warnings, persist_fn,
-                    progress_cb=None):
-    """
-    Match-quality gate + grid-hypothesis arbitration, shared by both scan entry
-    points.  If the initial scan_all_panels result is not suspect, it is
-    returned unchanged.  Otherwise up to 3 alternative full-frame grid
-    hypotheses are re-scanned and the best NON-suspect one is kept and
-    persisted (so the next scan starts right):
-
-      - the detection's discarded independent-axis reading ('alt'),
-      - the persisted last-good grid (settings['grid']) if valid and different,
-      - the flat cell_size default grid if not already used.
-
-    If every hypothesis is also suspect, this is a grid failure: returns empty
-    detections and grid_failed=True, appends a user-facing warning, and NEVER
-    surfaces the suspect detections.
-
-    Returns (detections, grid, grid_src, grid_failed).
-    """
-    occupied = _estimate_occupied(img_bgr, panels)
-    if not _scan_suspect(initial_dets, occupied):
-        return initial_dets, grid, grid_src, False
-
-    sh, sw = img_bgr.shape[:2]
-
-    def _slot_key(g):
-        return (round(g['cell_w'], 1), round(g['cell_h'], 1))
-
-    used = {_slot_key(grid)}
-    hypotheses = []                         # (grid_dict, src_label)
-    alt = grid.get('alt')
-    if validate_grid(alt):
-        hypotheses.append((alt, 'alt'))
-    saved = settings.get('grid')
-    if validate_grid(saved):
-        hypotheses.append((dict(saved), 'persisted'))
-    cs = float(settings.get('cell_size', 64))
-    hypotheses.append(({'cell_w': cs, 'cell_h': cs,
-                        'origin_x': 0.0, 'origin_y': 0.0}, 'fallback'))
-
-    best = None                             # (rate, med, dets, grid, src)
-    tried = 0
-    for hyp, src in hypotheses:
-        if tried >= 3:
-            break
-        key = _slot_key(hyp)
-        if key in used:
-            continue
-        used.add(key)
-        tried += 1
-        hyp = {k: v for k, v in hyp.items() if k != 'alt'}
-        hyp_db = get_matcher_db(hyp)
-        if hyp_db is None:
-            continue
-        hyp_panels = [{**hyp, 'x0': 0, 'y0': 0, 'x1': sw, 'y1': sh}]
-        hyp_occ = _estimate_occupied(img_bgr, hyp_panels)
-        hyp_dets = scan_all_panels(img_bgr, hyp_panels, hyp_db,
-                                   label_matcher=label_matcher,
-                                   progress_cb=progress_cb)
-        if _scan_suspect(hyp_dets, hyp_occ):
-            continue
-        rate = len(hyp_dets) / hyp_occ if hyp_occ else 0.0
-        med  = float(np.median([d['score'] for d in hyp_dets])) if hyp_dets else 0.0
-        if best is None or (rate, med) > (best[0], best[1]):
-            best = (rate, med, hyp_dets, hyp, src)
-
-    if best is not None:
-        _, _, dets, hyp_grid, src = best
-        print(f"[scan] grid arbitration: '{grid_src}' was suspect, "
-              f"switched to '{src}' ({len(dets)} detections)")
-        if persist_fn:
-            persist_fn({k: v for k, v in hyp_grid.items() if k != 'alt'})
-        return dets, hyp_grid, src, False
-
-    print(f"[scan] grid FAILED: '{grid_src}' suspect and no hypothesis recovered")
-    warnings.append('Stash grid not detected — check the capture region covers '
-                    'the stash, or recalibrate.')
-    return [], grid, grid_src, True
-
-
-def prefetch_keep_list_icons(keep_list, price_index, scale=2.0):
-    """Download icons for all keep-list items using tarkov.dev iconLink."""
-    downloaded = 0
-    for cat in keep_list['categories']:
-        for item in cat['items']:
-            name_lower = item['name'].lower()
-            item_data = price_index.get(name_lower)
-            if not item_data:
-                # Try aliases
-                for alias in item.get('aliases', []):
-                    item_data = price_index.get(alias.lower())
-                    if item_data:
-                        break
-            if item_data and item_data.get('iconLink'):
-                path = download_icon(item_data['id'], item_data['iconLink'])
-                if path:
-                    downloaded += 1
-    return downloaded
 
 
 def is_unpriced_weapon(item_data, category=None):
@@ -2074,10 +638,6 @@ def default_settings():
     return {
         'region': None, 'monitor': 0, 'hotkey': DEFAULT_HOTKEY, 'prestige': 3,
         'scan_countdown': 3,   # seconds before the manual Scan button captures (0 = instant)
-        'cell_size': 64,    # fallback: pixels per slot when grid auto-detect fails
-        'icon_scale': 2.0,  # scale applied to tarkov.dev icons for template matching
-        'icon_cache_path': None,  # override for the EFT icon-cache folder (auto-discovered if null)
-        'grid': None,       # last-good detected grid, persisted so a noisy frame can't derail a scan
         'kappa_only_tasks': True,  # only kappaRequired tasks count toward task aggregate/KEEP totals
         'debug_dumps': True,  # save raw frame + detections of the last few scans under data/debug/
         # Sell advice (see sellcalc.SELL_DEFAULTS for what each means; all are optional in settings.json)
@@ -2089,7 +649,6 @@ def default_settings():
         'hideout_management_level': 0,  # skill level 0-51; each level adds 0.3% flea fee discount (with Intel Center 3)
         'skip_traders': ['Ref'],   # Ref pays GP coins, not roubles
         'trader_levels': {},       # e.g. {'Ref': 4} - only Ref's pay rate changes with loyalty level
-        'identify_engine': 'v2',  # 'v2' (identify/ package) or 'legacy' (masked-NCC icon DB below)
         'auto_scan': True,  # watch the game passively and scan the stash when it settles (autoscan/)
     }
 
@@ -2668,506 +1227,9 @@ def get_protected_ids(keep_list, price_idx):
 # Grid detection helpers
 # ---------------------------------------------------------------------------
 
-GRID_PITCH_LO = 24    # smallest supported px/slot (~720p windowed capture)
-GRID_PITCH_HI = 200   # largest supported px/slot (4K + UI scale headroom)
 
-
-def _dominant_period(sig, lo=GRID_PITCH_LO, hi=GRID_PITCH_HI):
-    """
-    Find the dominant repeating period in `sig` (1-D numpy array) using FFT
-    autocorrelation.  Returns (float period, strength) — the period is
-    parabola-interpolated around the integer peak (true pitch is non-integer
-    for arbitrary window sizes), strength is the peak-vs-median decisiveness
-    of the autocorrelation window (≈1 = no periodicity).  (None, 0.0) on
-    failure.
-    """
-    sig = np.asarray(sig, dtype=float)
-    sig -= sig.mean()
-    n = len(sig)
-    if n < hi * 2:
-        hi = max(lo + 1, n // 2 - 1)
-        if n < hi * 2:
-            return None, 0.0
-    nfft = 1 << int(np.ceil(np.log2(2 * n)))
-    S = np.fft.rfft(sig, n=nfft)
-    acorr = np.fft.irfft(S * np.conj(S), n=nfft)[:n].real
-    acorr[0] = 0
-    window = acorr[lo:hi + 1]
-    if window.max() <= 0:
-        return None, 0.0
-    k = int(np.argmax(window))
-    # Harmonic disambiguation: a periodic grid also autocorrelates at 2×, 3×…
-    # its pitch, and a harmonic can edge out the fundamental (measured: 105px
-    # scoring 7.3 vs the true 52.5px at 6.8).  If a subharmonic of the peak
-    # also shows a strong local peak, the true pitch is the smallest such —
-    # without this, everything downstream runs on doubled cells.
-    peak = window[k]
-    for m in (4, 3, 2):
-        q = (lo + k) / m
-        if q < lo:
-            continue
-        qi = int(round(q)) - lo
-        a, b = max(0, qi - 3), min(len(window), qi + 4)
-        if window[a:b].max() >= 0.6 * peak:
-            k = a + int(np.argmax(window[a:b]))
-            break
-    p = lo + k
-    # Parabolic interpolation on the peak and its neighbours → sub-px period.
-    if 0 < k < len(window) - 1:
-        y0, y1, y2 = window[k - 1], window[k], window[k + 1]
-        denom = y0 - 2 * y1 + y2
-        if abs(denom) > 1e-9:
-            p += 0.5 * (y0 - y2) / denom
-    med = float(np.median(np.abs(window)))
-    strength = float(window[k] / med) if med > 0 else 0.0
-    return float(p), strength
-
-
-def _grid_phase(sig, period):
-    """
-    Given a signal and a known (int) period, find the offset (0..period-1)
-    where the repeating grid lines fall — i.e. the origin coordinate mod period.
-    """
-    sig = np.asarray(sig, dtype=float)
-    period = int(round(period))
-    n = len(sig)
-    # Pad to a multiple of period then fold and sum
-    r = n % period
-    padded = np.pad(sig, (0, period - r)) if r else sig
-    folded = padded.reshape(-1, period).sum(axis=0)
-    return int(np.argmax(folded))
-
-
-def _comb_score(proj, origin, period):
-    """Mean projection energy sampled at the comb origin + k·period."""
-    n = len(proj)
-    ks = np.arange(int((n - origin) / period) + 1)
-    idx = np.round(origin + ks * period).astype(int)
-    idx = idx[(idx >= 0) & (idx < n)]
-    if len(idx) < 3:
-        return -1.0
-    return float(proj[idx].mean())
-
-
-def _refine_axis(proj, period, phase):
-    """
-    Jointly refine (origin, period) as floats around the coarse estimates by
-    maximizing the grid-line comb response.  A fraction-of-a-pixel period
-    error accumulates to whole pixels across a 10+ cell panel, so this is
-    what keeps far cells aligned.
-    """
-    best = (float(phase), float(period), _comb_score(proj, phase, period))
-    for p in np.arange(period - 0.75, period + 0.751, 0.125):
-        if p < GRID_PITCH_LO * 0.8:
-            continue
-        for o in np.arange(phase - 3.0, phase + 3.01, 0.5):
-            s = _comb_score(proj, o, p)
-            if s > best[2]:
-                best = (float(o), float(p), s)
-    return best[0], best[1]
-
-
-def _rescue_weak_axis(proj, prior_period):
-    """
-    Re-detect one axis using `prior_period` as a hard prior instead of letting
-    autocorrelation pick the period freely.  Used when the other axis found the
-    true (square) pitch but this axis's raw projection is chrome-corrupted: the
-    coarse phase is folded at the prior period, then `_refine_axis`'s ±0.75px
-    window locks the sub-pixel period — that narrow window IS the prior, so it
-    cannot wander back to a distant false pitch (e.g. a sidebar's 47px comb).
-    Returns (origin, period) floats.
-    """
-    phase = _grid_phase(proj, prior_period)
-    return _refine_axis(proj, prior_period, phase)
-
-
-def _axis_corroboration(v_proj, h_proj, period):
-    """
-    How strongly BOTH projections support the grid pitch `period`, as the
-    minimum of the two axes' normalized comb responses (comb energy / median).
-
-    A real square grid draws lines at `period` on both axes, so both respond;
-    a chrome pitch (sidebar icon strip) exists on only one axis, so the other's
-    response collapses and drags the min down.  This is the signal that tells a
-    genuinely stretched capture (neither axis corroborates the other's pitch)
-    apart from chrome corruption (the true pitch corroborates on both).
-    """
-    ov, pv = _refine_axis(v_proj, period, _grid_phase(v_proj, period))
-    oh, ph = _refine_axis(h_proj, period, _grid_phase(h_proj, period))
-    medv = float(np.median(v_proj)) or 1.0
-    medh = float(np.median(h_proj)) or 1.0
-    cv_ = _comb_score(v_proj, ov, pv) / medv
-    ch_ = _comb_score(h_proj, oh, ph) / medh
-    return min(cv_, ch_)
-
-
-def _resolve_axis_pitches(v_proj, h_proj, lo=GRID_PITCH_LO, hi=GRID_PITCH_HI):
-    """
-    Resolve the true per-axis grid pitches from the two Sobel line projections,
-    correcting chrome-corrupted axes.
-
-    Returns a dict with resolved pitches `px`/`py` and their strengths `sx`/`sy`,
-    the raw independent detections `px0`/`py0`/`sx0`/`sy0` (before any rescue),
-    and `rescued` (True when one axis was overridden with the other's pitch).
-    Returns None when neither axis shows any periodicity.
-
-    Cases:
-      - both axes agree (within GRID_AXIS_DISAGREE)  → keep both, no rescue.
-      - one axis missing                             → substitute the found one.
-      - axes disagree, one period corroborates on BOTH axes and beats the rival
-        (GRID_CORROB_MIN / _RATIO)                   → chrome: force it on both.
-      - axes disagree, neither corroborates          → genuine stretch: keep both.
-    """
-    px0, sx0 = _dominant_period(v_proj, lo, hi)
-    py0, sy0 = _dominant_period(h_proj, lo, hi)
-    if not px0 and not py0:
-        return None
-    if not px0:                       # x axis silent → borrow the y pitch
-        return {'px': py0, 'py': py0, 'sx': sy0, 'sy': sy0,
-                'px0': py0, 'py0': py0, 'sx0': sy0, 'sy0': sy0, 'rescued': True}
-    if not py0:                       # y axis silent → borrow the x pitch
-        return {'px': px0, 'py': px0, 'sx': sx0, 'sy': sx0,
-                'px0': px0, 'py0': px0, 'sx0': sx0, 'sy0': sx0, 'rescued': True}
-
-    base = {'px0': px0, 'py0': py0, 'sx0': sx0, 'sy0': sy0}
-    if abs(px0 - py0) / max(px0, py0) <= GRID_AXIS_DISAGREE:
-        return {**base, 'px': px0, 'py': py0, 'sx': sx0, 'sy': sy0,
-                'rescued': False}
-
-    # Disagreement: is one period the true SQUARE pitch (corroborated on both
-    # axes), making the other chrome?  Or are both real (a genuine stretch)?
-    corr_x = _axis_corroboration(v_proj, h_proj, px0)
-    corr_y = _axis_corroboration(v_proj, h_proj, py0)
-    win_x = corr_x >= corr_y
-    win_corr, lose_corr = (corr_x, corr_y) if win_x else (corr_y, corr_x)
-    if win_corr >= GRID_CORROB_MIN and win_corr >= GRID_CORROB_RATIO * lose_corr:
-        # Chrome corruption: the winning period is the real square pitch; force
-        # it on both axes and carry the winner's strength across the rescue.
-        P = px0 if win_x else py0
-        S = sx0 if win_x else sy0
-        return {**base, 'px': P, 'py': P, 'sx': S, 'sy': S, 'rescued': True}
-
-    # Genuine stretch: both axes are real and simply differ — keep them.
-    return {**base, 'px': px0, 'py': py0, 'sx': sx0, 'sy': sy0, 'rescued': False}
-
-
-def _axis_origin_pitch(proj, period):
-    """Coarse phase + joint sub-pixel refine of (origin, pitch) at `period`,
-    then shift the origin into the first full cell.  Shared by both axes."""
-    origin, pitch = _refine_axis(proj, period, _grid_phase(proj, period))
-    while origin >= pitch:
-        origin -= pitch
-    return float(origin), float(pitch)
-
-
-def detect_stash_grid(img_bgr, lo=GRID_PITCH_LO, hi=GRID_PITCH_HI):
-    """
-    Auto-detect the Tarkov stash grid parameters from the screenshot.
-    Uses the repeating edge pattern (cell borders) via autocorrelation, then
-    refines pitch+origin to sub-pixel precision via the comb response.
-
-    Returns dict {cell_w, cell_h, origin_x, origin_y (floats), strength,
-    strength_x, strength_y} or None on failure.  Pitch is NOT assumed to be
-    63px — windowed captures render the grid at whatever resolution dictates.
-
-    When one axis is chrome-corrupted (UI sidebar forging a false pitch), the
-    corrupted axis is rescued to the corroborated square pitch and the raw
-    independent reading is exposed under 'alt' as an alternative hypothesis for
-    later match-quality arbitration.  The no-rescue path is behaviourally
-    identical to the original independent per-axis detection.
-    """
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    # np.abs computed once and shared across both projections (and by callers'
-    # rescue path) — the Sobel gradients are otherwise recomputed per use.
-    agx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
-    agy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
-
-    # Project each axis — peaks mark the grid lines
-    h_proj = np.sum(agy, axis=1)   # rows → horizontal line positions
-    v_proj = np.sum(agx, axis=0)   # cols → vertical line positions
-
-    pit = _resolve_axis_pitches(v_proj, h_proj, lo, hi)
-    if pit is None:
-        return None
-
-    origin_x, cell_w = _axis_origin_pitch(v_proj, pit['px'])
-    origin_y, cell_h = _axis_origin_pitch(h_proj, pit['py'])
-    strength_w, strength_h = pit['sx'], pit['sy']
-
-    grid = {
-        'cell_w': float(cell_w), 'cell_h': float(cell_h),
-        'origin_x': float(origin_x), 'origin_y': float(origin_y),
-        'strength': round(min(strength_w, strength_h), 2),
-        'strength_x': round(float(strength_w), 2),
-        'strength_y': round(float(strength_h), 2),
-    }
-
-    # When a rescue overrode an axis, expose the discarded independent reading
-    # as an alternative hypothesis (JSON-serializable; stripped before persist).
-    if pit['rescued'] and pit['px0'] and pit['py0'] and (
-            pit['px0'] != pit['px'] or pit['py0'] != pit['py']):
-        ax, aw = _axis_origin_pitch(v_proj, pit['px0'])
-        ay, ah = _axis_origin_pitch(h_proj, pit['py0'])
-        grid['alt'] = {
-            'cell_w': float(aw), 'cell_h': float(ah),
-            'origin_x': float(ax), 'origin_y': float(ay),
-            'strength': round(min(pit['sx0'], pit['sy0']), 2),
-            'strength_x': round(float(pit['sx0']), 2),
-            'strength_y': round(float(pit['sy0']), 2),
-        }
-    return grid
-
-
-PANEL_COMB_MIN  = 1.6  # folded comb peak/median floor to START a span
-PANEL_COMB_CONT = 1.5  # response floor AT THE RUN'S OWN PHASE to continue a span
-
-
-def _phase_spans(proj, pitch):
-    """
-    Segment a Sobel line projection into spans of stable grid-line phase.
-
-    Slides a 3-pitch window along `proj` in 1-pitch steps; each window folds
-    to a per-phase comb response.  A span starts at a window whose peak is
-    decisive, and CONTINUES for as long as later windows still respond at the
-    span's own phase (±2px, circular) — even when their argmax phase is
-    elsewhere.  That distinction matters: rows filled with multi-cell items
-    hide the interior grid lines, and overlay text (stack counts sit a fixed
-    ~13px above each cell bottom) then wins the argmax with a bogus phase,
-    while the true lines still respond well above background.  A window with
-    no response at the span phase (panel gap, chrome, world background, a
-    different panel) ends the span.
-
-    Two adjacent panels that happen to share a phase merge — harmless, since
-    a single grid then fits both by construction.
-
-    Returns [(start_px, end_px), ...].
-    """
-    p = int(round(pitch))
-    n = len(proj)
-    win = 3 * p
-    if n < win:
-        return [(0, n)] if n >= 2 * p else []
-    spans, cur = [], None          # cur = [start, end, phase]
-    for a in range(0, n - win + 1, p):
-        folded = proj[a:a + win].reshape(3, p).sum(axis=0)
-        med = float(np.median(folded))
-        if med <= 0:
-            med = 1.0
-        k = int(np.argmax(folded))
-        st = float(folded[k]) / med
-        if cur is not None:
-            j = int(cur[2] - a) % p
-            at_run = max(float(folded[(j + o) % p]) for o in (-2, -1, 0, 1, 2)) / med
-            if at_run >= PANEL_COMB_CONT:
-                cur[1] = a + win
-                continue
-            spans.append(cur)
-            cur = None
-        if st >= PANEL_COMB_MIN:
-            cur = [a, a + win, (a + k) % p]
-    if cur:
-        spans.append(cur)
-    return [(s, min(e, n)) for s, e, _ in spans if e - s >= 2 * p]
-
-
-PANEL_CHROME_OUTLIER = 6.0  # a horizontal edge this many× the span's median line
                             # energy is UI chrome (toolbar/header rule), not a grid
                             # line — grid lines sit ≤~2× median even when bold.
-
-
-def _chrome_top_trim(h_seg, sy0, sy1, pitch):
-    """
-    Raise a y-span's top past a dominant non-grid chrome edge.
-
-    A stash panel is preceded by UI chrome (search/sort toolbar, currency bar)
-    whose bottom rule is a horizontal edge far stronger than any interior grid
-    line.  _phase_spans can't drop it: its 3-pitch (≈190px) window always
-    straddles the ~1-2 chrome rows into the grid below, so the span starts at
-    the frame top and the panel then counts the chrome rows as phantom grid
-    rows.  This scans the span's top ~2 cells for an edge that is a strong
-    OUTLIER (≥PANEL_CHROME_OUTLIER× the span-median line energy — grid lines,
-    even bold borders, stay ≤~2×) and moves the top just below the lowest such
-    edge.  Chrome-free crops have no outlier and are left untouched.
-
-    Returns the trimmed absolute top coordinate (≥ sy0).
-    """
-    seg = h_seg[sy0:sy1]
-    if len(seg) < 3 * pitch:
-        return sy0
-    med = float(np.median(seg)) or 1.0
-    look = int(min(len(seg) - 2 * int(round(pitch)), 2.2 * pitch))
-    thr = PANEL_CHROME_OUTLIER * med
-    last = -1
-    for i in range(max(0, look)):
-        if seg[i] > thr:
-            last = i
-    if last < 0:
-        return sy0
-    return sy0 + last + max(4, int(round(0.12 * pitch)))
-
-
-def detect_panels(img_bgr):
-    """
-    Find every stash/container grid panel in the frame, each with its own
-    origin (pitch is shared — the whole frame renders at one UI scale, but
-    side-by-side container windows sit at arbitrary offsets, so a single
-    global phase misaligns all but one of them).
-
-    Two-level phase segmentation: split the x-axis into spans of stable
-    vertical-line phase, then split each span's y-axis the same way; each
-    (x-span × y-span) rectangle gets its own detect_stash_grid pass on the
-    sub-image (clean single-phase projections), keeping only validated grids
-    covering ≥2×2 cells.  Cells outside every panel never enter matching.
-
-    Returns [{cell_w, cell_h, origin_x, origin_y, strength, x0, y0, x1, y1}, ...]
-    (origins in full-frame coordinates); [] when nothing panel-like is found.
-    """
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
-    gy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
-    v_proj = gx.sum(axis=0)
-    h_proj = gy.sum(axis=1)
-    # Frame reference pitch for x-span segmentation.  Taken from BOTH axes, not
-    # the x-projection alone: a UI sidebar's icon strip forges a false pitch on
-    # x (measured on stash1.png: x reads 47px, strong, while the true grid is
-    # 63px), and segmenting at that false pitch splits the real panel wrong and
-    # then rejects every correct sub-grid.  _resolve_axis_pitches corroborates
-    # across axes and returns the true square pitch when one axis is chrome; on
-    # a genuine stretch it returns the real, different px/py.
-    pit = _resolve_axis_pitches(v_proj, h_proj)
-    if pit is None:
-        return []
-    pitch_x = pit['px']
-
-    sh, sw = img_bgr.shape[:2]
-    px_i = int(round(pitch_x))
-    candidates = []
-    for (sx0, sx1) in _phase_spans(v_proj, pitch_x):
-        # A real panel column-span renders at the frame pitch.  A UI sidebar
-        # (category-filter icon strip / container thumbnails) sits left of the
-        # stash and forms its own phase-span, but its LOCAL dominant x-period is
-        # the sidebar's forged pitch (measured on stash1.png: 41/47px vs the
-        # frame's 63px), not the grid's — so it would otherwise become a bogus
-        # narrow panel that outranks the real stash.  Drop spans whose own
-        # x-period disagrees with the frame pitch.
-        loc_v = gx[:, sx0:sx1].sum(axis=0)
-        local_xp, _ = _dominant_period(loc_v)
-        if not local_xp or abs(local_xp - pitch_x) / pitch_x > GRID_AXIS_DISAGREE:
-            continue
-        h_local = gy[:, sx0:sx1].sum(axis=1)
-        pitch_y, _ = _dominant_period(h_local)
-        if not pitch_y:
-            continue
-        py_i = int(round(pitch_y))
-        for (sy0, sy1) in _phase_spans(h_local, pitch_y):
-            # Span boundaries are window-quantized (1-pitch steps) and can cut
-            # a panel's first/last row or column — expand by one pitch each
-            # way so the sub-detection sees the true edge lines; overlaps into
-            # a neighbour are trimmed at its first grid line below.
-            x0, x1 = max(0, sx0 - px_i), min(sw, sx1 + px_i)
-            # Drop a leading UI-chrome rule (toolbar/header) from this span's
-            # top before expanding, so the panel doesn't count chrome rows as
-            # phantom grid rows; then expand by one pitch for the true edge line.
-            sy0t = _chrome_top_trim(h_local, sy0, sy1, pitch_y)
-            # When a chrome rule was trimmed, DON'T expand back up over it (that
-            # would re-admit the phantom rows); otherwise expand one pitch up to
-            # catch a span-quantized first grid line.
-            top = sy0t if sy0t > sy0 else max(0, sy0 - py_i)
-            y0, y1 = top, min(sh, sy1 + py_i)
-            sub = img_bgr[y0:y1, x0:x1]
-            g = detect_stash_grid(sub)
-            if not g or not validate_grid(g):
-                continue
-            # One frame renders at one UI scale, so every real panel shares
-            # the frame-global pitch — a sub-crop straddling a panel seam
-            # "detects" some other periodicity and gets rejected here.  x is
-            # compared against the frame x pitch; y against THIS span's own
-            # pitch_y (computed from the span-local h_local above, not a
-            # full-frame y reference which is poisoned by cross-panel
-            # correlation when panels sit at offset heights — measured: two
-            # panels 27px apart → global y "pitch" 27).  Per-axis references
-            # also admit genuinely stretched grids where pitch_x != pitch_y.
-            if (abs(g['cell_w'] - pitch_x) / pitch_x > 0.06
-                    or abs(g['cell_h'] - pitch_y) / pitch_y > 0.10):
-                continue
-            if (x1 - x0) < 2 * g['cell_w'] or (y1 - y0) < 2 * g['cell_h']:
-                continue
-            g['origin_x'] += x0
-            g['origin_y'] += y0
-            candidates.append({**g, 'x0': int(x0), 'y0': int(y0),
-                               'x1': int(x1), 'y1': int(y1)})
-
-    # Containment dedupe: a seam window can survive the pitch check when its
-    # junk period lands near-global, but such candidates sit almost entirely
-    # INSIDE a stronger panel (measured ~100% contained) — whereas a true
-    # neighbouring panel only overlaps by the one-pitch span expansion
-    # (measured ~27%).  Drop only the mostly-contained ones.
-    candidates.sort(key=lambda p: -p.get('strength', 0.0))
-    panels = []
-    for c in candidates:
-        area = (c['x1'] - c['x0']) * (c['y1'] - c['y0'])
-        contested = False
-        for k in panels:
-            ix = max(0, min(c['x1'], k['x1']) - max(c['x0'], k['x0']))
-            iy = max(0, min(c['y1'], k['y1']) - max(c['y0'], k['y0']))
-            if ix * iy > 0.6 * area:
-                contested = True
-                break
-        if not contested:
-            panels.append(c)
-
-    # Trim residual pairwise overlap (from the one-pitch span expansion) at
-    # the downstream panel's first grid line, so every cell is scanned by
-    # exactly one panel — a neighbour's grid running misaligned over this
-    # panel's cells is how false "extra" detections are born.
-    for i in range(len(panels)):
-        for j in range(i + 1, len(panels)):
-            a, b = panels[i], panels[j]
-            ix = min(a['x1'], b['x1']) - max(a['x0'], b['x0'])
-            iy = min(a['y1'], b['y1']) - max(a['y0'], b['y0'])
-            if ix <= 0 or iy <= 0:
-                continue
-            if ix <= iy:   # side-by-side → split along x
-                left, right = (a, b) if a['x0'] <= b['x0'] else (b, a)
-                cut = int(max(left['x0'] + 1, right['origin_x'] - 2))
-                left['x1'] = min(left['x1'], cut)
-                right['x0'] = max(right['x0'], min(cut, int(right['origin_x'])))
-            else:          # stacked → split along y
-                top, bot = (a, b) if a['y0'] <= b['y0'] else (b, a)
-                cut = int(max(top['y0'] + 1, bot['origin_y'] - 2))
-                top['y1'] = min(top['y1'], cut)
-                bot['y0'] = max(bot['y0'], min(cut, int(bot['origin_y'])))
-    panels = [p for p in panels
-              if p['x1'] - p['x0'] >= 2 * p['cell_w']
-              and p['y1'] - p['y0'] >= 2 * p['cell_h']]
-
-    # One frame renders at one UI scale → one pitch.  Per-panel sub-detections
-    # can round to neighbouring integer slot sizes (e.g. 63 vs 64), which would
-    # make the shared pitch-matched DB's templates the wrong length for a panel
-    # whose slot rounds differently and crash the masked-NCC matmul.  Snap only
-    # the SLOT-rounding outliers to the dominant slot (leaving each panel's own
-    # sub-pixel pitch otherwise intact so NCC sampling is unperturbed).
-    if len(panels) > 1:
-        from collections import Counter
-        slots = [(int(round(p['cell_w'])), int(round(p['cell_h']))) for p in panels]
-        dom = Counter(slots).most_common(1)[0][0]
-        for p, s in zip(panels, slots):
-            if s != dom:
-                p['cell_w'] = p['cell_w'] * dom[0] / s[0]
-                p['cell_h'] = p['cell_h'] * dom[1] / s[1]
-
-    panels.sort(key=lambda p: (p['y0'], p['x0']))
-    return panels
-
-
-def grid_rect(cx, cy, slots_w, slots_h, grid, pad=2):
-    """Pixel bounding rect for a grid region starting at (cx,cy), spanning slots."""
-    ox, oy = grid['origin_x'], grid['origin_y']
-    cw, ch = grid['cell_w'], grid['cell_h']
-    return (int(round(ox + cx * cw)) - pad,
-            int(round(oy + cy * ch)) - pad,
-            int(round(ox + (cx + slots_w) * cw)) + pad,
-            int(round(oy + (cy + slots_h) * ch)) + pad)
 
 
 # ---------------------------------------------------------------------------
@@ -3202,7 +1264,7 @@ def draw_badge(draw, x, y, label, bg=(30, 160, 30, 230)):
 
 
 # PIL's ImageDraw takes RGB(A) tuples (the highlight overlay is composited
-# onto `img`, a PIL Image, in the icon-DB pass below — unlike the OpenCV/BGR
+# onto `img`, a PIL Image, in the scan below — unlike the OpenCV/BGR
 # pipeline the rest of this module uses for matching).
 # This is the RGB equivalent of the amber/orange (0,165,255) BGR the FiR
 # feature spec calls for, so it renders as amber rather than blue on screen.
@@ -3212,11 +1274,6 @@ FIR_AMBER_RGB = (255, 165, 0)
 # ---------------------------------------------------------------------------
 # Keep-list scan — one pipeline shared by the hotkey and the Scan button
 # ---------------------------------------------------------------------------
-
-def _persist_grid(g):
-    s = load_json(SETTINGS_PATH, default_settings)
-    s['grid'] = g
-    save_json(SETTINGS_PATH, s)
 
 
 DEBUG_DIR  = os.path.join(DATA, 'debug')
@@ -3228,7 +1285,7 @@ def _save_debug_bundle(img_bgr, panels, detections, kind):
     Persist the raw frame + detected panels + every raw detection for the
     last few scans under data/debug/scan-<ts>-<kind>/.  This is what turns
     "that scan looked wrong" into an actionable report: the frame doubles as
-    an eval image (test_scan.py --label data/debug/.../frame.png) and the
+    an eval image (test_scan.py --prefill data/debug/.../frame.png) and the
     JSON shows exactly what the matcher decided.  Best-effort — a failed
     dump must never break a scan.
     """
@@ -3250,13 +1307,10 @@ def _save_debug_bundle(img_bgr, panels, detections, kind):
 
 def run_keep_scan(from_calibration=False):
     """
-    Capture → panel grids → icon-DB identification, annotated for the keep
-    list.  Identity comes exclusively from the icon matcher (OCR participates
-    only as the label-fusion layer inside identify_items_by_icon) — the old
-    whole-image OCR sweep drew fuzzy-matched boxes on essentially random
-    cells and suppressed correct icon matches at those spots, so it is gone.
+    Capture → identify every item (identify/ engine), annotated for the keep
+    list.
 
-    Returns {image, detections, grid, grid_src, warnings, checklist_matches}.
+    Returns {image, detections, grid, grid_failed, warnings, checklist_matches}.
     Raises ScanError/Exception — callers decide how to surface it.
 
     `from_calibration=True` reuses the region-picker's just-grabbed full-
@@ -3281,20 +1335,14 @@ def run_keep_scan(from_calibration=False):
         img, img_bgr = capture_for_scan(settings, from_calibration,
                                         require_region=False, warnings=warnings)
 
-        _scan_state['phase'] = 'grid'
-        use_v2 = identify_engine(settings) == 'v2'
-        if use_v2:
-            v2_dets, panels, v2_failed = scan_with_v2(img_bgr, settings, warnings)
-            grid_src = 'v2'
-        else:
-            panels, grid_src = resolve_panels(img_bgr, settings, persist_fn=_persist_grid)
+        _scan_state['phase'] = 'identify'
+        all_dets, panels, grid_failed = scan_with_v2(img_bgr, settings, warnings)
         grid = panels[0]
-        print(f"Grid[{grid_src}]: {len(panels)} panel(s), "
+        print(f"Grid: {len(panels)} panel(s), "
               f"cell={grid['cell_w']:.2f}×{grid['cell_h']:.2f} "
               f"origin=({grid['origin_x']:.1f},{grid['origin_y']:.1f})")
 
         detections    = []
-        grid_failed   = False
         found_entries = {}   # entry_id -> entry, for the confirm-to-check bar
 
         prices    = get_prices()
@@ -3305,28 +1353,8 @@ def run_keep_scan(from_calibration=False):
                             f"catalog: {', '.join(unmapped[:3])}"
                             + ('…' if len(unmapped) > 3 else ''))
 
-        icon_db = None if use_v2 else get_icon_db()
-        if not use_v2 and not icon_db:
-            warnings.append('Icon DB not built — icon matching skipped '
-                            '(build it from the Sell Advisor page)')
-        if (use_v2 or icon_db) and keepid_to_entry:
+        if keepid_to_entry:
             draw = ImageDraw.Draw(img, 'RGBA')
-            if use_v2:
-                all_dets, grid_failed = v2_dets, v2_failed
-            else:
-                _scan_state['phase'] = 'resample'
-                matcher_db = get_matcher_db(grid)
-                _scan_state['phase'] = 'match'
-                label_matcher = build_label_matcher(prices)
-                def _cb(done, total):
-                    _scan_state['done'], _scan_state['total'] = done, total
-                all_dets = scan_all_panels(img_bgr, panels, matcher_db,
-                                           label_matcher=label_matcher,
-                                           progress_cb=_cb)
-                all_dets, grid, grid_src, grid_failed = _arbitrate_scan(
-                    img_bgr, panels, all_dets, grid, grid_src, settings,
-                    matcher_db, label_matcher, warnings, _persist_grid,
-                    progress_cb=_cb)
             if settings.get('debug_dumps', True):
                 _save_debug_bundle(img_bgr, panels, all_dets, 'keep')
             for d in all_dets:
@@ -3362,7 +1390,7 @@ def run_keep_scan(from_calibration=False):
         buf = BytesIO()
         img.save(buf, format='PNG')
         encoded = base64.b64encode(buf.getvalue()).decode()
-        return {'image': encoded, 'detections': detections, 'grid': grid, 'grid_src': grid_src,
+        return {'image': encoded, 'detections': detections, 'grid': grid,
                 'grid_failed': grid_failed,
                 'warnings': warnings, 'checklist_matches': checklist_matches}
     finally:
@@ -3461,32 +1489,16 @@ def last_scan():
 def scan_status():
     return jsonify(dict(_scan_state))
 
-def _exact_ids_status():
-    """Report the eft_hash validation-gate status for /api/health."""
-    try:
-        import eft_hash
-        status = eft_hash.get_status(DATA)
-        if not status:
-            return {'enabled': False}
-        return {
-            'enabled':   bool(status.get('enabled')),
-            'agreement': status.get('agreement'),
-            'provider':  status.get('provider'),
-        }
-    except Exception:
-        return {'enabled': False}
-
 
 @app.route('/api/health', methods=['GET'])
 def health():
     return jsonify({
         'tesseract':      tesseract_available(),
         'tesseract_cmd':  pytesseract.pytesseract.tesseract_cmd,
-        'icon_db_ready':  get_icon_db() is not None,
-        'icon_db_error':  _index_build_state.get('error') or _icon_db_error,
+        'catalog_ready':  catalog_summary() is not None,
+        'catalog_error':  _index_build_state.get('error'),
         'prices_cached':  os.path.exists(PRICES_PATH),
         'hotkey':         hotkey_manager.current,
-        'exact_ids':      _exact_ids_status(),
         'app_version':    APP_VERSION,
     })
 
@@ -3896,91 +1908,56 @@ def prices_refresh():
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
-@app.route('/api/debug/grid', methods=['POST'])
-def debug_grid():
-    """Capture the configured region and return detected grid/panel parameters."""
-    settings = load_json(SETTINGS_PATH, default_settings)
-    img, img_bgr = capture_stash_image(settings)
-    grid = detect_stash_grid(img_bgr)
-    panels = detect_panels(img_bgr)
-    return jsonify({'grid': grid, 'panels': panels,
-                    'img_size': [img.width, img.height]})
 
-@app.route('/api/icons/prefetch', methods=['POST'])
-def icons_prefetch():
-    """Pre-download icons for all keep-list items in background."""
-    def _run():
-        keep_list = load_json(KEEPLIST_PATH, default_keep_list)
-        prices    = get_prices()
-        price_idx = build_price_index(prices)
-        settings  = load_json(SETTINGS_PATH, default_settings)
-        scale     = settings.get('icon_scale', 2.0)
-        n = prefetch_keep_list_icons(keep_list, price_idx, scale)
-        print(f"Icon prefetch complete: {n} icons downloaded/verified")
-    threading.Thread(target=_run, daemon=True).start()
-    return jsonify({'ok': True, 'message': 'Icon prefetch started in background'})
-
-_index_build_state = {'running': False, 'done': 0, 'total': 0, 'ts': 0, 'error': None}
+_index_build_state = {'running': False, 'phase': None, 'done': 0, 'total': 0, 'ts': 0, 'error': None}
 
 @app.route('/api/icons/build-index', methods=['POST'])
 def icons_build_index():
-    """Download all icons and build the NCC icon index."""
+    """Build everything the identification engine needs: download the tarkov.dev base image of
+    every item that lacks one (data/tmpl_src/), then rebuild the template catalog from them
+    (data/identify_catalog_v2.npz) and load it into the running engine."""
     if _index_build_state['running']:
         return jsonify({'ok': False, 'message': 'Build already in progress'})
+    # claim the slot before the thread starts so a double click cannot start two builds
+    _index_build_state.update({'running': True, 'phase': 'images', 'done': 0, 'total': 0,
+                               'ts': time.time(), 'error': None})
 
     def _run():
-        global _icon_db, _icon_db_error
-        _index_build_state.update({'running': True, 'done': 0, 'total': 0,
-                                   'ts': time.time(), 'error': None})
         try:
             prices = get_prices()
-            _index_build_state['total'] = len(prices.get('items', []))
             def cb(done, total):
                 _index_build_state['done']  = done
                 _index_build_state['total'] = total
-            db = build_icon_db(prices, progress_cb=cb)
-            with _icon_db_lock:
-                _icon_db = db
-                _icon_db_error = None   # fresh build supersedes any stale load error
-            _invalidate_pitch_cache()   # pitch-resampled copies of the old DB are stale
-            _index_build_state['done'] = _index_build_state['total']
-            print(f"[icon_db] built: {sum(len(b['ids']) for b in db.values())} items")
+            ok, failed = download_missing_base_images(prices, progress_cb=cb)
+            print(f"[catalog] base images: {ok} downloaded, {failed} failed")
+            _index_build_state['phase'] = 'catalog'    # ~35 s, no progress to report
+            from identify.catalog import load_catalog
+            load_catalog(force_rebuild=True)
             _warm_v2_engine()
+            print('[catalog] built')
         except Exception as e:
             _index_build_state['error'] = str(e)
-            print(f"[icon_db] build failed: {e}")
-            return
+            print(f"[catalog] build failed: {e}")
         finally:
-            _index_build_state['running'] = False
+            _index_build_state.update({'running': False, 'phase': None})
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({'ok': True, 'message': 'Icon DB build started'})
 
 
-@app.route('/api/icons/index-status', methods=['GET'])
-def icons_index_status():
-    db = get_icon_db()
-    summary = None
-    if db:
-        summary = {
-            'sizes':       len(db),
-            'total_items': sum(len(b['ids']) for b in db.values()),
-        }
-    return jsonify({'build': _index_build_state, 'index': summary})
-
-
 @app.route('/api/icons/matcher-status', methods=['GET'])
 def icons_matcher_status():
-    """Unified status endpoint for the sell page — covers icon DB build + readiness."""
-    db = get_icon_db()
-    item_count = sum(len(b['ids']) for b in db.values()) if db else 0
+    """Status endpoint for the sell page: build progress + whether the catalog is ready."""
+    running = _index_build_state['running']
+    summary = None if running else catalog_summary()
     return jsonify({
-        'running':    _index_build_state['running'],
+        'running':    running,
+        'phase':      _index_build_state.get('phase'),
         'done_count': _index_build_state.get('done', 0),
         'total':      _index_build_state.get('total', 0),
-        'error':      _index_build_state.get('error') or _icon_db_error,
-        'ready':      db is not None,
-        'item_count': item_count,
+        'error':      _index_build_state.get('error'),
+        'ready':      summary is not None,
+        'item_count': summary['items'] if summary else 0,
     })
 
 
@@ -3999,15 +1976,6 @@ def sell_scan():
 def _sell_scan_inner(from_calibration=False, frame_bgr=None):
     settings = load_json(SETTINGS_PATH, default_settings)
 
-    # --- Icon DB required (legacy engine only; v2 builds its own catalog) -----
-    use_v2 = identify_engine(settings) == 'v2'
-    icon_db = None if use_v2 else get_icon_db()
-    if not use_v2 and not icon_db:
-        return jsonify({
-            'image': None, 'results': [], 'grid': None, 'grid_failed': False,
-            'error': 'Icon index not built yet. Click "Build Icon DB" first.',
-        })
-
     _scan_state.update({'running': True, 'phase': 'capture',
                         'done': 0, 'total': 0, 'ts': time.time()})
     try:
@@ -4025,15 +1993,11 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
             return jsonify({'image': None, 'results': [], 'grid': None,
                             'grid_failed': False, 'error': str(e)})
 
-        # --- Grid detection (any pitch, per-panel origins, persisted) --------
-        _scan_state['phase'] = 'grid'
-        if use_v2:
-            v2_dets, panels, v2_failed = scan_with_v2(img_bgr, settings, warnings)
-            grid_src = 'v2'
-        else:
-            panels, grid_src = resolve_panels(img_bgr, settings, persist_fn=_persist_grid)
+        # --- Identification (grid, per-panel origins, every item) -------------
+        _scan_state['phase'] = 'identify'
+        raw_detections, panels, grid_failed = scan_with_v2(img_bgr, settings, warnings)
         grid = panels[0]
-        print(f"Grid[{grid_src}]: {len(panels)} panel(s), "
+        print(f"Grid: {len(panels)} panel(s), "
               f"cell={grid['cell_w']:.2f}×{grid['cell_h']:.2f} "
               f"origin=({grid['origin_x']:.1f},{grid['origin_y']:.1f})")
 
@@ -4054,22 +2018,6 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
             warnings.append('Tesseract OCR not installed — name reading disabled '
                             '(winget install UB-Mannheim.TesseractOCR)')
 
-        # --- identification (v2 engine, or legacy NCC + OCR-label via the icon DB) ----
-        if use_v2:
-            raw_detections, grid_failed = v2_dets, v2_failed
-        else:
-            _scan_state['phase'] = 'resample'
-            matcher_db = get_matcher_db(grid)
-            _scan_state['phase'] = 'match'
-            def _cb(done, total):
-                _scan_state['done'], _scan_state['total'] = done, total
-            label_matcher = build_label_matcher(prices)
-            raw_detections = scan_all_panels(img_bgr, panels, matcher_db,
-                                             label_matcher=label_matcher,
-                                             progress_cb=_cb)
-            raw_detections, grid, grid_src, grid_failed = _arbitrate_scan(
-                img_bgr, panels, raw_detections, grid, grid_src, settings,
-                matcher_db, label_matcher, warnings, _persist_grid, progress_cb=_cb)
         print(f"[sell_scan] matches: {len(raw_detections)}")
         if settings.get('debug_dumps', True):
             _save_debug_bundle(img_bgr, panels, raw_detections, 'sell')
@@ -4164,8 +2112,7 @@ URL = f'http://{HOST}:{PORT}'
 def run_server():
     """The Flask app + all /api routes are unchanged — this just serves them
     on localhost instead of the old port-80/custom-hostname setup. The window
-    below is the only thing that changed; nothing about scanning, OCR, or the
-    icon DB was touched."""
+    below is the only thing that changed; nothing about scanning or OCR was touched."""
     from waitress import serve
     serve(app, host=HOST, port=PORT, _quiet=True)
 
@@ -4194,7 +2141,7 @@ def _startup_maintenance():
 
 def _warm_v2_engine():
     try:
-        if identify_engine(load_json(SETTINGS_PATH, default_settings)) == 'v2' and os.path.exists(PRICES_PATH):
+        if os.path.exists(PRICES_PATH):
             from identify.config import EngineSettings
             from identify.pipeline import Engine
             es = EngineSettings.from_settings(load_json(SETTINGS_PATH, default_settings))

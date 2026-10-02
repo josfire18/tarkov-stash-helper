@@ -116,12 +116,12 @@ def test_clipped_bottom_row_still_identifies(world):
     assert all(d.clipped for d in last)
 
 
-def test_detection_has_the_legacy_result_shape(world):
+def test_detection_has_the_scan_record_shape(world):
     cat, icons = world
     img, _, _, _ = render_panel(63.0, 3, 2, [(0, 0, 1, 1)], icons={(0, 0): icons[idof(1)]}, size=(300, 240))
     d = engine(cat).scan(img).detections[0]
     assert isinstance(d, Detection)
-    leg = d.to_legacy()
+    leg = d.to_record()
     for key in ('col', 'row', 'W', 'H', 'item_id', 'name', 'rotated', 'score', 'fir', 'panel',
                 'px', 'py', 'pw', 'ph', 'uncertain'):
         assert key in leg
