@@ -207,14 +207,25 @@ def _cache_count(path: str | None) -> int:
         return sum(1 for e in it if e.name.lower().endswith('.png'))
 
 
+def _items_signature(prices_path: str) -> str:
+    """Hash of the item fields the catalog is built from (identity, names, size, tint, kind).
+    Prices are deliberately not part of it: they change every refresh (hourly) and must not
+    trigger a catalog rebuild."""
+    try:
+        with open(prices_path, encoding='utf-8') as f:
+            items = json.load(f)['items']
+        rows = sorted((it['id'], it.get('name') or '', it.get('shortName') or '',
+                       it.get('backgroundColor') or '', it.get('width'), it.get('height'),
+                       sorted(it.get('types') or ())) for it in items)
+        return hashlib.sha1(json.dumps(rows).encode()).hexdigest()
+    except (OSError, ValueError, KeyError, TypeError):
+        return 'none'
+
+
 def source_signature(prices_path: str, tmpl_dir: str) -> str:
     """Signature of the *mandatory* sources (schema, prices, tarkov.dev images).  The icon cache
     is tracked separately by file count (see :func:`load_catalog`)."""
-    try:
-        st = os.stat(prices_path)
-        ps = f'{st.st_size}:{int(st.st_mtime)}'
-    except OSError:
-        ps = 'none'
+    ps = _items_signature(prices_path)
     raw = f'{CATALOG_SCHEMA}|{STAGE1_SLOT}|{ps}|{_dir_signature(tmpl_dir)}'
     return hashlib.sha1(raw.encode()).hexdigest()
 
