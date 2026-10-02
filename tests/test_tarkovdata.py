@@ -205,7 +205,11 @@ def test_tasks_convert_to_the_old_shape_with_first_item_fir_and_trader_name():
     visit, give = t['objectives']
     assert visit == {'id': '65732ac3c67dcd96adffa3c7', 'type': 'visit'}
     assert give['type'] == 'giveItem' and give['count'] == 3 and give['foundInRaid'] is True
-    # a multi-item ("any of these") objective keeps its first item, as the deprecated GraphQL field did
+    # a multi-item ("any of these") objective: `item` stays the first (the deprecated GraphQL field),
+    # `items` carries every alternative
+    assert [i['id'] for i in give['items']] == ['590c695186f7741e566b64a2', '5751a89d24597722aa0e8db0',
+                                                '5af0548586f7743a532b7e99']
+    assert give['items'][0] == give['item']
     assert give['item'] == {'id': '590c695186f7741e566b64a2', 'name': 'Augmentin antibiotic pills',
                             'shortName': 'Augmentin'}
     kappa = tasks['5979f9ba86f7740f6c3fe9f2']
@@ -445,6 +449,34 @@ def test_json_comes_back_after_a_graphql_period(net, paths, graphql, monkeypatch
     assert res['source'] == 'json.tarkov.dev' and read(app.PRICES_PATH)['source'] == 'json.tarkov.dev'
 
 
+def test_objective_items_reads_items_falls_back_to_the_old_single_item_and_dedupes():
+    a, b = {'id': 'a', 'name': 'A'}, {'id': 'b', 'name': 'B'}
+    assert td.objective_items({'items': [a, b], 'item': a}) == [a, b]
+    assert td.objective_items({'item': a}) == [a]                       # cache written before `items`
+    assert td.objective_items({'items': [], 'item': a}) == [a]          # GraphQL answered only `item`
+    assert td.objective_items({'items': [a, a, b]}) == [a, b]
+    assert td.objective_items({'type': 'visit'}) == [] and td.objective_items({'item': None}) == []
+
+
+def test_any_of_objective_stays_out_of_the_aggregate_for_the_sell_advisor():
+    names = {'590c695186f7741e566b64a2': ('Augmentin antibiotic pills', 'Augmentin')}
+    cache = {'timestamp': time.time(), 'hideoutStations': [],
+             'tasks': td.convert_tasks(fixture('tasks'), fixture('tasks_en'), trader_names(), names)}
+    progress = {'completed_tasks': [], 'completed_hideout': [], 'have': {}}
+    page = app.compute_tasks_view(cache, progress)                      # the Tasks page: first item, as before
+    assert any(r['item_id'] == '590c695186f7741e566b64a2' and r['total_needed'] == 3 for r in page['aggregate'])
+    row = next(i for t in page['tasks'] for i in t['items'] if i['item_id'] == '590c695186f7741e566b64a2')
+    assert len(row['alternatives']) == 3
+    sell = app.compute_tasks_view(cache, progress, split_any_of=True)
+    assert not any(r['item_id'] == '590c695186f7741e566b64a2' for r in sell['aggregate'])
+    (g,) = sell['any_of']
+    assert (g['count'], g['fir'], g['label']) == (3, True, 'Therapist — First in Line')
+    assert [i['id'] for i in g['items']][0] == '590c695186f7741e566b64a2' and len(g['items']) == 3
+    done = app.compute_tasks_view(cache, {**progress, 'completed_tasks': ['657315ddab5a49b71f098853']},
+                                  split_any_of=True)
+    assert done['any_of'] == []                                         # finished task: nothing to keep
+
+
 # ---------------------------------------------------------------------------
 # Tasks / hideout
 # ---------------------------------------------------------------------------
@@ -461,6 +493,24 @@ def test_tasks_refresh_writes_tasks_and_hideout_and_is_conditional_afterwards(ne
     net.requests.clear()
     assert app.refresh_tasks()['status'] == 'unchanged'
     assert len(net.fetched('tasks')) == 1 and net.fetched('tasks')[0][1] == net.etags['tasks']
+
+
+def test_a_cache_without_item_lists_is_refetched_even_when_the_etags_say_unchanged(net, paths):
+    app.refresh_prices()
+    app.refresh_tasks()
+    cache = read(app.TASKS_CACHE_PATH)
+    assert cache['schema'] == td.TASKS_SCHEMA
+    for t in cache['tasks']:                                         # what an old cache on disk looks like
+        for o in t['objectives']:
+            o.pop('items', None)
+    cache.pop('schema')
+    app.save_json(app.TASKS_CACHE_PATH, cache)
+    net.requests.clear()
+    assert app.refresh_tasks()['status'] == 'updated'
+    assert net.fetched('tasks')[0][1] is None                        # unconditional
+    new = read(app.TASKS_CACHE_PATH)
+    assert new['schema'] == td.TASKS_SCHEMA
+    assert any(len(o.get('items') or ()) == 3 for t in new['tasks'] for o in t['objectives'])
 
 
 def test_bad_task_payload_keeps_the_good_cache(net, paths):

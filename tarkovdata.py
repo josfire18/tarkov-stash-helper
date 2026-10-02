@@ -17,7 +17,7 @@ downstream (sellcalc, the task views, the identification catalog) changes:
 * ``fleaMarket`` + ``traders`` -> the ``rules`` blob sellcalc reads (live flea fee
   rates, the Found-in-Raid rule, trader pay rates).
 * tasks / hideout -> ``tasks`` and ``hideoutStations`` with the old shape (an item
-  objective carries ``item`` = the first of the JSON's ``items`` list, as the
+  objective carries ``items`` = the JSON's whole ``items`` list and ``item`` = its first, as the
   deprecated GraphQL field did).
 
 Names are translation keys in the JSON (``"<id> Name"``) resolved through the
@@ -69,6 +69,10 @@ FALLBACK_TRADER_NAMES = {
 }
 
 ITEM_OBJECTIVES = ('giveItem', 'findItem', 'plantItem')   # GraphQL's TaskObjectiveItem
+# Cache layout version of tasks_cache.json.  2 = item objectives carry ``items`` (every
+# accepted alternative) next to the legacy ``item`` (the first one).  A cache written
+# before that has no ``schema`` and is re-fetched even when the ETags say "unchanged".
+TASKS_SCHEMA = 2
 FLEA_KEYS = ('minPlayerLevel', 'enabled', 'sellOfferFeeRate', 'sellRequirementFeeRate',
              'foundInRaidRequired', 'reputationLevels')
 
@@ -335,6 +339,21 @@ def _item_ref(item_id, item_names):
     return {'id': item_id, 'name': name or item_id, 'shortName': short or name or item_id}
 
 
+def objective_items(obj):
+    """Every item an item objective accepts, as ``[{'id', 'name', 'shortName'}]`` (de-duplicated,
+    order kept).  Reads the ``items`` list; a cache written before it existed (or a GraphQL
+    answer with only ``item``) falls back to the single ``item``.  [] for non-item objectives."""
+    refs = [r for r in (obj.get('items') or ()) if r and r.get('id')]
+    if not refs and (obj.get('item') or {}).get('id'):
+        refs = [obj['item']]
+    seen, out = set(), []
+    for r in refs:
+        if r['id'] not in seen:
+            seen.add(r['id'])
+            out.append(r)
+    return out
+
+
 def convert_tasks(tasks_body, en_body, trader_names, item_names):
     """The ``tasks`` document -> the old ``TASKS_QUERY`` task list."""
     tr = translator(en_body)
@@ -345,8 +364,9 @@ def convert_tasks(tasks_body, en_body, trader_names, item_names):
             rec = {'id': o.get('id'), 'type': o.get('type')}
             ids = o.get('items') or []
             if o.get('type') in ITEM_OBJECTIVES and ids:
+                refs = [_item_ref(i, item_names) for i in dict.fromkeys(ids)]   # any ONE of these
                 rec.update({'count': o.get('count') or 0, 'foundInRaid': bool(o.get('foundInRaid')),
-                            'item': _item_ref(ids[0], item_names)})
+                            'item': refs[0], 'items': refs})
             objectives.append(rec)
         out.append({
             'id': t.get('id') or tid, 'name': tr(t.get('name'), t.get('normalizedName') or tid),
@@ -405,7 +425,8 @@ def refresh_tasks(tasks_path, meta, previous, item_names, now=None):
 
     tasks, stations, etags, errors = prev_tasks, prev_stations, {}, []
     changed = False
-    got = fetch_pair(meta, 'tasks', 'tasks_en', bool(prev_tasks))
+    old_layout = (previous or {}).get('schema', 1) < TASKS_SCHEMA     # no ``items`` lists yet
+    got = fetch_pair(meta, 'tasks', 'tasks_en', bool(prev_tasks) and not old_layout)
     if got is not None:
         try:
             new = convert_tasks(got[0], got[1], trader_names, item_names)
@@ -430,7 +451,8 @@ def refresh_tasks(tasks_path, meta, previous, item_names, now=None):
         if errors:                       # something was refused but the old data stands
             meta['errors']['tasks_partial'] = '; '.join(errors)
         return {'status': 'unchanged', 'cache': previous}
-    cache = {'timestamp': now, 'source': SOURCE_NAME, 'tasks': tasks, 'hideoutStations': stations}
+    cache = {'timestamp': now, 'source': SOURCE_NAME, 'schema': TASKS_SCHEMA,
+             'tasks': tasks, 'hideoutStations': stations}
     write_json_atomic(tasks_path, cache)
     _commit_etags(meta, etags)
     meta['sources']['tasks'] = SOURCE_NAME

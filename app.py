@@ -143,7 +143,7 @@ TASKS_QUERY = '''{
     trader { name }
     objectives {
       id type
-      ... on TaskObjectiveItem { count foundInRaid item { id name shortName } }
+      ... on TaskObjectiveItem { count foundInRaid item { id name shortName } items { id name shortName } }
     }
   }
   hideoutStations {
@@ -1166,6 +1166,7 @@ def _graphql_tasks():
     return {
         'timestamp':       time.time(),
         'source':          'graphql',
+        'schema':          tarkovdata.TASKS_SCHEMA,
         'tasks':           data.get('tasks') or [],
         'hideoutStations': data.get('hideoutStations') or [],
     }
@@ -1256,7 +1257,7 @@ def get_tasks(allow_fetch=True):
 # stash items worth tracking — they'd bury real requirements in the aggregate.
 CURRENCY_NAMES = {'roubles', 'dollars', 'euros'}
 
-def compute_tasks_view(cache, progress, kappa_only=False, kinds=('giveItem',)):
+def compute_tasks_view(cache, progress, kappa_only=False, kinds=('giveItem',), split_any_of=False):
     """
     Server-side merged view of what the player still needs.
     Only 'giveItem' objectives count as hand-ins (the Tasks page); the sell
@@ -1269,6 +1270,12 @@ def compute_tasks_view(cache, progress, kappa_only=False, kinds=('giveItem',)):
     "Compensation for Damage") still appear in `tasks_out` (the client dims
     them) but no longer inflate the aggregate/KEEP totals. Hideout
     accumulation is untouched regardless, since it's needed for prestige.
+
+    An objective that accepts ANY ONE of several items (tarkov.dev's ``items`` list)
+    shows on the Tasks page under its first item, with the rest in ``alternatives``.
+    With ``split_any_of`` (the sell advisor) it stays out of ``aggregate`` and is
+    returned in ``any_of`` instead - ``{'label', 'count', 'fir', 'items': [{id, name}]}``
+    per still-open objective - because each item's own total would be wrong for it.
     """
     done_tasks  = set(progress.get('completed_tasks', []))
     done_levels = set(progress.get('completed_hideout', []))
@@ -1288,25 +1295,33 @@ def compute_tasks_view(cache, progress, kappa_only=False, kinds=('giveItem',)):
             rec['sources'].append({'type': src_type, 'name': src_name,
                                    'count': count, 'fir': bool(fir)})
 
+    any_of = []
     tasks_out = []
     for t in cache.get('tasks', []):
         items = []
         for o in (t.get('objectives') or []):
             if o.get('type') not in kinds:
                 continue
-            it, cnt = o.get('item'), o.get('count') or 0
-            if not it or not it.get('id') or cnt <= 0:
+            alts = [a for a in tarkovdata.objective_items(o)
+                    if (a.get('name') or '').lower() not in CURRENCY_NAMES]
+            cnt = o.get('count') or 0
+            if not alts or cnt <= 0:
                 continue
-            if (it.get('name') or '').lower() in CURRENCY_NAMES:
-                continue
+            it = alts[0]
             fir = bool(o.get('foundInRaid'))
-            items.append({'item_id': it['id'], 'name': it.get('name') or '?',
-                          'count': cnt, 'fir': fir})
+            rec = {'item_id': it['id'], 'name': it.get('name') or '?', 'count': cnt, 'fir': fir}
+            if len(alts) > 1:
+                rec['alternatives'] = [a.get('name') or '?' for a in alts]
+            items.append(rec)
             active = (t['id'] not in done_tasks
                       and (not kappa_only or bool(t.get('kappaRequired'))))
-            _acc(it, cnt, fir, 'task',
-                 f"{(t.get('trader') or {}).get('name', '?')} — {t['name']}",
-                 active=active)
+            label = f"{(t.get('trader') or {}).get('name', '?')} — {t['name']}"
+            if len(alts) > 1 and split_any_of:
+                if active:
+                    any_of.append({'label': label, 'count': cnt, 'fir': fir,
+                                   'items': [{'id': a['id'], 'name': a.get('name') or '?'} for a in alts]})
+                continue
+            _acc(it, cnt, fir, 'task', label, active=active)
         if not items:
             continue   # only hand-in tasks are interesting here
         tasks_out.append({
@@ -1348,6 +1363,7 @@ def compute_tasks_view(cache, progress, kappa_only=False, kinds=('giveItem',)):
 
     return {
         'aggregate': aggregate,
+        'any_of':    any_of,
         'tasks':     tasks_out,
         'stations':  stations_out,
         'cache_age_minutes': round((time.time() - cache.get('timestamp', 0)) / 60, 1),
