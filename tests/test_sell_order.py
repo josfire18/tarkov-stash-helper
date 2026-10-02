@@ -529,3 +529,11 @@ def test_rules_outage_does_not_stop_a_price_refresh_and_keeps_the_last_good_rule
     assert out['items'][0]['id'] == 'x'
     assert out['rules'] == {'flea': {'sellOfferFeeRate': 0.05}}              # last good rules survive
     assert json.loads(cache.read_text(encoding='utf-8'))['rules'] == out['rules']
+
+
+def test_dogtags_are_skipped_but_the_dogtag_case_is_priced():
+    assert app.skip_badge({'name': 'Dogtag USEC', 'types': ['barter', 'noFlea']}) == 'TAG'
+    assert app.skip_badge({'name': 'Dogtag BEAR', 'types': ['barter', 'noFlea']}) == 'TAG'
+    assert app.skip_badge({'name': 'Dogtag case', 'types': ['container', 'noFlea']}) is None
+    assert app.skip_badge({'name': 'Colt M4A1', 'types': ['gun']}) == 'GUN'
+    assert app.skip_badge({'name': 'Salewa', 'types': ['meds']}) is None

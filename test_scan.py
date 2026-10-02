@@ -172,7 +172,7 @@ def sell_destination(item_id):
     if item is None:
         return None
     a = _SELL['app']
-    if a.is_unpriced_weapon(item):
+    if a.skip_badge(item):
         return 'skip'
     rec = a.sell_recommendation(item, flea_blocked=a.flea_block_reason(item, True, {}))
     return 'flea' if rec['recommend'] == 'flea' else f"trader:{rec['trader_name']}"
@@ -213,6 +213,10 @@ def score(truth, dets, cats, verbose=True):
             # Weapons are never priced (a gun can be built from hundreds of parts), so the
             # only thing that matters is recognising it AS a weapon so the sell list skips it.
             ok = d.get('category') == 'weapon'
+        elif t.get('name', '').startswith('Dogtag ') and 'case' not in t.get('name', ''):
+            # Dogtags are skipped too (dozens of identically named themed variants): any
+            # dogtag answer is enough for the sell list to skip it.
+            ok = d.get('name', '').startswith('Dogtag ') and 'case' not in d.get('name', '')
         if ok:
             ident['ok'] += 1
             c['ok'] += 1

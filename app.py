@@ -606,6 +606,23 @@ def is_unpriced_weapon(item_data, category=None):
     return item_data is None and category == 'weapon'
 
 
+def is_dogtag(item_data):
+    """True for a PMC dogtag.  Dozens of themed tags share the names "Dogtag BEAR" /
+    "Dogtag USEC", so they can't be told apart or priced reliably; the sell list
+    skips them.  The Dogtag case is a normal container and is kept."""
+    name = (item_data or {}).get('name') or ''
+    return name.startswith('Dogtag ') and 'container' not in ((item_data or {}).get('types') or ())
+
+
+def skip_badge(item_data, category=None):
+    """Badge for an item the sell list leaves out ('GUN', 'TAG'), or None to price it."""
+    if is_unpriced_weapon(item_data, category):
+        return 'GUN'
+    if is_dogtag(item_data):
+        return 'TAG'
+    return None
+
+
 def build_sell_context(settings, prices):
     """sellcalc context for one scan: settings + the live rules cached with the
     prices + the Intelligence Center level from the hideout progress."""
@@ -2034,13 +2051,14 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
 
         sellable = []
         for d in sorted(raw_detections, key=lambda r: (r['panel'], r['row'], r['col'])):
-            if is_unpriced_weapon(id_to_item.get(d['item_id']), d.get('category')):
-                # Guns are never priced: a build can use any of hundreds of parts, so the
-                # identity says nothing about its value.  Mark it so the player sees it was
-                # recognised, and leave it out of the sell list.
+            badge = skip_badge(id_to_item.get(d['item_id']), d.get('category'))
+            if badge:
+                # Guns are never priced (a build can use any of hundreds of parts) and
+                # dogtags come in dozens of identically named themed variants.  Mark them so
+                # the player sees they were recognised, and leave them out of the sell list.
                 draw.rectangle([d['px'], d['py'], d['px'] + d['pw'], d['py'] + d['ph']],
                                outline=(110, 110, 110, 255), width=2)
-                draw_badge(draw, d['px'] + 2, d['py'] + 2, 'GUN', bg=(80, 80, 80, 220))
+                draw_badge(draw, d['px'] + 2, d['py'] + 2, badge, bg=(80, 80, 80, 220))
                 skipped_weapons += 1
             else:
                 sellable.append(d)
