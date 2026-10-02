@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 
 import sellcalc
+import tarkovdata
 # The sell-advice economics live in sellcalc.py (pure functions); the historical
 # names stay importable from here (test_scan.py scores sell decisions via app.*).
 from sellcalc import (best_trader_price, calc_flea_fee, price_420, flea_block_reason,  # noqa: F401
@@ -53,6 +54,7 @@ PRICES_PATH    = os.path.join(DATA, 'prices_cache.json')
 KAPPA_WIKI_PATH  = os.path.join(DATA, 'kappa_wiki.json')   # cached Collector item names from the wiki
 PRESTIGE_WIKI_PATH = os.path.join(DATA, 'prestige_wiki.json')  # cached Prestige requirements from the wiki
 TASKS_CACHE_PATH = os.path.join(DATA, 'tasks_cache.json')  # cached tasks + hideout requirements (tarkov.dev)
+META_PATH        = os.path.join(DATA, 'tarkovdev_meta.json')  # ETags, last-check times, pending catalog work
 PROGRESS_PATH    = os.path.join(DATA, 'progress.json')     # user task/hideout completion + have-counts
 TMPL_SRC_DIR   = os.path.join(DATA, 'tmpl_src')        # transparent per-slot base images (BGRA PNG)
 os.makedirs(DATA, exist_ok=True)
@@ -67,7 +69,10 @@ if not shutil.which(pytesseract.pytesseract.tesseract_cmd):
     if os.path.exists(_default_tesseract):
         pytesseract.pytesseract.tesseract_cmd = _default_tesseract
 
-PRICE_CACHE_TTL      = 1800  # seconds (30 min)
+PRICE_CACHE_TTL      = 1800  # seconds (30 min): older and a scan refreshes on demand (the refresher normally beats this)
+PRICE_REFRESH_INTERVAL = 900   # seconds (15 min): background refresh of items/prices (a 304 when nothing changed)
+TASKS_REFRESH_INTERVAL = 3 * 3600  # seconds (3 h): background refresh of tasks/hideout/traders
+RETRY_BACKOFF        = 300   # seconds: after a failed refresh, wait this long before trying again
 KAPPA_WIKI_TTL       = 86400 # seconds (24 h) — Collector list changes rarely
 PRESTIGE_WIKI_TTL    = 7 * 86400 # seconds (7 d) — Prestige requirements change only per major patch
 TASKS_CACHE_TTL      = 86400 # seconds (24 h) — task/hideout requirements change per patch
@@ -192,8 +197,7 @@ def load_json(path, default_fn):
     return data
 
 def save_json(path, data):
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    tarkovdata.write_json_atomic(path, data, indent=2)     # temp file + os.replace: never half-written
 
 
 # ---------------------------------------------------------------------------
@@ -243,8 +247,9 @@ class PriceFetchError(Exception):
     """tarkov.dev did not return item data (outage, rate limit, schema change)."""
 
 
-def fetch_prices():
-    """Fetch all item prices from tarkov.dev and write to cache."""
+def _graphql_prices():
+    """Item prices from tarkov.dev's GraphQL API (the fallback source) as a cache dict.
+    Not written anywhere; raises PriceFetchError."""
     r = http_requests.post(TARKOV_API, json={'query': PRICE_QUERY}, timeout=30)
     try:
         body = r.json()
@@ -255,13 +260,7 @@ def fetch_prices():
         errs = '; '.join(e.get('message', '?') if isinstance(e, dict) else str(e)
                          for e in body.get('errors') or []) or 'no items'
         raise PriceFetchError(f'tarkov.dev HTTP {r.status_code}: {errs}')
-    cache = {'timestamp': time.time(), 'items': items}
-    previous = load_json(PRICES_PATH, lambda: None) if os.path.exists(PRICES_PATH) else None
-    rules = fetch_sell_rules() or (previous or {}).get('rules')
-    if rules:
-        cache['rules'] = rules
-    save_json(PRICES_PATH, cache)
-    return cache
+    return {'timestamp': time.time(), 'source': 'graphql', 'items': items}
 
 
 def parse_sell_rules(data):
@@ -284,7 +283,7 @@ def parse_sell_rules(data):
 
 
 def fetch_sell_rules():
-    """Best-effort fetch of the flea fee rates / FiR rule / trader pay rates.
+    """Best-effort fetch of the flea fee rates / FiR rule / trader pay rates (GraphQL).
     Never raises: an outage or a schema change leaves the documented constants
     in force (sellcalc)."""
     try:
@@ -294,16 +293,132 @@ def fetch_sell_rules():
         print(f'[prices] sell rules unavailable, using built-in constants: {e}')
         return None
 
+
+# Refresh bookkeeping shared by the on-demand paths and the background refresher.
+_refresh_lock = threading.RLock()     # one refresh at a time (the refresher, a scan, the Refresh button)
+_refresh_state = {                    # in-memory status, merged into /api/prices/status
+    'prices': {'attempt': 0, 'error': None},
+    'tasks':  {'attempt': 0, 'error': None},
+}
+
+
+def _load_cache(path):
+    """A cache file's content, or None if it is missing/unreadable (never creates it)."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _load_meta():
+    return tarkovdata.load_meta(META_PATH)
+
+
+def _save_meta_quietly(meta):
+    try:
+        tarkovdata.save_meta(META_PATH, meta)
+    except OSError as e:
+        print(f'[refresh] could not save refresh bookkeeping: {e}')
+
+
+def _usable_prices(cache):
+    return cache if cache and cache.get('items') else None
+
+
+def fetch_prices_graphql(previous=None):
+    """Refresh the price cache from the GraphQL API alone (the fallback source).  Validated
+    like the JSON source, written atomically, returns the cache.  Raises PriceFetchError."""
+    cache = _graphql_prices()
+    previous = previous if previous is not None else _usable_prices(_load_cache(PRICES_PATH))
+    try:
+        tarkovdata.validate_items(cache['items'], (previous or {}).get('items'))
+    except tarkovdata.SourceError as e:
+        raise PriceFetchError(f'tarkov.dev GraphQL data refused: {e}')
+    rules = fetch_sell_rules() or (_load_cache(PRICES_PATH) or {}).get('rules')
+    if rules:
+        cache['rules'] = rules
+    tarkovdata.write_json_atomic(PRICES_PATH, cache)
+    return cache
+
+
+def refresh_prices(force=False):
+    """Bring the price cache up to date.  Source order: json.tarkov.dev (conditional, cheap
+    when nothing changed), then the GraphQL API, then - as an error - the cache that is
+    already on disk (the callers' stale-cache fallback).  Never replaces a good cache with
+    a bad one.  Returns ``{'status', 'source', 'cache', 'new_ids'}``; a new item id on a
+    machine that already has a catalog queues the catalog update."""
+    with _refresh_lock:
+        previous = _usable_prices(_load_cache(PRICES_PATH))
+        meta = _load_meta()
+        _refresh_state['prices']['attempt'] = meta['attempted']['prices'] = time.time()
+        if force:
+            meta['etags'] = {}
+        try:
+            try:
+                res = tarkovdata.refresh_prices(PRICES_PATH, meta, previous)
+                res['source'] = tarkovdata.SOURCE_NAME
+            except Exception as json_err:      # network, bad payload, a converter bug: all fall back
+                print(f'[prices] json.tarkov.dev failed ({json_err}); trying the GraphQL API')
+                try:
+                    cache = fetch_prices_graphql(previous)
+                except (PriceFetchError, http_requests.RequestException) as gql_err:
+                    raise PriceFetchError(f'json.tarkov.dev: {json_err}; GraphQL: {gql_err}')
+                meta['checked']['prices'] = cache['timestamp']
+                meta['sources']['prices'] = 'graphql'
+                meta['etags'].pop('items', None)      # the cache is no longer the JSON data: never 304 against it
+                meta['etags'].pop('items_en', None)
+                old_ids = {i['id'] for i in (previous or {}).get('items', ())}
+                res = {'status': 'updated', 'source': 'graphql', 'cache': cache,
+                       'new_ids': [i['id'] for i in cache['items'] if i['id'] not in old_ids] if old_ids else []}
+        except PriceFetchError as e:
+            meta['errors']['prices'] = str(e)
+            _refresh_state['prices']['error'] = str(e)
+            _save_meta_quietly(meta)
+            raise
+        meta['errors'].pop('prices', None)
+        _refresh_state['prices']['error'] = None
+        if res['new_ids']:
+            meta['catalog_pending'] = sorted(set(meta['catalog_pending']) | set(res['new_ids']))
+        _save_meta_quietly(meta)
+    if res['new_ids']:
+        print(f"[prices] {len(res['new_ids'])} new items")
+        _queue_catalog_update()
+    return res
+
+
+def fetch_prices():
+    """Refresh the price cache now (see :func:`refresh_prices`) and return it."""
+    return refresh_prices()['cache']
+
+
+def _cache_age_seconds(cache, kind):
+    """Seconds since this cache was last confirmed current: written, or re-checked
+    (a 304 from json.tarkov.dev rewrites nothing)."""
+    ts = (cache or {}).get('timestamp', 0)
+    try:
+        ts = max(ts, _load_meta()['checked'].get(kind) or 0)
+    except Exception:
+        pass
+    return time.time() - ts
+
+
 def get_prices():
     """Return cached prices, refreshing if stale.
 
-    A failed refresh (tarkov.dev outage) falls back to the last good cache,
-    marked ``stale_error`` so the UI can say how old the prices are - a
-    temporary API problem must not stop a sell scan.
+    The background refresher normally keeps the cache current, so this is cheap.  A failed
+    refresh (tarkov.dev outage) falls back to the last good cache, marked ``stale_error`` so
+    the UI can say how old the prices are - a temporary API problem must not stop a sell
+    scan - and is not retried for RETRY_BACKOFF seconds (a scan never waits on a dead
+    network twice in a row).
     """
-    cache = load_json(PRICES_PATH, lambda: None) if os.path.exists(PRICES_PATH) else None
-    if cache and time.time() - cache.get('timestamp', 0) < PRICE_CACHE_TTL:
+    cache = _usable_prices(_load_cache(PRICES_PATH))
+    if cache and _cache_age_seconds(cache, 'prices') < PRICE_CACHE_TTL:
         return cache
+    err = _refresh_state['prices']['error']
+    if cache and err and time.time() - _refresh_state['prices']['attempt'] < RETRY_BACKOFF:
+        return {**cache, 'stale_error': err}
     try:
         return fetch_prices()
     except (PriceFetchError, http_requests.RequestException) as e:
@@ -1037,32 +1152,104 @@ def default_progress():
     return {'completed_tasks': [], 'completed_hideout': [], 'have': {}}
 
 
-def fetch_tasks():
-    """Fetch task + hideout item requirements from tarkov.dev, cache 24 h."""
+def _graphql_tasks():
+    """Task + hideout item requirements from tarkov.dev's GraphQL API (the fallback source) as
+    a cache dict.  Not written anywhere; raises RuntimeError."""
     r = http_requests.post(TARKOV_API, json={'query': TASKS_QUERY}, timeout=60)
-    payload = r.json()
+    try:
+        payload = r.json()
+    except ValueError:
+        raise RuntimeError(f'tarkov.dev returned HTTP {r.status_code} with no JSON')
     if payload.get('errors'):
         raise RuntimeError(f"tarkov.dev tasks query failed: {payload['errors']}")
     data = payload.get('data') or {}
-    cache = {
+    return {
         'timestamp':       time.time(),
+        'source':          'graphql',
         'tasks':           data.get('tasks') or [],
         'hideoutStations': data.get('hideoutStations') or [],
     }
-    save_json(TASKS_CACHE_PATH, cache)
+
+
+def fetch_tasks_graphql(previous=None):
+    """Refresh the tasks cache from the GraphQL API alone; validated, written atomically."""
+    cache = _graphql_tasks()
+    previous = previous if previous is not None else _load_cache(TASKS_CACHE_PATH)
+    try:
+        tarkovdata.validate_tasks(cache['tasks'], (previous or {}).get('tasks'))
+        tarkovdata.validate_stations(cache['hideoutStations'], (previous or {}).get('hideoutStations'))
+    except tarkovdata.SourceError as e:
+        raise RuntimeError(f'tarkov.dev GraphQL task data refused: {e}')
+    tarkovdata.write_json_atomic(TASKS_CACHE_PATH, cache, indent=1)
     return cache
 
 
+def refresh_tasks(force=False):
+    """Bring the tasks/hideout cache up to date: json.tarkov.dev first, then GraphQL; a bad
+    payload never replaces the cache on disk.  Returns ``{'status', 'source', 'cache'}``."""
+    with _refresh_lock:
+        previous = _load_cache(TASKS_CACHE_PATH)
+        if previous and not (previous.get('tasks') and previous.get('hideoutStations')):
+            previous = None
+        meta = _load_meta()
+        _refresh_state['tasks']['attempt'] = meta['attempted']['tasks'] = time.time()
+        if force:
+            meta['etags'] = {k: v for k, v in meta['etags'].items() if k not in
+                             ('tasks', 'tasks_en', 'hideout', 'hideout_en')}
+        names = tarkovdata.item_names_from_prices(_load_cache(PRICES_PATH))
+        try:
+            try:
+                res = tarkovdata.refresh_tasks(TASKS_CACHE_PATH, meta, previous, names)
+                res['source'] = tarkovdata.SOURCE_NAME
+            except Exception as json_err:      # network, bad payload, a converter bug: all fall back
+                print(f'[tasks] json.tarkov.dev failed ({json_err}); trying the GraphQL API')
+                try:
+                    cache = fetch_tasks_graphql(previous)
+                except (RuntimeError, http_requests.RequestException) as gql_err:
+                    raise RuntimeError(f'json.tarkov.dev: {json_err}; GraphQL: {gql_err}')
+                meta['checked']['tasks'] = cache['timestamp']
+                meta['sources']['tasks'] = 'graphql'
+                for k in ('tasks', 'tasks_en', 'hideout', 'hideout_en'):
+                    meta['etags'].pop(k, None)
+                res = {'status': 'updated', 'source': 'graphql', 'cache': cache}
+        except RuntimeError as e:
+            meta['errors']['tasks'] = str(e)
+            _refresh_state['tasks']['error'] = str(e)
+            _save_meta_quietly(meta)
+            raise
+        meta['errors'].pop('tasks', None)
+        _refresh_state['tasks']['error'] = None
+        _save_meta_quietly(meta)
+        return res
+
+
+def fetch_tasks():
+    """Refresh the task + hideout item requirements now (see :func:`refresh_tasks`)."""
+    return refresh_tasks()['cache']
+
+
 def get_tasks(allow_fetch=True):
-    """Cached task data, refreshed when stale. With allow_fetch=False, returns
-    whatever cache exists (or None) without touching the network — used inside
+    """Cached task data, refreshed when stale (the background refresher normally keeps it
+    current; a failed refresh falls back to the cache on disk). With allow_fetch=False,
+    returns whatever cache exists (or None) without touching the network - used inside
     scans so a scan can never block on tarkov.dev."""
-    if os.path.exists(TASKS_CACHE_PATH):
-        cache = load_json(TASKS_CACHE_PATH, lambda: None)
-        if cache and (not allow_fetch
-                      or time.time() - cache.get('timestamp', 0) < TASKS_CACHE_TTL):
-            return cache
-    return fetch_tasks() if allow_fetch else None
+    cache = _load_cache(TASKS_CACHE_PATH)
+    if cache and not (cache.get('tasks') and cache.get('hideoutStations')):
+        cache = None
+    if cache and (not allow_fetch or _cache_age_seconds(cache, 'tasks') < TASKS_CACHE_TTL):
+        return cache
+    if not allow_fetch:
+        return None
+    err = _refresh_state['tasks']['error']
+    if cache and err and time.time() - _refresh_state['tasks']['attempt'] < RETRY_BACKOFF:
+        return cache
+    try:
+        return fetch_tasks()
+    except (RuntimeError, http_requests.RequestException) as e:
+        if not cache:
+            raise
+        print(f'[tasks] refresh failed, using cached tasks: {e}')
+        return cache
 
 
 # Money hand-ins (e.g. "Compensation for Damage" wants 1M roubles) aren't
@@ -1825,7 +2012,10 @@ def api_tasks():
     qp = request.args.get('kappa_only')
     if qp is not None:
         kappa_only = qp not in ('0', 'false', 'False')
-    return jsonify(compute_tasks_view(cache, progress, kappa_only=kappa_only))
+    view = compute_tasks_view(cache, progress, kappa_only=kappa_only)
+    view['cache_age_minutes'] = round(_cache_age_seconds(cache, 'tasks') / 60, 1)   # since last confirmed current
+    view['source'] = cache.get('source') or 'graphql'
+    return jsonify(view)
 
 @app.route('/api/tasks/refresh', methods=['POST'])
 def api_tasks_refresh():
@@ -1909,56 +2099,129 @@ def api_prestige_advance():
 def sell_page():
     return render_template('sell.html')
 
+def _cache_status(path, kind, count_key):
+    """Status of one cache for /api/prices/status: age since last confirmed current, when it was
+    last rewritten, which source produced it, and the last refresh error (None when the latest
+    attempt succeeded)."""
+    cache = _load_cache(path)
+    if not cache or not cache.get(count_key):
+        return {'cached': False, 'age_minutes': None, 'count': 0,
+                'error': _refresh_state[kind]['error']}
+    meta = _load_meta()
+    now = time.time()
+    return {
+        'cached': True,
+        'age_minutes': round(_cache_age_seconds(cache, kind) / 60, 1),
+        'updated_minutes': round((now - cache.get('timestamp', 0)) / 60, 1),
+        'count': len(cache[count_key]),
+        'source': cache.get('source') or 'graphql',
+        'error': _refresh_state[kind]['error'] or meta['errors'].get(kind),
+    }
+
+
 @app.route('/api/prices/status', methods=['GET'])
 def prices_status():
-    if not os.path.exists(PRICES_PATH):
-        return jsonify({'cached': False, 'age_minutes': None, 'count': 0})
-    cache = load_json(PRICES_PATH, lambda: {})
-    age = (time.time() - cache.get('timestamp', 0)) / 60
-    return jsonify({'cached': True, 'age_minutes': round(age, 1), 'count': len(cache.get('items', []))})
+    st = _cache_status(PRICES_PATH, 'prices', 'items')
+    st['stale'] = bool(st['cached'] and st['age_minutes'] > 3 * PRICE_REFRESH_INTERVAL / 60)
+    st['refresh_minutes'] = PRICE_REFRESH_INTERVAL // 60
+    st['tasks'] = _cache_status(TASKS_CACHE_PATH, 'tasks', 'tasks')
+    st['catalog_pending'] = len(_load_meta()['catalog_pending'])
+    st['catalog_building'] = _index_build_state['running']
+    return jsonify(st)
 
 @app.route('/api/prices/refresh', methods=['POST'])
 def prices_refresh():
     try:
-        cache = fetch_prices()
-        return jsonify({'ok': True, 'count': len(cache['items'])})
+        res = refresh_prices()
+        return jsonify({'ok': True, 'count': len(res['cache']['items']), 'status': res['status'],
+                        'source': res['source'], 'new_items': len(res['new_ids'])})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
 _index_build_state = {'running': False, 'phase': None, 'done': 0, 'total': 0, 'ts': 0, 'error': None}
+_catalog_rerun = threading.Event()     # items changed while a build was running: build once more
+_startup_done = threading.Event()      # the engine warm-up at launch finished (builds wait for it)
+
+
+def _wait_for_idle_scan(timeout=300):
+    """Block until no scan is running (a hot-swap of the engine must not pull it out from under one)."""
+    t0 = time.time()
+    while _scan_state['running'] and time.time() - t0 < timeout:
+        time.sleep(1)
+
+
+def run_icon_db_build(reason='manual'):
+    """The Build Icon DB work, synchronously (the caller claimed ``_index_build_state``): download
+    the base image of every item that lacks one, rebuild the catalog, wait for any running scan to
+    finish, then hot-swap the engine.  New-item ids that were pending are cleared once every image
+    arrived.  Repeats once more if items changed while it ran."""
+    try:
+        if reason != 'manual':
+            _startup_done.wait(600)           # never race the launch-time engine warm-up
+        while True:
+            _catalog_rerun.clear()
+            pending = set(_load_meta()['catalog_pending'])
+            prices = get_prices()
+            def cb(done, total):
+                _index_build_state['done']  = done
+                _index_build_state['total'] = total
+            _index_build_state.update({'phase': 'images', 'done': 0, 'total': 0})
+            ok, failed = download_missing_base_images(prices, progress_cb=cb)
+            print(f"[catalog] base images: {ok} downloaded, {failed} failed ({reason})")
+            _index_build_state['phase'] = 'catalog'    # ~35 s, no progress to report
+            from identify.catalog import load_catalog
+            load_catalog(force_rebuild=True)
+            _index_build_state['phase'] = 'engine'
+            _wait_for_idle_scan()
+            _warm_v2_engine()
+            print('[catalog] built')
+            if failed == 0 and pending:
+                meta = _load_meta()
+                meta['catalog_pending'] = sorted(set(meta['catalog_pending']) - pending)
+                _save_meta_quietly(meta)
+            if not _catalog_rerun.is_set():
+                break
+    except Exception as e:
+        _index_build_state['error'] = str(e)
+        print(f"[catalog] build failed: {e}")
+    finally:
+        _index_build_state.update({'running': False, 'phase': None})
+
+
+def start_icon_db_build(reason='manual'):
+    """Start :func:`run_icon_db_build` in the background.  False (and a request to build once
+    more when the running build finishes) if one is already running."""
+    if _index_build_state['running']:
+        _catalog_rerun.set()
+        return False
+    # claim the slot before the thread starts so a double click cannot start two builds
+    _index_build_state.update({'running': True, 'phase': 'images', 'done': 0, 'total': 0,
+                               'ts': time.time(), 'error': None})
+    threading.Thread(target=run_icon_db_build, args=(reason,), daemon=True).start()
+    return True
+
+
+def _has_catalog():
+    """True once this install has built its item catalog (so the app should keep it current)."""
+    return catalog_summary() is not None
+
+
+def _queue_catalog_update():
+    """New items arrived: fetch their images and rebuild the catalog in the background, but only
+    on installs that already have a catalog (a clean install waits for its first Build Icon DB,
+    which covers them).  The ids stay in the meta file until a build has covered them."""
+    if _has_catalog():
+        start_icon_db_build('new items')
+
 
 @app.route('/api/icons/build-index', methods=['POST'])
 def icons_build_index():
     """Build everything the identification engine needs: download the tarkov.dev base image of
     every item that lacks one (data/tmpl_src/), then rebuild the template catalog from them
     (data/identify_catalog_v2.npz) and load it into the running engine."""
-    if _index_build_state['running']:
+    if not start_icon_db_build('manual'):
         return jsonify({'ok': False, 'message': 'Build already in progress'})
-    # claim the slot before the thread starts so a double click cannot start two builds
-    _index_build_state.update({'running': True, 'phase': 'images', 'done': 0, 'total': 0,
-                               'ts': time.time(), 'error': None})
-
-    def _run():
-        try:
-            prices = get_prices()
-            def cb(done, total):
-                _index_build_state['done']  = done
-                _index_build_state['total'] = total
-            ok, failed = download_missing_base_images(prices, progress_cb=cb)
-            print(f"[catalog] base images: {ok} downloaded, {failed} failed")
-            _index_build_state['phase'] = 'catalog'    # ~35 s, no progress to report
-            from identify.catalog import load_catalog
-            load_catalog(force_rebuild=True)
-            _warm_v2_engine()
-            print('[catalog] built')
-        except Exception as e:
-            _index_build_state['error'] = str(e)
-            print(f"[catalog] build failed: {e}")
-        finally:
-            _index_build_state.update({'running': False, 'phase': None})
-
-    threading.Thread(target=_run, daemon=True).start()
     return jsonify({'ok': True, 'message': 'Icon DB build started'})
 
 
@@ -2154,7 +2417,10 @@ def _startup_maintenance():
         print(f"[kappa] startup sync skipped (offline?): {e}")
     # Warm the v2 identification engine (loads/builds the template catalog - ~35 s the first
     # time - and the optional DINO model) so the first hotkey scan isn't the one that pays for it.
-    _warm_v2_engine()
+    try:
+        _warm_v2_engine()
+    finally:
+        _startup_done.set()
 
 
 def _warm_v2_engine():
@@ -2167,6 +2433,68 @@ def _warm_v2_engine():
             print('[v2] identification engine ready')
     except Exception as e:
         print(f"[v2] warm-up skipped: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Background refresher: keeps prices, tasks and the item catalog current without being asked
+# ---------------------------------------------------------------------------
+
+def _refresh_due(kind, path, interval, meta, now):
+    """True when this cache was last confirmed current more than ``interval`` seconds ago (so a
+    cache that is already old at startup refreshes immediately) and the last attempt - failed ones
+    included - is at least RETRY_BACKOFF (or the interval, if shorter) back."""
+    cache = _load_cache(path)
+    confirmed = max((cache or {}).get('timestamp', 0), meta['checked'].get(kind) or 0) if cache else 0
+    if now - confirmed < interval:
+        return False
+    attempt = max(meta['attempted'].get(kind) or 0, _refresh_state[kind]['attempt'])
+    return now - attempt >= min(RETRY_BACKOFF, interval)
+
+
+def refresh_cycle(now=None):
+    """One pass of the refresher: refresh whatever is due (prices first - the task data takes its
+    item names from them), then resume catalog work a previous run left unfinished.  Never
+    raises.  Returns the list of what was refreshed."""
+    now = time.time() if now is None else now
+    ran = []
+    for kind, path, interval, fn in (
+            ('prices', PRICES_PATH, PRICE_REFRESH_INTERVAL, refresh_prices),
+            ('tasks', TASKS_CACHE_PATH, TASKS_REFRESH_INTERVAL, refresh_tasks)):
+        try:
+            if _refresh_due(kind, path, interval, _load_meta(), now):
+                fn()
+                ran.append(kind)
+        except Exception as e:
+            print(f'[refresh] {kind}: {e}')
+    try:
+        if _load_meta()['catalog_pending'] and not _index_build_state['running']:
+            _queue_catalog_update()
+    except Exception as e:
+        print(f'[refresh] catalog: {e}')
+    return ran
+
+
+_refresher = {'thread': None, 'stop': threading.Event()}
+
+
+def _refresher_loop(stop, poll=60):
+    while not stop.is_set():
+        refresh_cycle()
+        stop.wait(poll)
+
+
+def start_refresher():
+    """Start the daemon thread (idempotent).  The first pass runs at once, so a cache that is
+    older than its interval is refreshed on startup."""
+    t = _refresher['thread']
+    if t is not None and t.is_alive():
+        return t
+    _refresher['stop'].clear()
+    t = threading.Thread(target=_refresher_loop, args=(_refresher['stop'],), daemon=True,
+                         name='tarkovdev-refresher')
+    _refresher['thread'] = t
+    t.start()
+    return t
 
 
 # Module-level handle to the running pywebview window / pystray icon / quit
@@ -2188,6 +2516,7 @@ def _shutdown_desktop():
     quitting = _desktop.get('quitting')
     if quitting is not None:
         quitting.set()
+    _refresher['stop'].set()
     try:
         autoscanner.stop()      # releases the screen duplication
     except Exception:
@@ -2218,6 +2547,7 @@ def _run_app():
 
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=_startup_maintenance, daemon=True).start()
+    start_refresher()
     start_hotkey_listener()
     autoscanner.start()
 

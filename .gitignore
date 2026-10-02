@@ -46,6 +46,7 @@ env/
 .claude/
 data/kappa_wiki.json
 data/tasks_cache.json
+data/tarkovdev_meta.json
 data/progress.json
 data/prestige_wiki.json
 data/eft_hash_status.json

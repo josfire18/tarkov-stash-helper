@@ -523,10 +523,13 @@ def test_rules_outage_does_not_stop_a_price_refresh_and_keeps_the_last_good_rule
     def post(url, json=None, timeout=None):
         if 'fleaMarket' in json['query']:
             raise app.http_requests.ConnectionError('down')
-        return Resp({'data': {'items': [{'id': 'x', 'name': 'X', 'shortName': 'X'}]}})
+        return Resp({'data': {'items': [
+            {'id': f'x{n}', 'name': 'X', 'shortName': 'X', 'width': 1, 'height': 1,
+             'baseImageLink': 'https://img/x', 'sellFor': [{'vendor': {'name': 'Prapor'}, 'priceRUB': 5}]}
+            for n in range(1200)]}})      # a complete-looking data set (a handful of items is refused as partial)
     monkeypatch.setattr(app.http_requests, 'post', post)
-    out = app.fetch_prices()
-    assert out['items'][0]['id'] == 'x'
+    out = app.fetch_prices_graphql()
+    assert out['items'][0]['id'] == 'x0'
     assert out['rules'] == {'flea': {'sellOfferFeeRate': 0.05}}              # last good rules survive
     assert json.loads(cache.read_text(encoding='utf-8'))['rules'] == out['rules']
 

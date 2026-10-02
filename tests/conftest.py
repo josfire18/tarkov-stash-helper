@@ -3,3 +3,23 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_network_no_real_data(monkeypatch, tmp_path):
+    """Unit tests never touch the network or the real data/ folder: the json.tarkov.dev
+    transport raises unless a test installs its own, and the price/task caches and the refresh
+    bookkeeping file live in tmp_path (a test that wants other paths monkeypatches them itself)."""
+    import tarkovdata
+
+    def _blocked(url, headers, timeout):
+        raise AssertionError(f'unit test tried to fetch {url}')
+    monkeypatch.setattr(tarkovdata, '_http_get', _blocked)
+    app = sys.modules.get('app')
+    if app is not None:
+        for name, fn in (('META_PATH', 'tarkovdev_meta.json'), ('PRICES_PATH', 'prices_cache.json'),
+                         ('TASKS_CACHE_PATH', 'tasks_cache.json')):
+            monkeypatch.setattr(app, name, str(tmp_path / 'autouse_data' / fn), raising=False)
