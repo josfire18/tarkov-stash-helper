@@ -1,0 +1,351 @@
+{
+ "data": {
+  "items": {
+   "5447a9cd4bdc2dbd208b4567": {
+    "id": "5447a9cd4bdc2dbd208b4567",
+    "name": "5447a9cd4bdc2dbd208b4567 Name",
+    "shortName": "5447a9cd4bdc2dbd208b4567 ShortName",
+    "normalizedName": "colt-m4a1-556x45-assault-rifle",
+    "updated": "2026-10-02T20:38:06.000Z",
+    "width": 1,
+    "height": 1,
+    "lastOfferCount": 34,
+    "types": [
+     "gun",
+     "wearable"
+    ],
+    "iconLink": "https://assets.tarkov.dev/5447a9cd4bdc2dbd208b4567-icon.webp",
+    "gridImageLink": "https://assets.tarkov.dev/5447a9cd4bdc2dbd208b4567-grid-image.webp",
+    "baseImageLink": "https://assets.tarkov.dev/5447a9cd4bdc2dbd208b4567-base-image.webp",
+    "basePrice": 18397,
+    "lastLowPrice": 39899,
+    "avg24hPrice": 85273,
+    "low24hPrice": 20000,
+    "high24hPrice": 399898,
+    "minLevelForFlea": 25,
+    "backgroundColor": "black",
+    "buyFromTrader": [
+     {
+      "trader": "5a7c2eca46aef81a7ca2145d",
+      "price": 22997,
+      "priceRUB": 22997,
+      "currency": "RUB",
+      "currencyItem": "5449016a4bdc2d6f028b456f",
+      "minTraderLevel": 3,
+      "taskUnlock": null,
+      "restockAmount": 320000,
+      "buyLimit": 5
+     }
+    ],
+    "sellToTrader": [
+     {
+      "trader": "54cb50c76803fa8b248b4571",
+      "price": 7358,
+      "priceRUB": 7358,
+      "currency": "RUB",
+      "currencyItem": "5449016a4bdc2d6f028b456f"
+     },
+     {
+      "trader": "579dc571d53a0658a154fbec",
+      "price": 4415,
+      "priceRUB": 4415,
+      "currency": "RUB",
+      "currencyItem": "5449016a4bdc2d6f028b456f"
+     },
+     {
+      "trader": "58330581ace78e27b8b10cee",
+      "price": 7174,
+      "priceRUB": 7174,
+      "currency": "RUB",
+      "currencyItem": "5449016a4bdc2d6f028b456f"
+     },
+     {
+      "trader": "5935c25fb3acc3127c3d8cd9",
+      "price": 54,
+      "priceRUB": 6622,
+      "currency": "USD",
+      "currencyItem": "5696686a4bdc2da3298b456a"
+     },
+     {
+      "trader": "5a7c2eca46aef81a7ca2145d",
+      "price": 8278,
+      "priceRUB": 8278,
+      "currency": "RUB",
+      "currencyItem": "5449016a4bdc2d6f028b456f"
+     },
+     {
+      "trader": "6617beeaa9cfa777ca915b7c",
+      "price": 7358,
+      "priceRUB": 7358,
+      "currency": "RUB",
+      "currencyItem": "5449016a4bdc2d6f028b456f"
+     }
+    ]
+   },
+   "5449016a4bdc2d6f028b456f": {
+    "id": "5449016a4bdc2d6f028b456f",
+    "name": "5449016a4bdc2d6f028b456f Name",
+    "shortName": "5449016a4bdc2d6f028b456f ShortName",
+    "normalizedName": "roubles",
+    "updated": "2025-11-14T10:07:17.000Z",
+    "width": 1,
+    "height": 1,
+    "lastOfferCount": null,
+    "types": [
+     "noFlea"
+    ],
+    "iconLink": "https://assets.tarkov.dev/5449016a4bdc2d6f028b456f-icon.webp",
+    "gridImageLink": "https://assets.tarkov.dev/5449016a4bdc2d6f028b456f-grid-image.webp",
+    "baseImageLink": "https://assets.tarkov.dev/5449016a4bdc2d6f028b456f-base-image.webp",
+    "basePrice": 1,
+    "lastLowPrice": null,
+    "avg24hPrice": null,
+    "high24hPrice": null,
+    "minLevelForFlea": 0,
+    "backgroundColor": "green",
+    "buyFromTrader": [],
+    "sellToTrader": []
+   },
+   "590c695186f7741e566b64a2": {
+    "id": "590c695186f7741e566b64a2",
+    "name": "590c695186f7741e566b64a2 Name",
+    "shortName": "590c695186f7741e566b64a2 ShortName",
+    "normalizedName": "augmentin-antibiotic-pills",
+    "updated": "2026-10-02T20:48:06.000Z",
+    "width": 1,
+    "height": 1,
+    "lastOfferCount": 15,
+    "types": [
+     "meds",
+     "provisions"
+    ],
+    "iconLink": "https://assets.tarkov.dev/590c695186f7741e566b64a2-icon.webp",
+    "gridImageLink": "https://assets.tarkov.dev/590c695186f7741e566b64a2-grid-image.webp",
+    "baseImageLink": "https://assets.tarkov.dev/590c695186f7741e566b64a2-base-image.webp",
+    "basePrice": 11010,
+    "lastLowPrice": 44333,
+    "avg24hPrice": 45133,
+    "low24hPrice": 37999,
+    "high24hPrice": 50000,
+    "minLevelForFlea": 20,
+    "backgroundColor": "orange",
+    "buyFromTrader": [
+     {
+      "trader": "54cb57776803fa99248b456e",
+      "price": 45147,
+      "priceRUB": 45147,
+      "currency": "RUB",
+      "currencyItem": "5449016a4bdc2d6f028b456f",
+      "minTraderLevel": 4,
+      "taskUnlock": null,
+      "restockAmount": 440000,
+      "buyLimit": 2
+     }
+    ],
+    "sellToTrader": [
+     {
+      "trader": "54cb50c76803fa8b248b4571",
+      "price": 4404,
+      "priceRUB": 4404,
+      "currency": "RUB",
+      "currencyItem": "5449016a4bdc2d6f028b456f"
+     },
+     {
+      "trader": "54cb57776803fa99248b456e",
+      "price": 5615,
+      "priceRUB": 5615,
+      "currency": "RUB",
+      "currencyItem": "5449016a4bdc2d6f028b456f"
+     },
+     {
+      "trader": "579dc571d53a0658a154fbec",
+      "price": 2642,
+      "priceRUB": 2642,
+      "currency": "RUB",
+      "currencyItem": "5449016a4bdc2d6f028b456f"
+     },
+     {
+      "trader": "5c0647fdd443bc2504c2d371",
+      "price": 5284,
+      "priceRUB": 5284,
+      "currency": "RUB",
+      "currencyItem": "5449016a4bdc2d6f028b456f"
+     }
+    ]
+   },
+   "5d1b3f2d86f774253763b735": {
+    "id": "5d1b3f2d86f774253763b735",
+    "name": "5d1b3f2d86f774253763b735 Name",
+    "shortName": "5d1b3f2d86f774253763b735 ShortName",
+    "normalizedName": "disposable-syringe",
+    "updated": "2026-10-02T21:18:06.000Z",
+    "width": 1,
+    "height": 1,
+    "lastOfferCount": 30,
+    "types": [
+     "barter"
+    ],
+    "iconLink": "https://assets.tarkov.dev/5d1b3f2d86f774253763b735-icon.webp",
+    "gridImageLink": "https://assets.tarkov.dev/5d1b3f2d86f774253763b735-grid-image.webp",
+    "baseImageLink": "https://assets.tarkov.dev/5d1b3f2d86f774253763b735-base-image.webp",
+    "basePrice": 8540,
+    "lastLowPrice": 20000,
+    "avg24hPrice": 26180,
+    "low24hPrice": 17000,
+    "high24hPrice": 38500,
+    "minLevelForFlea": 20,
+    "backgroundColor": "blue",
+    "buyFromTrader": [],
+    "sellToTrader": [
+     {
+      "trader": "54cb57776803fa99248b456e",
+      "price": 4355,
+      "priceRUB": 4355,
+      "currency": "RUB",
+      "currencyItem": "5449016a4bdc2d6f028b456f"
+     },
+     {
+      "trader": "579dc571d53a0658a154fbec",
+      "price": 2049,
+      "priceRUB": 2049,
+      "currency": "RUB",
+      "currencyItem": "5449016a4bdc2d6f028b456f"
+     },
+     {
+      "trader": "5c0647fdd443bc2504c2d371",
+      "price": 4099,
+      "priceRUB": 4099,
+      "currency": "RUB",
+      "currencyItem": "5449016a4bdc2d6f028b456f"
+     }
+    ]
+   },
+   "6a8c4c7999baf8bd5802f7fe": {
+    "id": "6a8c4c7999baf8bd5802f7fe",
+    "name": "6a8c4c7999baf8bd5802f7fe Name",
+    "shortName": "6a8c4c7999baf8bd5802f7fe ShortName",
+    "normalizedName": "sudak-tudak-marine-repair-kit",
+    "updated": "2026-09-18T12:09:42.000Z",
+    "width": 2,
+    "height": 2,
+    "lastOfferCount": null,
+    "types": [
+     "noFlea",
+     "specialSlot"
+    ],
+    "iconLink": "https://assets.tarkov.dev/6a8c4c7999baf8bd5802f7fe-icon.webp",
+    "gridImageLink": "https://assets.tarkov.dev/6a8c4c7999baf8bd5802f7fe-grid-image.webp",
+    "baseImageLink": "https://assets.tarkov.dev/6a8c4c7999baf8bd5802f7fe-base-image.webp",
+    "basePrice": 100000,
+    "lastLowPrice": null,
+    "avg24hPrice": null,
+    "high24hPrice": null,
+    "minLevelForFlea": 0,
+    "backgroundColor": "orange",
+    "buyFromTrader": [],
+    "sellToTrader": [
+     {
+      "trader": "5935c25fb3acc3127c3d8cd9",
+      "price": 293,
+      "priceRUB": 36000,
+      "currency": "USD",
+      "currencyItem": "5696686a4bdc2da3298b456a"
+     }
+    ]
+   }
+  },
+  "fleaMarket": {
+   "name": "FleaMarket",
+   "normalizedName": "flea-market",
+   "minPlayerLevel": 15,
+   "enabled": true,
+   "sellOfferFeeRate": 0.05,
+   "sellRequirementFeeRate": 0.05,
+   "foundInRaidRequired": false,
+   "reputationLevels": [
+    {
+     "offers": 1,
+     "offersSpecialEditions": 1,
+     "minRep": -10000,
+     "maxRep": -10
+    },
+    {
+     "offers": 2,
+     "offersSpecialEditions": 3,
+     "minRep": -10,
+     "maxRep": -2
+    },
+    {
+     "offers": 3,
+     "offersSpecialEditions": 4,
+     "minRep": -2,
+     "maxRep": 0.2
+    },
+    {
+     "offers": 4,
+     "offersSpecialEditions": 5,
+     "minRep": 0.2,
+     "maxRep": 7
+    },
+    {
+     "offers": 5,
+     "offersSpecialEditions": 6,
+     "minRep": 7,
+     "maxRep": 30
+    },
+    {
+     "offers": 6,
+     "offersSpecialEditions": 7,
+     "minRep": 30,
+     "maxRep": 60
+    },
+    {
+     "offers": 7,
+     "offersSpecialEditions": 8,
+     "minRep": 60,
+     "maxRep": 150
+    },
+    {
+     "offers": 8,
+     "offersSpecialEditions": 9,
+     "minRep": 150,
+     "maxRep": 200
+    },
+    {
+     "offers": 9,
+     "offersSpecialEditions": 10,
+     "minRep": 200,
+     "maxRep": 250
+    },
+    {
+     "offers": 10,
+     "offersSpecialEditions": 11,
+     "minRep": 250,
+     "maxRep": 500
+    },
+    {
+     "offers": 11,
+     "offersSpecialEditions": 12,
+     "minRep": 500,
+     "maxRep": 750
+    },
+    {
+     "offers": 12,
+     "offersSpecialEditions": 13,
+     "minRep": 750,
+     "maxRep": 1000
+    },
+    {
+     "offers": 15,
+     "offersSpecialEditions": 16,
+     "minRep": 1000,
+     "maxRep": 10000
+    }
+   ]
+  }
+ },
+ "translations": [
+  "$.data.items.*.name",
+  "$.data.items.*.shortName"
+ ]
+}

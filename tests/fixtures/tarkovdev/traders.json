@@ -1,0 +1,342 @@
+{
+ "data": {
+  "54cb50c76803fa8b248b4571": {
+   "id": "54cb50c76803fa8b248b4571",
+   "name": "54cb50c76803fa8b248b4571 Nickname",
+   "normalizedName": "prapor",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "54cb50c76803fa8b248b4571-1",
+     "level": 1,
+     "payRate": 0.4
+    },
+    {
+     "id": "54cb50c76803fa8b248b4571-2",
+     "level": 2,
+     "payRate": 0.4
+    },
+    {
+     "id": "54cb50c76803fa8b248b4571-3",
+     "level": 3,
+     "payRate": 0.4
+    },
+    {
+     "id": "54cb50c76803fa8b248b4571-4",
+     "level": 4,
+     "payRate": 0.4
+    }
+   ]
+  },
+  "54cb57776803fa99248b456e": {
+   "id": "54cb57776803fa99248b456e",
+   "name": "54cb57776803fa99248b456e Nickname",
+   "normalizedName": "therapist",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "54cb57776803fa99248b456e-1",
+     "level": 1,
+     "payRate": 0.51
+    },
+    {
+     "id": "54cb57776803fa99248b456e-2",
+     "level": 2,
+     "payRate": 0.51
+    },
+    {
+     "id": "54cb57776803fa99248b456e-3",
+     "level": 3,
+     "payRate": 0.51
+    },
+    {
+     "id": "54cb57776803fa99248b456e-4",
+     "level": 4,
+     "payRate": 0.51
+    }
+   ]
+  },
+  "579dc571d53a0658a154fbec": {
+   "id": "579dc571d53a0658a154fbec",
+   "name": "579dc571d53a0658a154fbec Nickname",
+   "normalizedName": "fence",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "579dc571d53a0658a154fbec-0",
+     "level": 0,
+     "payRate": 0.24
+    },
+    {
+     "id": "579dc571d53a0658a154fbec-1",
+     "level": 1,
+     "payRate": 0.24
+    },
+    {
+     "id": "579dc571d53a0658a154fbec-2",
+     "level": 2,
+     "payRate": 0.24
+    }
+   ]
+  },
+  "58330581ace78e27b8b10cee": {
+   "id": "58330581ace78e27b8b10cee",
+   "name": "58330581ace78e27b8b10cee Nickname",
+   "normalizedName": "skier",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "58330581ace78e27b8b10cee-1",
+     "level": 1,
+     "payRate": 0.39
+    },
+    {
+     "id": "58330581ace78e27b8b10cee-2",
+     "level": 2,
+     "payRate": 0.39
+    },
+    {
+     "id": "58330581ace78e27b8b10cee-3",
+     "level": 3,
+     "payRate": 0.39
+    },
+    {
+     "id": "58330581ace78e27b8b10cee-4",
+     "level": 4,
+     "payRate": 0.39
+    }
+   ]
+  },
+  "5935c25fb3acc3127c3d8cd9": {
+   "id": "5935c25fb3acc3127c3d8cd9",
+   "name": "5935c25fb3acc3127c3d8cd9 Nickname",
+   "normalizedName": "peacekeeper",
+   "currency": "USD",
+   "levels": [
+    {
+     "id": "5935c25fb3acc3127c3d8cd9-1",
+     "level": 1,
+     "payRate": 0.36
+    },
+    {
+     "id": "5935c25fb3acc3127c3d8cd9-2",
+     "level": 2,
+     "payRate": 0.36
+    },
+    {
+     "id": "5935c25fb3acc3127c3d8cd9-3",
+     "level": 3,
+     "payRate": 0.36
+    },
+    {
+     "id": "5935c25fb3acc3127c3d8cd9-4",
+     "level": 4,
+     "payRate": 0.36
+    }
+   ]
+  },
+  "5a7c2eca46aef81a7ca2145d": {
+   "id": "5a7c2eca46aef81a7ca2145d",
+   "name": "5a7c2eca46aef81a7ca2145d Nickname",
+   "normalizedName": "mechanic",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "5a7c2eca46aef81a7ca2145d-1",
+     "level": 1,
+     "payRate": 0.45
+    },
+    {
+     "id": "5a7c2eca46aef81a7ca2145d-2",
+     "level": 2,
+     "payRate": 0.45
+    },
+    {
+     "id": "5a7c2eca46aef81a7ca2145d-3",
+     "level": 3,
+     "payRate": 0.45
+    },
+    {
+     "id": "5a7c2eca46aef81a7ca2145d-4",
+     "level": 4,
+     "payRate": 0.45
+    }
+   ]
+  },
+  "5ac3b934156ae10c4430e83c": {
+   "id": "5ac3b934156ae10c4430e83c",
+   "name": "5ac3b934156ae10c4430e83c Nickname",
+   "normalizedName": "ragman",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "5ac3b934156ae10c4430e83c-1",
+     "level": 1,
+     "payRate": 0.5
+    },
+    {
+     "id": "5ac3b934156ae10c4430e83c-2",
+     "level": 2,
+     "payRate": 0.5
+    },
+    {
+     "id": "5ac3b934156ae10c4430e83c-3",
+     "level": 3,
+     "payRate": 0.5
+    },
+    {
+     "id": "5ac3b934156ae10c4430e83c-4",
+     "level": 4,
+     "payRate": 0.5
+    }
+   ]
+  },
+  "5c0647fdd443bc2504c2d371": {
+   "id": "5c0647fdd443bc2504c2d371",
+   "name": "5c0647fdd443bc2504c2d371 Nickname",
+   "normalizedName": "jaeger",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "5c0647fdd443bc2504c2d371-1",
+     "level": 1,
+     "payRate": 0.48
+    },
+    {
+     "id": "5c0647fdd443bc2504c2d371-2",
+     "level": 2,
+     "payRate": 0.48
+    },
+    {
+     "id": "5c0647fdd443bc2504c2d371-3",
+     "level": 3,
+     "payRate": 0.48
+    },
+    {
+     "id": "5c0647fdd443bc2504c2d371-4",
+     "level": 4,
+     "payRate": 0.48
+    }
+   ]
+  },
+  "638f541a29ffd1183d187f57": {
+   "id": "638f541a29ffd1183d187f57",
+   "name": "638f541a29ffd1183d187f57 Nickname",
+   "normalizedName": "lightkeeper",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "638f541a29ffd1183d187f57-1",
+     "level": 1,
+     "payRate": 0.0001
+    }
+   ]
+  },
+  "68fe15910f29ba3fdbba9d54": {
+   "id": "68fe15910f29ba3fdbba9d54",
+   "name": "68fe15910f29ba3fdbba9d54 Nickname",
+   "normalizedName": "taran",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "68fe15910f29ba3fdbba9d54-1",
+     "level": 1,
+     "payRate": 0.0001
+    }
+   ]
+  },
+  "68fe15990f29ba3fdbba9d55": {
+   "id": "68fe15990f29ba3fdbba9d55",
+   "name": "68fe15990f29ba3fdbba9d55 Nickname",
+   "normalizedName": "radio-station",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "68fe15990f29ba3fdbba9d55-1",
+     "level": 1,
+     "payRate": 0.0001
+    }
+   ]
+  },
+  "656f0f98d80a697f855d34b1": {
+   "id": "656f0f98d80a697f855d34b1",
+   "name": "656f0f98d80a697f855d34b1 Nickname",
+   "normalizedName": "btr-driver",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "656f0f98d80a697f855d34b1-1",
+     "level": 1,
+     "payRate": 0.0001
+    }
+   ]
+  },
+  "6617beeaa9cfa777ca915b7c": {
+   "id": "6617beeaa9cfa777ca915b7c",
+   "name": "6617beeaa9cfa777ca915b7c Nickname",
+   "normalizedName": "ref",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "6617beeaa9cfa777ca915b7c-1",
+     "level": 1,
+     "payRate": 0.4
+    },
+    {
+     "id": "6617beeaa9cfa777ca915b7c-2",
+     "level": 2,
+     "payRate": 0.45
+    },
+    {
+     "id": "6617beeaa9cfa777ca915b7c-3",
+     "level": 3,
+     "payRate": 0.45
+    },
+    {
+     "id": "6617beeaa9cfa777ca915b7c-4",
+     "level": 4,
+     "payRate": 0.5
+    }
+   ]
+  },
+  "688246518448b05efd61d461": {
+   "id": "688246518448b05efd61d461",
+   "name": "688246518448b05efd61d461 Nickname",
+   "normalizedName": "mr-kerman",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "688246518448b05efd61d461-1",
+     "level": 1,
+     "payRate": 0.0001
+    }
+   ]
+  },
+  "688246958448b05efd61d462": {
+   "id": "688246958448b05efd61d462",
+   "name": "688246958448b05efd61d462 Nickname",
+   "normalizedName": "voevoda",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "688246958448b05efd61d462-1",
+     "level": 1,
+     "payRate": 0.0001
+    }
+   ]
+  },
+  "69e0d6cc77b63940375b9173": {
+   "id": "69e0d6cc77b63940375b9173",
+   "name": "69e0d6cc77b63940375b9173 Nickname",
+   "normalizedName": "survivor",
+   "currency": "RUB",
+   "levels": [
+    {
+     "id": "69e0d6cc77b63940375b9173-1",
+     "level": 1,
+     "payRate": 0.0001
+    }
+   ]
+  }
+ }
+}
