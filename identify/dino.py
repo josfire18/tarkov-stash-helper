@@ -34,7 +34,7 @@ from .masks import LABEL_PX, BOTTOM_PX
 MODEL_ID = 'facebook/dinov2-small'
 RES = 224
 
-TINT_BGR = {   # EFT rarity backgrounds (BGR), measured in the legacy engine (see app.EFT_BG_TINTS)
+TINT_BGR = {   # EFT rarity backgrounds (BGR), measured by diffing tarkov.dev grid images against base images
     'black': (20, 19, 19), 'grey': (30, 29, 28), 'default': (54, 54, 53), 'blue': (45, 39, 29),
     'violet': (41, 29, 38), 'yellow': (33, 48, 47), 'green': (24, 34, 27), 'orange': (24, 30, 37),
     'red': (29, 32, 49),

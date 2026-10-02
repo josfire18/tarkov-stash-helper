@@ -1,5 +1,5 @@
 """
-Found-in-Raid check mark detection (three-valued, ported from ``app.detect_fir``).
+Found-in-Raid check mark detection (three-valued; replaces the old corner-window detector that lived in app.py).
 
 Semantics are unchanged and load-bearing: ``True`` = confidently FiR, ``False`` =
 confidently not FiR, ``None`` = indeterminate - callers must never treat ``None``

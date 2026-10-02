@@ -58,9 +58,9 @@ always lives next to the exe, so settings and the item database survive updates.
 
 ## How it works
 
-Item identification lives in the `identify/` package (the **v2** engine, default). Set
-`"identify_engine": "legacy"` in `data/settings.json` to fall back to the old masked-NCC
-icon DB that is still in `app.py`.
+Item identification lives in the `identify/` package. (The older masked-NCC engine that used to
+sit inside `app.py` was removed; it is preserved in git history and on the `wip/pre-identify-v2`
+branch.)
 
 1. `identify/grid.py` - finds the stash lattice from the 1 px border line EFT draws around
    every item (colour range tolerant of the UI's top gradient, ridge fallbacks for
@@ -72,7 +72,9 @@ icon DB that is still in `app.py`.
 3. `identify/catalog.py` - one `.npz` template catalog of **every** item (ammo, guns, presets
    and containers included) from tarkov.dev base images plus EFT's icon cache (re-associated
    to items on every build; unmatched cache renders are kept as anonymous "build" templates).
-   `data/identify_catalog_v2.npz` is rebuilt automatically when a source changes.
+   `data/identify_catalog_v2.npz` is rebuilt automatically when a source changes. The Sell
+   Advisor's **Build Icon DB** button downloads the tarkov.dev base image of every item into
+   `data/tmpl_src/` and then rebuilds this catalog (first run: a few minutes, needs internet).
 4. `identify/match.py` + `ocr.py` + `dino.py` - stage 1 masked pixel residual against
    same-footprint templates (overlay bands only down-weighted, background measured from the
    tile), stage 2 DINOv2-small re-rank of the shortlist (optional: needs torch +
@@ -83,8 +85,7 @@ icon DB that is still in `app.py`.
    calibrated confidence, an `uncertain` flag (a tile the catalog cannot explain is flagged,
    not guessed), per-stage evidence, stack count and Found-in-Raid.
 
-Other pieces: `icon_cache.py` (legacy engine) reads EFT's local icon cache; the UI
-(`templates/`) is served locally and hosted in a native window via `pywebview`, with a
+Other pieces: the UI (`templates/`) is served locally and hosted in a native window via `pywebview`, with a
 `pystray` tray icon.
 
 ## Auto-scan
@@ -149,7 +150,7 @@ inject DLLs or hook anything, simulate input, or move/resize/focus the game wind
 
 ```
 python -m pytest tests                                        # unit tests (no network, no game data)
-python test_scan.py --score data/eval/stash1.png --engine both  # v2 vs legacy, per-category metrics
+python test_scan.py --score data/eval/stash1.png               # segmentation / identification / sell decision, per category
 python test_scan.py --robustness data/eval/stash1.png          # JPEG / blur / rescale / stretch per stage
 python test_scan.py --prefill data/eval/new.png                # draft truth + contact sheets (crop | predicted icon | name)
 python test_scan.py --relabel data/eval/new.png fixes.json     # apply the corrections you read off the sheets
