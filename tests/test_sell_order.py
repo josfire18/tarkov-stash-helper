@@ -438,6 +438,88 @@ def test_plan_skips_unknown_items_and_handles_empty_input():
 
 
 # ---------------------------------------------------------------------------
+# "Any of N items" requirements
+# ---------------------------------------------------------------------------
+
+def _group(count, ids, fir=False, label='Therapist - First in Line'):
+    return {'label': label, 'count': count, 'fir': fir,
+            'items': [{'id': i, 'name': i.upper()} for i in ids]}
+
+
+def _meds():
+    return {'a': _item(name='A', sellFor=_sf(Therapist=9000)),
+            'b': _item(name='B', sellFor=_sf(Therapist=2000)),
+            'c': _item(name='C', sellFor=_sf(Therapist=5000))}
+
+
+def _split(sell, keep):
+    return ({r['matched_name']: r['count'] for r in sell}, {r['matched_name']: r['count'] for r in keep})
+
+
+def test_any_of_keeps_the_count_in_total_from_the_cheapest_alternatives_and_sells_the_rest():
+    dets = [_det('a', 2, col=0), _det('b', 1, col=1), _det('c', 3, col=2)]
+    sell, keep = sellcalc.plan_entries(dets, _meds(), {}, {}, sellcalc.make_context({}),
+                                       [_group(3, ['a', 'b', 'c'])])
+    sold, kept = _split(sell, keep)
+    assert kept == {'B': 1, 'C': 2} and sold == {'A': 2, 'C': 1}      # 3 total, valuable A sold
+    assert len(keep) == 2 and all(k['reason'].startswith('Keep ') for k in keep)
+    assert 'for Therapist - First in Line (any of: A, B, C)' in keep[0]['reason']
+    assert keep[0]['reason'].startswith('Keep 1 for')
+
+
+def test_any_of_with_a_whole_stack_of_one_alternative_keeps_only_count_of_it():
+    sell, keep = sellcalc.plan_entries([_det('b', 10)], _meds(), {}, {}, sellcalc.make_context({}),
+                                       [_group(4, ['a', 'b', 'c'])])
+    assert (sell[0]['count'], keep[0]['count'], keep[0]['drawn']) == (6, 4, False)
+    assert 'sell the other 6' in keep[0]['reason'] and 'any of: A, B, C' in keep[0]['reason']
+
+
+def test_any_of_fir_requirement_only_keeps_fir_capable_copies():
+    dets = [_det('b', 1, fir=False, col=0), _det('c', 1, fir=True, col=1), _det('a', 1, fir=True, col=2)]
+    sell, keep = sellcalc.plan_entries(dets, _meds(), {}, {}, sellcalc.make_context({}),
+                                       [_group(2, ['a', 'b', 'c'], fir=True)])
+    sold, kept = _split(sell, keep)
+    assert kept == {'C': 1, 'A': 1} and sold == {'B': 1}              # the cheap non-FiR B cannot be handed in
+
+
+def test_any_of_fir_requirement_with_only_non_fir_copies_keeps_nothing():
+    sell, keep = sellcalc.plan_entries([_det('b', 3, fir=False)], _meds(), {}, {}, sellcalc.make_context({}),
+                                       [_group(2, ['a', 'b'], fir=True)])
+    assert keep == [] and sell[0]['count'] == 3
+
+
+def test_any_of_with_nothing_from_the_set_in_the_scan_protects_nothing():
+    items = {**_meds(), 'z': _item(name='Z', sellFor=_sf(Prapor=1000))}
+    sell, keep = sellcalc.plan_entries([_det('z', 2)], items, {}, {}, sellcalc.make_context({}),
+                                       [_group(3, ['a', 'b', 'c'])])
+    assert keep == [] and [(r['matched_name'], r['count']) for r in sell] == [('Z', 2)]
+
+
+def test_any_of_takes_what_a_single_item_need_on_the_same_item_left_over():
+    prot = {'b': {'reason': 'Needed: x', 'fir_only': False, 'need': 2, 'fir_need': 0, 'why': ['Skier x2']}}
+    dets = [_det('b', 3, col=0), _det('c', 1, col=1)]
+    sell, keep = sellcalc.plan_entries(dets, _meds(), prot, {}, sellcalc.make_context({}),
+                                       [_group(2, ['b', 'c'])])
+    sold, kept = _split(sell, keep)
+    # B: 2 for the single need + 1 more for the any-of (cheapest), C: the second any-of copy
+    assert kept == {'B': 3, 'C': 1} and sold == {}
+    b = next(k for k in keep if k['matched_name'] == 'B')
+    assert 'Still need 2' in b['reason'] and 'Keep 1 for Therapist - First in Line' in b['reason']
+
+
+def test_two_any_of_objectives_do_not_claim_the_same_copy():
+    sell, keep = sellcalc.plan_entries([_det('b', 3)], _meds(), {}, {}, sellcalc.make_context({}),
+                                       [_group(2, ['a', 'b'], label='T1'), _group(1, ['b', 'c'], label='T2')])
+    assert keep[0]['count'] == 3 and 'T1' in keep[0]['reason'] and 'T2' in keep[0]['reason']
+    assert sell == []
+
+
+def test_any_of_list_of_alternatives_is_cut_in_the_reason():
+    ids = [f'i{n}' for n in range(9)]
+    assert sellcalc.any_of_label(_group(1, ids)).endswith('+3 more')
+
+
+# ---------------------------------------------------------------------------
 # app.py wiring: protected ids from task/hideout data, price refresh rules
 # ---------------------------------------------------------------------------
 
@@ -540,3 +622,52 @@ def test_dogtags_are_skipped_but_the_dogtag_case_is_priced():
     assert app.skip_badge({'name': 'Dogtag case', 'types': ['container', 'noFlea']}) is None
     assert app.skip_badge({'name': 'Colt M4A1', 'types': ['gun']}) == 'GUN'
     assert app.skip_badge({'name': 'Salewa', 'types': ['meds']}) is None
+
+
+def _any_of_cache():
+    def ref(i):
+        return {'id': i, 'name': i.upper(), 'shortName': i}
+    return {'timestamp': 0, 'hideoutStations': [], 'tasks': [
+        {'id': 't1', 'name': 'First in Line', 'kappaRequired': True, 'trader': {'name': 'Therapist'},
+         'objectives': [{'id': 'o1', 'type': 'giveItem', 'count': 3, 'foundInRaid': True,
+                         'item': ref('a'), 'items': [ref('a'), ref('b'), ref('c')]}]},
+        {'id': 't2', 'name': 'Old Cache Shape', 'kappaRequired': True, 'trader': {'name': 'Skier'},
+         'objectives': [{'id': 'o2', 'type': 'giveItem', 'count': 2, 'foundInRaid': False, 'item': ref('d')}]},
+    ]}
+
+
+def _plan_for(monkeypatch, tmp_path, progress):
+    import json
+    prog = tmp_path / 'progress.json'
+    prog.write_text(json.dumps(progress), encoding='utf-8')
+    monkeypatch.setattr(app, 'PROGRESS_PATH', str(prog))
+    monkeypatch.setattr(app, 'SETTINGS_PATH', str(tmp_path / 'settings.json'))
+    monkeypatch.setattr(app, 'get_tasks', lambda allow_fetch=True: _any_of_cache())
+    return app.get_protected_plan({'categories': []}, {})
+
+
+def test_protected_plan_returns_any_of_groups_and_not_a_first_item_need(monkeypatch, tmp_path):
+    protected, groups = _plan_for(monkeypatch, tmp_path,
+                                  {'completed_tasks': [], 'completed_hideout': [], 'have': {}})
+    assert 'a' not in protected                      # the first alternative is no longer protected by itself
+    assert protected['d']['need'] == 2               # old single-`item` shape still works
+    (g,) = groups
+    assert (g['count'], g['fir'], g['label']) == (3, True, 'Therapist \u2014 First in Line')
+    assert [i['id'] for i in g['items']] == ['a', 'b', 'c']
+
+
+def test_protected_plan_respects_completed_tasks_and_set_aside_copies(monkeypatch, tmp_path):
+    _, groups = _plan_for(monkeypatch, tmp_path,
+                          {'completed_tasks': ['t1'], 'completed_hideout': [], 'have': {}})
+    assert groups == []
+    _, groups = _plan_for(monkeypatch, tmp_path,
+                          {'completed_tasks': [], 'completed_hideout': [], 'have': {'b': 2}})
+    assert groups[0]['count'] == 1                   # 2 of the 3 already set aside (on any alternative)
+    _, groups = _plan_for(monkeypatch, tmp_path,
+                          {'completed_tasks': [], 'completed_hideout': [], 'have': {'a': 1, 'c': 5}})
+    assert groups == []
+
+
+def test_get_protected_ids_is_still_the_item_keyed_dict(monkeypatch, tmp_path):
+    assert set(_plan_for(monkeypatch, tmp_path,
+                         {'completed_tasks': [], 'completed_hideout': [], 'have': {}})[0]) == {'d'}

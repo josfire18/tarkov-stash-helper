@@ -522,6 +522,18 @@ def describe_keep(prot, kept, stack):
     return f'Still need {need}{fir}: {shown}{split}'
 
 
+def _keep_reason(prot, single_n, groups, kept, stack):
+    """The KEEP row's reason: the single-item need and/or each any-of objective it covers."""
+    if not groups:
+        return describe_keep(prot, kept, stack)
+    parts = [describe_keep(prot, single_n, single_n)] if single_n else []
+    parts += [f"Keep {n} for {g['label']} ({any_of_label(g)})" for n, g in groups]
+    text = '; '.join(parts)
+    if kept < stack:
+        text += f' - keep {kept} of this stack of {stack}, sell the other {stack - kept}'
+    return text
+
+
 # ---------------------------------------------------------------------------
 # The whole plan for one scan
 # ---------------------------------------------------------------------------
@@ -536,7 +548,36 @@ def _geometry(d):
     return out
 
 
-def plan_entries(detections, id_to_item, protected, settings, ctx):
+def any_of_label(group, shown=6):
+    """'any of: A, B, C' for an any-of group, long lists cut."""
+    names = [i['name'] for i in group['items']]
+    more = f', +{len(names) - shown} more' if len(names) > shown else ''
+    return f"any of: {', '.join(names[:shown])}{more}"
+
+
+def allocate_any_of(group, copies):
+    """Which copies satisfy one any-of requirement ("hand over ``count`` of A / B / C").
+
+    ``copies`` = [(units, fir, unit_value)] for every scanned stack of ANY item in the set,
+    in reading order.  Up to ``group['count']`` units are kept IN TOTAL, taken from the
+    cheapest-to-give-up copies first so the valuable ones stay on the sell list; a FiR
+    requirement only accepts FiR-capable copies (``fir`` not False), confirmed-FiR before
+    unknown on a value tie.  Returns [kept_units] aligned with ``copies``.
+    """
+    kept = [0] * len(copies)
+    left = group['count']
+    order = sorted((i for i, (_, fir, _) in enumerate(copies) if not group['fir'] or fir is not False),
+                   key=lambda i: (copies[i][2], copies[i][1] is None, copies[i][1] is not False, i))
+    for i in order:
+        if left <= 0:
+            break
+        n = min(copies[i][0], left)
+        kept[i] = n
+        left -= n
+    return kept
+
+
+def plan_entries(detections, id_to_item, protected, settings, ctx, any_of=None):
     """Turn identified stash items into ordered sell rows and keep rows.
 
     ``detections`` carry item_id, count, fir, uncertain and their pixel rect
@@ -545,6 +586,10 @@ def plan_entries(detections, id_to_item, protected, settings, ctx):
     by margin, then the flea queue); keep rows are numbered 'K'.  A stack that
     is only partly needed becomes a sell row for the surplus plus a keep row
     (``drawn`` False) for the rest.
+
+    ``any_of`` = open objectives that accept any ONE of several items (see
+    app.get_protected_plan).  They are allocated after the single-item needs, out of the
+    copies those left over, across every scanned stack of every item in the set.
     """
     dets = sorted((d for d in detections if id_to_item.get(d['item_id'])),
                   key=lambda r: (r.get('panel', 0), r['row'], r['col']))
@@ -559,6 +604,27 @@ def plan_entries(detections, id_to_item, protected, settings, ctx):
         alloc = allocate_keep([(dets[i].get('count') or 1, dets[i].get('fir')) for i in idxs],
                               need, fir_need)
         kept.update(zip(idxs, alloc))
+    kept_single = dict(kept)
+
+    # any-of requirements: from what the single-item needs left, across the whole set
+    group_keeps = {}                                   # det index -> [(units, group)]
+    for g in any_of or ():
+        ids = {a['id'] for a in g['items']}
+        idxs = [i for i, d in enumerate(dets) if d['item_id'] in ids]
+        copies = []
+        for i in idxs:
+            d = dets[i]
+            fir = d.get('fir')
+            rec = sell_recommendation(
+                id_to_item[d['item_id']],
+                flea_blocked=flea_block_reason(id_to_item[d['item_id']], fir, settings, ctx.get('rules')),
+                count=1, ctx=ctx)
+            unit = (rec['flea_net'] if rec['recommend'] == 'flea' else rec['trader_price']) or 0
+            copies.append(((d.get('count') or 1) - kept.get(i, 0), fir, unit))
+        for i, n in zip(idxs, allocate_any_of(g, copies)):
+            if n:
+                kept[i] = kept.get(i, 0) + n
+                group_keeps.setdefault(i, []).append((n, g))
 
     sell, keep = [], []
     for i, d in enumerate(dets):
@@ -571,7 +637,8 @@ def plan_entries(detections, id_to_item, protected, settings, ctx):
         if k:
             keep.append({**base, 'num': 'K', 'count': k, 'stack': count, 'drawn': k >= count,
                          'recommend': 'keep', 'trader_name': None, 'trader_price': None,
-                         'flea_list': None, 'flea_net': None, 'reason': describe_keep(prot, k, count)})
+                         'flea_list': None, 'flea_net': None,
+                         'reason': _keep_reason(prot, kept_single.get(i, 0), group_keeps.get(i), k, count)})
         if k >= count:
             continue
 

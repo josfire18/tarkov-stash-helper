@@ -1372,7 +1372,13 @@ def compute_tasks_view(cache, progress, kappa_only=False, kinds=('giveItem',), s
 
 
 def get_protected_ids(keep_list, price_idx):
+    """The item-keyed half of :func:`get_protected_plan` (the single-item needs)."""
+    return get_protected_plan(keep_list, price_idx)[0]
+
+
+def get_protected_plan(keep_list, price_idx):
     """
+    ``(protected, any_of)``.  ``protected`` is
     {tarkov.dev item id: {'reason', 'fir_only', 'need', 'fir_need', 'why'}} for
     everything the player should NOT unconditionally sell: unacquired keep-list
     entries + task/hideout items still short of their required count.  Task
@@ -1393,8 +1399,14 @@ def get_protected_ids(keep_list, price_idx):
         non-FiR copy is still needed.
     Task hand-ins and plant-item objectives both count (planted items are
     consumed); completed tasks/hideout levels are excluded by the progress data.
+
+    ``any_of`` lists the open objectives that accept ANY ONE of several items:
+    ``{'label', 'count', 'fir', 'items': [{id, name}]}``.  Which copies to keep for them
+    depends on what the scan found, so sellcalc.plan_entries allocates them after the
+    single-item needs.  ``count`` is already net of ``have`` copies of those items that
+    no single-item need claims.
     """
-    protected = {}
+    protected, any_of = {}, []
     entry_cat = {e['id']: cat
                  for cat in keep_list['categories'] for e in cat['items']}
     mapped, _unmapped = map_keep_entries_to_ids(keep_list, price_idx)
@@ -1415,7 +1427,19 @@ def get_protected_ids(keep_list, price_idx):
             settings = load_json(SETTINGS_PATH, default_settings)
             view = compute_tasks_view(cache, progress,
                                       kappa_only=settings.get('kappa_only_tasks', True),
-                                      kinds=('giveItem', 'plantItem'))
+                                      kinds=('giveItem', 'plantItem'), split_any_of=True)
+            spare = {rec['item_id']: max(0, rec['have'] - rec['total_needed'])
+                     for rec in view['aggregate']}
+            for g in view['any_of']:
+                left = g['count']
+                for a in g['items']:                       # set-aside copies cover it first
+                    i = a['id']
+                    avail = spare.get(i, int(progress.get('have', {}).get(i, 0)))
+                    use = min(avail, left)
+                    spare[i] = avail - use
+                    left -= use
+                if left:
+                    any_of.append({**g, 'count': left})
             for rec in view['aggregate']:
                 need, fir_need = sellcalc.remaining_needs(
                     rec['total_needed'], rec['fir_needed'], rec['have'])
@@ -1440,7 +1464,7 @@ def get_protected_ids(keep_list, price_idx):
                 }
     except Exception as e:
         print(f"[tasks] protected-id pass skipped: {e}")
-    return protected
+    return protected, any_of
 
 
 # ---------------------------------------------------------------------------
@@ -2308,7 +2332,7 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
         # Everything the player shouldn't sell: unacquired keep-list entries +
         # task/hideout items still short of their required count.
         keep_list = load_json(KEEPLIST_PATH, default_keep_list)
-        protected = get_protected_ids(keep_list, price_idx)
+        protected, any_of = get_protected_plan(keep_list, price_idx)
 
         if not tesseract_available():
             warnings.append('Tesseract OCR not installed — name reading disabled '
@@ -2343,7 +2367,7 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
                 sellable.append(d)
 
         ctx = build_sell_context(settings, prices)
-        results, keep_results = sellcalc.plan_entries(sellable, id_to_item, protected, settings, ctx)
+        results, keep_results = sellcalc.plan_entries(sellable, id_to_item, protected, settings, ctx, any_of)
 
         for r in results:
             if r['recommend'] == 'flea':
