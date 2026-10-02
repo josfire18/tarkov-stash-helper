@@ -169,6 +169,21 @@ counted for segmentation). See `identify/evaltools.py` for the format.
   capture of the stash region reads noticeably better than a downscaled one.
 - v2 needs about 50 px/slot or more (1080p UI scale 80%+) and, for JPEG captures, quality 70+;
   below that the border lines are too degraded to segment reliably.
-- Items released after your last "Build Icon DB" / price refresh are not in the catalog; v2
-  flags them `uncertain` instead of guessing. Items that share an icon family (dogtags, colour
+- Items released after the last price refresh are not in the catalog until the next refresh
+  (see "Data freshness" below; v2 flags unknown items `uncertain` instead of guessing). Items that share an icon family (dogtags, colour
   variants hidden under attachments) are flagged too.
+
+## Data freshness
+
+Prices, items, tasks and hideout requirements come from tarkov.dev's static JSON documents
+(`https://json.tarkov.dev/regular/...`, the ones tarkov.dev's own site uses) via `tarkovdata.py`;
+its GraphQL API is only the fallback, then the last good cache (the Sell Advisor then shows the
+prices as stale). While the app runs a background thread checks items/prices every 15 minutes
+(an unchanged data set is a cheap `304 Not Modified`) and tasks/hideout/traders every 3 hours, and
+immediately at startup when a cache is older than that. A refresh never replaces a good cache with
+an empty or partial one. When new item ids appear, their base images are downloaded and the item
+catalog is rebuilt in the background and swapped into the engine (after a running scan finishes) -
+no need to press Build Icon DB again. `GET /api/prices/status` reports the source, age, item count
+and last error; the Sell Advisor header shows the same. `data/tarkovdev_meta.json` holds the ETags
+and bookkeeping (safe to delete).
+

@@ -485,28 +485,43 @@ function updateScanButton() {
 // ---------------------------------------------------------------------------
 // Price cache status
 // ---------------------------------------------------------------------------
+function fmtAge(min) {
+  if (min < 1) return 'just now';
+  return min < 60 ? `${Math.round(min)}m ago` : `${Math.round(min / 60)}h ago`;
+}
+const SOURCE_LABEL = {'json.tarkov.dev': 'tarkov.dev JSON', 'graphql': 'tarkov.dev GraphQL (fallback)'};
+
 async function checkPriceStatus() {
-  const s = await api('GET', '/api/prices/status');
+  let s;
+  try { s = await api('GET', '/api/prices/status'); } catch (e) { return; }
   const dot   = document.getElementById('price-dot');
   const label = document.getElementById('price-label');
+  const src = SOURCE_LABEL[s.source] || s.source || '';
+  const extra = s.catalog_building ? ' · updating item catalog…' : (s.catalog_pending ? ` · ${s.catalog_pending} new items pending` : '');
+  const tip = [s.cached ? `Source: ${src}. Checked every ${s.refresh_minutes} min; last change written ${fmtAge(s.updated_minutes)}.` : '',
+               s.tasks && s.tasks.cached ? `Tasks & hideout: ${s.tasks.count} tasks, checked ${fmtAge(s.tasks.age_minutes)} (${SOURCE_LABEL[s.tasks.source] || s.tasks.source}).` : '',
+               s.error ? `Last refresh failed: ${s.error}` : ''].filter(Boolean).join('
+');
+  label.parentElement.title = tip;
   if (!s.cached) {
     dot.className   = 'price-dot absent';
-    label.textContent = 'No price data — click Refresh';
-  } else if (s.age_minutes > 30) {
+    label.textContent = s.error ? 'No price data (refresh failed) - click Refresh' : 'No price data - click Refresh';
+  } else if (s.stale || s.error) {
     dot.className   = 'price-dot stale';
-    label.textContent = `Prices ${Math.round(s.age_minutes)}m old (stale)`;
+    label.textContent = `Prices ${fmtAge(s.age_minutes)} (${s.stale ? 'stale' : 'last refresh failed'}) · ${s.count.toLocaleString()} items${extra}`;
   } else {
     dot.className   = 'price-dot fresh';
-    label.textContent = `Prices updated ${Math.round(s.age_minutes)}m ago · ${s.count.toLocaleString()} items`;
+    label.textContent = `Prices checked ${fmtAge(s.age_minutes)} · ${s.count.toLocaleString()} items · ${src}${extra}`;
   }
 }
+setInterval(checkPriceStatus, 60000);   // the server refreshes in the background; keep the label honest
 
 document.getElementById('btn-refresh-prices').addEventListener('click', async () => {
   const btn = document.getElementById('btn-refresh-prices');
   btn.disabled = true; btn.textContent = 'Fetching…';
   try {
     const r = await api('POST', '/api/prices/refresh');
-    toast(r.ok ? `✓ Prices refreshed — ${r.count.toLocaleString()} items` : `Error: ${r.error}`);
+    toast(r.ok ? (r.status === 'unchanged' ? `✓ Prices already up to date — ${r.count.toLocaleString()} items` : `✓ Prices refreshed — ${r.count.toLocaleString()} items` + (r.new_items ? `, ${r.new_items} new` : '')) : `Error: ${r.error}`);
   } catch(e) { toast('Failed: ' + e.message); }
   btn.disabled = false; btn.textContent = 'Refresh Prices';
   checkPriceStatus();
