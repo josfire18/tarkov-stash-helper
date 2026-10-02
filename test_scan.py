@@ -2,16 +2,12 @@
 """
 Offline stash-scan evaluation harness (no Tarkov, no Flask needed).
 
-Two engines can be scored side by side on the same labelled screenshots:
-
-  --engine v2        the new ``identify`` package (default)
-  --engine legacy    the old app.py masked-NCC pipeline
-  --engine both      run both and print a comparison table
+Scores the ``identify`` package (the identification engine) on labelled screenshots.
 
 Usage
 -----
   # score (segmentation / identification / per-category / uncertain / end-to-end)
-  python test_scan.py --score data/eval/stash1.png [--engine v2|legacy|both]
+  python test_scan.py --score data/eval/stash1.png [more.png ...]
                       [--truth full|orig|<path>] [--no-dino] [--no-ocr] [--json out.json]
 
   # label a new screenshot (v2 prefill + contact sheets), then correct and re-score
@@ -19,9 +15,8 @@ Usage
   python test_scan.py --relabel data/eval/shot.png corrections.json
   python test_scan.py --score data/eval/shot.png --truth full
 
-  # legacy helpers (unchanged): --label <img> writes the old truth+HTML; no flag dumps one image
-  python test_scan.py --label data/eval/shot.png
-  python test_scan.py [path/to/stash.png] [col row W H]
+  # print every detection of one image
+  python test_scan.py [path/to/stash.png]
 
 What is measured (``--score``)
   segmentation    footprint rectangles, IoU >= 0.9, one-to-one: precision / recall
@@ -86,8 +81,8 @@ def _categories():
         return {it['id']: category_of(it.get('types')) for it in json.load(f)['items']}
 
 
-def _legacy_truth_to_rects(truth, panel0):
-    """Original ``stash1.truth.json`` rows have (col,row) on the legacy grid (origin y=141,
+def _orig_truth_to_rects(truth, panel0):
+    """Original ``stash1.truth.json`` rows have (col,row) on the old detector's grid (origin y=141,
     i.e. the *second* line of the v2 lattice) and no rect: map them through the v2 panel."""
     if not truth or 'rect' in truth[0]:
         return truth
@@ -102,7 +97,7 @@ def _legacy_truth_to_rects(truth, panel0):
 
 
 # ---------------------------------------------------------------------------
-# engines -> normalised detections
+# engine -> normalised detections
 #   each detection: {'rect': [x,y,w,h], 'item_id', 'name', 'uncertain', 'conf'}
 # ---------------------------------------------------------------------------
 
@@ -129,25 +124,6 @@ def run_v2(img_bgr, use_dino=True, use_ocr=True, warm=True):
     dets = [{'rect': list(d.rect), 'item_id': d.item_id, 'name': d.name, 'uncertain': d.uncertain,
              'conf': d.confidence, 'category': d.category, 'det': d} for d in res.detections]
     return dets, dt, res
-
-
-def run_legacy(img_bgr):
-    import app as A
-    icon_db = A.load_icon_db()
-    if icon_db is None:
-        raise SystemExit('legacy engine needs data/icon_db.npz (Build Icon DB in the app)')
-    settings = dict(A.load_json(A.SETTINGS_PATH, A.default_settings))
-    settings.pop('grid', None)
-    prices = A.load_json(A.PRICES_PATH, lambda: {})
-    lm = A.build_label_matcher(prices) if (A.tesseract_available() and prices.get('items')) else None
-    t = time.perf_counter()
-    panels, _src = A.resolve_panels(img_bgr, settings, persist_fn=None)
-    mdb = A.get_db_at_pitch(icon_db, *A._slot_px(panels[0]))
-    raw = A.scan_all_panels(img_bgr, panels, mdb, label_matcher=lm)
-    dt = time.perf_counter() - t
-    dets = [{'rect': [d['px'], d['py'], d['pw'], d['ph']], 'item_id': d['item_id'], 'name': d['name'],
-             'uncertain': False, 'conf': d['score'] / 100.0} for d in raw]
-    return dets, dt, None
 
 
 # ---------------------------------------------------------------------------
@@ -303,12 +279,11 @@ def _strip(m):
 # --score
 # ---------------------------------------------------------------------------
 
-def score_mode(paths, engine, which, use_dino, use_ocr, json_out):
+def score_mode(paths, which, use_dino, use_ocr, json_out):
     cats = _categories()
-    engines = ['v2', 'legacy'] if engine == 'both' else [engine]
     results = {}
-    agg = {e: {'truth': 0, 'matched': 0, 'dets': 0, 'ok': 0, 'n': 0, 'e2e_ok': 0, 'e2e_n': 0,
-               'time': 0.0, 'cat': {}} for e in engines}
+    a = {'truth': 0, 'matched': 0, 'dets': 0, 'ok': 0, 'n': 0, 'e2e_ok': 0, 'e2e_n': 0,
+         'dec_ok': 0, 'dec_n': 0, 'time': 0.0, 'cat': {}}
     for path in paths:
         img = cv2.imread(path)
         if img is None:
@@ -323,43 +298,34 @@ def score_mode(paths, engine, which, use_dino, use_ocr, json_out):
         if truth and 'rect' not in truth[0]:
             from identify.grid import detect_grid
             gp = detect_grid(img).panels
-            truth = _legacy_truth_to_rects(truth, gp[0])
-        for e in engines:
-            if e == 'v2':
-                dets, dt, _ = run_v2(img, use_dino, use_ocr)
-            else:
-                dets, dt, _ = run_legacy(img)
-            m = score(truth, dets, cats)
-            print_report(e, m, dt, truth, dets)
-            results.setdefault(os.path.basename(path), {})[e] = {**_strip(m), 'time': dt}
-            a = agg[e]
-            a['truth'] += m['segmentation']['truth']; a['matched'] += m['segmentation']['matched']
-            a['dets'] += m['segmentation']['detections']
-            a['ok'] += m['identification']['ok']; a['n'] += m['identification']['n']
-            a['e2e_ok'] += m['end_to_end']['ok']; a['e2e_n'] += m['end_to_end']['n']
-            a['dec_ok'] = a.get('dec_ok', 0) + m['sell_decision']['ok']
-            a['dec_n'] = a.get('dec_n', 0) + m['sell_decision']['n']
-            a['time'] += dt
-            for k, v in m['per_category'].items():
-                c = a['cat'].setdefault(k, [0, 0])
-                c[0] += v['ok']; c[1] += v['n']
-    if len(paths) > 1 or engine == 'both':
+            truth = _orig_truth_to_rects(truth, gp[0])
+        dets, dt, _ = run_v2(img, use_dino, use_ocr)
+        m = score(truth, dets, cats)
+        print_report('v2', m, dt, truth, dets)
+        results[os.path.basename(path)] = {**_strip(m), 'time': dt}
+        a['truth'] += m['segmentation']['truth']; a['matched'] += m['segmentation']['matched']
+        a['dets'] += m['segmentation']['detections']
+        a['ok'] += m['identification']['ok']; a['n'] += m['identification']['n']
+        a['e2e_ok'] += m['end_to_end']['ok']; a['e2e_n'] += m['end_to_end']['n']
+        a['dec_ok'] += m['sell_decision']['ok']; a['dec_n'] += m['sell_decision']['n']
+        a['time'] += dt
+        for k, v in m['per_category'].items():
+            c = a['cat'].setdefault(k, [0, 0])
+            c[0] += v['ok']; c[1] += v['n']
+    if len(paths) > 1:
         print(f"\n{'=' * 70}\nOVERALL")
-        hdr = f"  {'':<22}" + ''.join(f'{e:>12}' for e in engines)
-        print(hdr)
 
-        def row(label, fn):
-            print(f'  {label:<22}' + ''.join(f'{fn(agg[e]):>12}' for e in engines))
-        row('seg recall', lambda a: _pct(a['matched'] / a['truth']) if a['truth'] else '-')
-        row('seg precision', lambda a: _pct(a['matched'] / a['dets']) if a['dets'] else '-')
-        row('identification', lambda a: _pct(a['ok'] / a['n']) if a['n'] else '-')
-        row('end-to-end', lambda a: _pct(a['e2e_ok'] / a['e2e_n']) if a['e2e_n'] else '-')
-        row('sell decision', lambda a: _pct(a['dec_ok'] / a['dec_n']) if a.get('dec_n') else '-')
-        row('time/scan (s)', lambda a: f"{a['time'] / max(1, len(paths)):.2f}")
-        allcats = sorted({k for e in engines for k in agg[e]['cat']})
-        for k in allcats:
-            row(f'  {k}', lambda a, k=k: (f"{_pct(a['cat'][k][0] / a['cat'][k][1])} ({a['cat'][k][0]}/{a['cat'][k][1]})"
-                                           if k in a['cat'] and a['cat'][k][1] else '-'))
+        def row(label, value):
+            print(f'  {label:<22}{value:>12}')
+        row('seg recall', _pct(a['matched'] / a['truth']) if a['truth'] else '-')
+        row('seg precision', _pct(a['matched'] / a['dets']) if a['dets'] else '-')
+        row('identification', _pct(a['ok'] / a['n']) if a['n'] else '-')
+        row('end-to-end', _pct(a['e2e_ok'] / a['e2e_n']) if a['e2e_n'] else '-')
+        row('sell decision', _pct(a['dec_ok'] / a['dec_n']) if a['dec_n'] else '-')
+        row('time/scan (s)', f"{a['time'] / max(1, len(paths)):.2f}")
+        for k in sorted(a['cat']):
+            ok, n = a['cat'][k]
+            row(f'  {k}', f"{_pct(ok / n)} ({ok}/{n})" if n else '-')
     if json_out:
         with open(json_out, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=1, default=str)
@@ -492,41 +458,6 @@ def relabel_mode(img_path, corr_path):
     print(f'wrote {out} ({len(rows)} rows, {sum(1 for r in rows if r.get("uncertain"))} uncertain)')
 
 
-# ---------------------------------------------------------------------------
-# legacy modes (--label, dump): unchanged behaviour, lazy app import
-# ---------------------------------------------------------------------------
-
-def _legacy_api():
-    import app as A
-    return A
-
-
-def legacy_label_mode(img_path):
-    A = _legacy_api()
-    img_bgr = cv2.imread(img_path)
-    if img_bgr is None:
-        print(f"ERROR: cannot load '{img_path}'")
-        sys.exit(1)
-    icon_db = A.load_icon_db()
-    settings = dict(A.load_json(A.SETTINGS_PATH, A.default_settings))
-    settings.pop('grid', None)
-    panels, _ = A.resolve_panels(img_bgr, settings, persist_fn=None)
-    mdb = A.get_db_at_pitch(icon_db, *A._slot_px(panels[0]))
-    prices = A.load_json(A.PRICES_PATH, lambda: {})
-    lm = A.build_label_matcher(prices) if A.tesseract_available() and prices.get('items') else None
-    detections = A.scan_all_panels(img_bgr, panels, mdb, label_matcher=lm)
-    detections = sorted(detections, key=lambda d: (d.get('panel', 0), d['row'], d['col']))
-    truth = [{'panel': d.get('panel', 0), 'col': d['col'], 'row': d['row'], 'W': d['W'], 'H': d['H'],
-              'item_id': d['item_id'], 'name': d['name'], 'rotated': d.get('rotated', False)}
-             for d in detections]
-    tp = truth_path(img_path, 'orig')
-    if os.path.exists(tp):
-        tp += '.new'
-    with open(tp, 'w', encoding='utf-8') as f:
-        json.dump(truth, f, indent=2, ensure_ascii=False)
-    print(f'Wrote {len(truth)} legacy guesses -> {tp}  (prefer --prefill: the v2 tool also labels the whole stash)')
-
-
 def dump_mode(argv):
     img_path = argv[0] if argv else os.path.join(EVAL_DIR, 'stash1.png')
     img = cv2.imread(img_path)
@@ -543,7 +474,6 @@ def dump_mode(argv):
 def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument('--score', nargs='+', metavar='IMG')
-    ap.add_argument('--engine', default='v2', choices=['v2', 'legacy', 'both'])
     ap.add_argument('--truth', default='full', help="'full' (default), 'orig' or a path")
     ap.add_argument('--no-dino', action='store_true')
     ap.add_argument('--no-ocr', action='store_true')
@@ -553,7 +483,6 @@ def main():
     ap.add_argument('--kinds', help='comma separated variants for --robustness')
     ap.add_argument('--prefill', metavar='IMG')
     ap.add_argument('--relabel', nargs=2, metavar=('IMG', 'CORRECTIONS.json'))
-    ap.add_argument('--label', metavar='IMG')
     ap.add_argument('rest', nargs='*')
     a = ap.parse_args()
     if a.pitch_hint:
@@ -562,15 +491,13 @@ def main():
         paths = []
         for p in a.score:
             paths.extend(sorted(glob.glob(p)) if any(c in p for c in '*?[') else [p])
-        score_mode(paths, a.engine, a.truth, not a.no_dino, not a.no_ocr, a.json)
+        score_mode(paths, a.truth, not a.no_dino, not a.no_ocr, a.json)
     elif a.robustness:
         robustness_mode(a.robustness, a.truth, a.kinds.split(',') if a.kinds else None, a.json)
     elif a.prefill:
         prefill_mode(a.prefill, not a.no_dino)
     elif a.relabel:
         relabel_mode(*a.relabel)
-    elif a.label:
-        legacy_label_mode(a.label)
     else:
         dump_mode(a.rest)
 
