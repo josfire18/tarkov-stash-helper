@@ -23,3 +23,9 @@ Usage window 06:40–11:40 UTC (2026-10-03), target ≈ 20 %/h, checked every ~2
   reads rig/backpack/picker items as stash items. Task 4 fixes it.
 - tarkov.dev marks only the Collector's 13-quest chain `kappaRequired` since 1.0; hideout progress
   is not in the logs.
+
+## Next (queued 09:40 UTC)
+- 9. First look at a new view in < 1.5 s: publish provisional (stage-1/label) results immediately, certified results replace them as they finish (SSE pushes both). + task 7 taskbar icon. — Sonnet, ~10:20 UTC
+- 10. Rig / backpack / pocket cells (different border style) scanned so "On you" and in-raid Drop advice see your own items. — next window
+- 11. Task 6 (hideout levels from the hideout screen). — next window
+- 12. Rebuild exe + GitHub release. — orchestrator, ~11:15 UTC
