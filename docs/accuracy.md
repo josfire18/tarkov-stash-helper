@@ -159,3 +159,14 @@ Mean time per scan over the 11 screenshots (RTX 5080 dev machine): full 6.8 s be
 4.7 s vs 4.2 s. That is about 10 s on the 2560x1440 mags/guns screen. It is far from the < 2 s goal for a live
 viewer. Most of the time goes to Tesseract (4 processes per scan) and to the full-catalog stage 1. Neither was
 changed here.
+
+## Shared labels settled by size and picture (2026-10-03, main checkout, lean)
+
+The exact-label anchor capped every tile whose printed label is shared by several items at 0.5
+("picture alone decides"), even when only one of them can occupy the tile or the picture clearly
+prefers one (M9A3 magazine vs M9A3 side grips, MP5 magazines vs the MP5 gun).
+`Engine._twins_settled_by_footprint` keeps the cap only when a same-label twin fits the tile as
+drawn AND the picture's lead over it is below the twin gap (6.0 residual-only, 2.0 with DINO).
+
+Strict eval, 1063 tiles, lean: **996 correct / 0 wrong / 65 uncertain / 2 missed** (was 924 / 0 /
+137 / 2); certified 490, certified-but-wrong 0.

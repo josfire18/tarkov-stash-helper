@@ -284,6 +284,9 @@ class Engine:
             # ("MP5": receiver / magazine / gun, "D3CRX": two colours) that no exact render
             # separates: whatever the picture prefers is a guess between them
             guns = {str(self.cat.cats[self._id_row[t_]]) == 'weapon' for t_ in twins if t_ in self._id_row}
+            if self._twins_settled_by_footprint(det.item_id, twins, tile, _at_viewport_edge(it, panel, tile), w):
+                ev['note'] = 'printed label is shared; size / picture separate the twins'
+                return
             if not (det.category == 'weapon' and guns == {True}):     # all guns: "a gun" is enough
                 det.uncertain = True
                 det.confidence = min(det.confidence, 0.5)
@@ -1003,6 +1006,40 @@ class Engine:
                         break
             self._fold_of = {int(r): ocr_mod.fold_glyph(str(c.shorts[r])) for r in self._api}
         return self._api
+
+    def _twins_settled_by_footprint(self, item_id: str, twins, tile: Tile, edge: bool, w=None) -> bool:
+        """Label twins that cannot be this tile do not make the pick a coin flip.  True when the
+        picked item is the only same-label item that can occupy the tile, or the only one that fits
+        it unturned while every other fits only turned (an M9A3 magazine drawn 1x2 vs the 2x1
+        pistol; MP5 magazines vs the MP5 gun, which cannot be 1x2 at all).  Never at the viewport
+        edge (a cut tile fits anything) or on a square tile (turning proves nothing)."""
+        cat = self.cat
+        me = self._id_row.get(item_id)
+        if me is None or edge or item_id not in twins:
+            return False
+        fit = [r for r in (self._id_row.get(t_) for t_ in twins) if r is not None
+               and self._footprint_ok(r, tile, False)]
+        if me not in fit:
+            return False
+        others = [r for r in fit if r != me and str(cat.names[r]) != str(cat.names[me])]
+        if not others:
+            return True
+        def native(r):
+            sizes = self.gun_sizes.get(r) or {(int(cat.tw[r]), int(cat.th[r]))}
+            return (tile.W, tile.H) in sizes
+        if tile.W != tile.H and native(me) and not any(native(r) for r in others):
+            return True
+        # Same size: the picture decides only with a clear lead over every twin it shortlisted (a
+        # twin the picture did not shortlist at all is not a contender).  Same thresholds as the
+        # pipeline's own twin rule; colour variants stay below them and keep the cap.
+        if w is None:
+            return False
+        rk = self._twin_ranker(w)([me] + others)
+        if me not in rk:
+            return False
+        gap = TWIN_GAP_OK if self._use_dino() else TWIN_GAP_OK_RES
+        rivals = [rk[r] for r in others if r in rk]
+        return not rivals or rk[me] - max(rivals) >= gap
 
     def _unresolved_label_twins(self, w, tile: Tile, edge: bool, item_id: str, have_dino: bool) -> bool:
         """True when the item the picture chose shares its exactly-read label with another
