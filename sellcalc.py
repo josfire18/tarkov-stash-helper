@@ -668,7 +668,9 @@ def plan_entries(detections, id_to_item, protected, settings, ctx, any_of=None):
                      'num': 'K', 'count': count, 'stack': count, 'drawn': True, 'check': True,
                      'uncertain': True, 'recommend': 'keep', 'trader_name': None,
                      'trader_price': None, 'flea_list': None, 'flea_net': None,
-                     'reason': f"Not sure this is {item['name']} - check it yourself (never auto-sold)"})
+                     **({'provisional': True} if d.get('provisional') else {}),
+                     'reason': ('Checking this item...' if d.get('provisional') else
+                                f"Not sure this is {item['name']} - check it yourself (never auto-sold)")})
 
     assign_flea_slots(sell, ctx['slots'], ctx['overflow'])
     sell = order_for_selling(sell)

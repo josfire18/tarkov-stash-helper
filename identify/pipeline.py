@@ -99,6 +99,7 @@ class Detection:
     clipped: bool = False
     category: str = ''
     short: str = ''
+    provisional: bool = False           # fast identification only: anchors certification still pending
 
     def to_record(self) -> dict:
         """The flat dict shape app.py's scan routes consume."""
@@ -107,7 +108,8 @@ class Detection:
                 'item_id': self.item_id, 'name': self.name, 'rotated': self.rotated,
                 'source': 'v2', 'score': round(self.confidence * 100, 1), 'fir': self.fir,
                 'panel': self.panel, 'px': x, 'py': y, 'pw': w, 'ph': h,
-                'uncertain': self.uncertain, 'count': self.count, 'category': self.category}
+                'uncertain': self.uncertain, 'count': self.count, 'category': self.category,
+                **({'provisional': True} if self.provisional else {})}
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -147,6 +149,10 @@ def _g(ocr_score: float | None) -> float:
     if ocr_score is None:
         return 0.0
     return max(-1.0, min(1.0, (ocr_score - 60.0) / 35.0))
+
+
+class ScanCancelled(Exception):
+    """A newer view superseded this scan before its certification finished."""
 
 
 class Engine:
@@ -432,13 +438,19 @@ class Engine:
         return bool(self.s.use_ocr and ocr_mod.tesseract_available())
 
     # ------------------------------------------------------------------
-    def scan(self, img_bgr: np.ndarray, scene=None) -> ScanResult:
+    def scan(self, img_bgr: np.ndarray, scene=None, on_provisional=None, cancel=None) -> ScanResult:
         """``scene`` (identify.scene.SceneInfo) cuts the detected panels by role: only stash /
-        own / loot / container-window grids are read, the item picker and occluded cells never."""
-        with self._lock:
-            return self._scan(img_bgr, scene)
+        own / loot / container-window grids are read, the item picker and occluded cells never.
 
-    def _scan(self, img_bgr: np.ndarray, scene=None) -> ScanResult:
+        ``on_provisional(ScanResult)`` is called as soon as the fast identification is done, before
+        the (slow) anchors certification: the tiles read fresh in this scan come back as copies
+        with ``provisional=True`` / ``uncertain=True``.  ``cancel()`` is polled during
+        certification; when it turns true the scan stops with :class:`ScanCancelled` (tiles already
+        certified stay in the tile cache)."""
+        with self._lock:
+            return self._scan(img_bgr, scene, on_provisional, cancel)
+
+    def _scan(self, img_bgr: np.ndarray, scene=None, on_provisional=None, cancel=None) -> ScanResult:
         T: dict[str, float] = {}
         t0 = time.perf_counter()
         warnings: list[str] = []
@@ -511,6 +523,13 @@ class Engine:
             self._prepare_pool(w)
         T['pool'] = time.perf_counter() - t
 
+        # ---- provisional: label + stage-1 only (DINO and certification still pending) ----
+        if on_provisional is not None and work:
+            self._publish_provisional(img_bgr, work, cached, grid, items, T, t0, warnings, regions, on_provisional)
+
+        if cancel is not None and cancel():
+            raise ScanCancelled()
+
         # ---- DINO ------------------------------------------------------------------
         t = time.perf_counter()
         if self._use_dino():
@@ -526,20 +545,43 @@ class Engine:
                 dets.append(d)
                 w['det'] = d
         T['fuse'] = time.perf_counter() - t
-
         # ---- anchors: exact game render / exact game-font label --------------------------
         self._phases = {}
         t = time.perf_counter()
-        for w in work:
-            if w.get('det') is not None:
-                self._certify(img_bgr, w, w['det'])
-                self.tile_cache.put(w['key'], _to_cache(w['det']))
+        self._certify_all(img_bgr, work, cancel)
         T['anchors'] = time.perf_counter() - t
         dets.sort(key=lambda d: (d.panel, d.row, d.col))
         T['total'] = time.perf_counter() - t0
         if self.store is not None:
             self.store.save()
         return ScanResult(dets, grid, [it for it, _ in items], T, warnings, regions)
+
+    def _publish_provisional(self, img_bgr, work, cached, grid, items, T, t0, warnings, regions, cb) -> None:
+        """Fast first look: decide every freshly read tile from stage 1 + the printed label alone
+        (no DINO, no anchors) and hand it out marked provisional / uncertain."""
+        try:
+            prov = list(cached)
+            for w in work:
+                d = self._decide(img_bgr, dict(w))
+                if d is not None:
+                    d.provisional, d.uncertain = True, True
+                    prov.append(d)
+            prov.sort(key=lambda d: (d.panel, d.row, d.col))
+            T['provisional'] = time.perf_counter() - t0
+            cb(ScanResult(prov, grid, [it for it, _ in items], dict(T), list(warnings), regions))
+        except Exception as e:                           # a broken first look never costs the scan
+            print(f'[v2] provisional pass failed: {e}')
+
+    def _certify_all(self, img_bgr, work, cancel=None) -> None:
+        # Sequential on purpose: certifying tiles in a thread pool measured SLOWER (4 workers:
+        # 5.1 s -> 7.0 s on an 87-item view; the label / render maths is GIL- and BLAS-contended).
+        for w in work:
+            if w.get('det') is None:
+                continue
+            if cancel is not None and cancel():
+                raise ScanCancelled()
+            self._certify(img_bgr, w, w['det'])
+            self.tile_cache.put(w['key'], _to_cache(w['det']))
 
     # ------------------------------------------------------------------
     def _dino_pass(self, img_bgr, work) -> None:
