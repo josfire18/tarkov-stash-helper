@@ -327,6 +327,14 @@ def segment_panel(img_bgr: np.ndarray, panel: Panel, panel_index: int = 0,
                       clipped_top=panel.clip_top and r == 0,
                       clipped_bottom=panel.clip_bottom and r + bh == nr)
             it.empty = cell_is_empty(img_bgr, rect)
+            if it.empty and panel.own and (bw > 1 or bh > 1):
+                # own gear draws no line between empty cells: count them one by one
+                for rr in range(r, r + bh):
+                    for cc in range(c, c + bw):
+                        items.append(Item(col=cc, row=rr, w=1, h=1, rect=panel.rect(cc, rr, 1, 1), panel=panel_index,
+                                          clipped_top=panel.clip_top and rr == 0,
+                                          clipped_bottom=panel.clip_bottom and rr == nr - 1, empty=True))
+                continue
             items.append(it)
     items.sort(key=lambda i: (i.row, i.col))
     return items

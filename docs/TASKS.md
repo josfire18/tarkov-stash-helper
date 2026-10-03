@@ -26,6 +26,6 @@ Usage window 06:40–11:40 UTC (2026-10-03), target ≈ 20 %/h, checked every ~2
 
 ## Next (queued 09:40 UTC)
 - 9. First look at a new view: DONE on `feat/fast-first` - provisional result (stage 1 + label, items `provisional`, shown pending, never a confident sell/drop) after 1.2-2.1 s, certified final 4.3-7.7 s as a new seq; warm re-scan 0.4 s. A newer view cancels the pending certification. Parallel certification measured SLOWER (GIL/BLAS contention), so it stays sequential.
-- 10. Rig / backpack / pocket cells (different border style) scanned so "On you" and in-raid Drop advice see your own items. — next window
+- 10. Rig / backpack / pocket cells (different border style) scanned so "On you" and in-raid Drop advice see your own items. — landed on `feat/own-grids` (identify/owngrid.py)
 - 11. Task 6 (hideout levels from the hideout screen). — next window
 - 12. Rebuild exe + GitHub release. — orchestrator, ~11:15 UTC

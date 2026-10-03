@@ -127,7 +127,7 @@ def _fits(occ, w, h) -> bool:
 
 
 def free_cells(grids) -> int:
-    return sum(1 for g in grids if g.get('role') in DROP_ROLES
+    return sum(cell[2] * cell[3] for g in grids if g.get('role') in DROP_ROLES
                for cell in g['cells'] if cell[4])
 
 
