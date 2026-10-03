@@ -90,6 +90,14 @@ branch.)
 5. `identify/pipeline.py` - `scan(image) -> list[Detection]` with footprint, rotation, item id,
    calibrated confidence, an `uncertain` flag (a tile the catalog cannot explain is flagged,
    not guessed), per-stage evidence, stack count and Found-in-Raid.
+6. **Exact anchors** (`identify/anchors.py`, `identify/fontlabel.py`, `identify/tmpfont.py`) - a
+   tile is *certain* when it matches, pixel for pixel, something the game itself rendered: the
+   game's own icon-cache render of a known item, or its printed label rendered with the game's
+   own TextMeshPro font asset (Bender SDF atlas + glyph metrics, extracted once from the installed
+   game into `data/fonts/` with UnityPy; nothing is redistributed). A label-certified tile binds
+   its render to the item for good, so the render alone is certain next time. Without the game
+   (or UnityPy) the anchors are simply off. `identify/tilecache.py` reuses the result of every
+   unchanged tile on a re-scan. Details and numbers: `docs/accuracy.md`.
 
 Other pieces: the UI (`templates/`) is served locally and hosted in a native window via `pywebview`, with a
 `pystray` tray icon.

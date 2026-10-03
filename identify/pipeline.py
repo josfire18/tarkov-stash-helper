@@ -269,12 +269,14 @@ class Engine:
             print(f'[anchors] contradiction at {it.rect}: render {id1} vs label {id2}')
             return
         cid = id2 or id1
-        if not cid and len(twins) > 1:
-            # the label was matched exactly, and the game prints that text for several items
-            # ("MP5": receiver / magazine / gun, "D3CRX": two colours) that no exact render
-            # separates: whatever the picture prefers is a guess between them
-            guns = {str(self.cat.cats[self._id_row[t_]]) == 'weapon' for t_ in twins if t_ in self._id_row}
-            if not (det.category == 'weapon' and guns == {True}):     # all guns: "a gun" is enough
+        if not cid and len(twins) > 1 and self.s.extra.get('flag_label_twins'):
+            # opt-in: the label was matched exactly, and the game prints that text for several
+            # items ("MP5": receiver / magazine / gun, "D3CRX": two colours) that no exact render
+            # separates.  Measured: removes the MP5 / D3CRX wrongs but flags far more correct
+            # picture choices (ammo twins on 1600p: 48 -> 29 correct), so it is off by default.
+            agrees = (exact1 and a1.render is not None and a1.render.hint_id
+                      and a1.render.hint_id == self._canon.get(det.item_id, det.item_id))
+            if not agrees:
                 det.uncertain = True
                 det.confidence = min(det.confidence, 0.5)
                 ev['note'] = f'printed label is shared by {len(twins)} items; picture alone decides'

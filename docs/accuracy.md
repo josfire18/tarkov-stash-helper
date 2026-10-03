@@ -1,5 +1,94 @@
 # Identification accuracy
 
+## Round 3: exact anchors ("this icon is for sure this icon")
+
+Certainty no longer comes from a learned probability. A tile is **certified** only when it agrees
+*exactly* with something the game itself drew:
+
+* **Anchor 1, exact game render** (`identify/anchors.py`). EFT's icon cache holds the textures the
+  game rendered for every item it has shown, and the stash tile draws exactly that texture. The tile
+  is compared with each shortlisted render over the render's fully opaque pixels only (so the rarity
+  tint and the cell background drop out), with the label band, the bottom band (count, FiR, calibre)
+  and the frame excluded. At other UI scales the render is resampled the way the GPU does it
+  (bilinear), with a sub-pixel phase search (±2 px coarse 0.5 px, refined to 1/8 px, then reused for
+  the whole panel). The score is the mean absolute level error (0 to 255).
+* **Anchor 2, exact label in the game's own font** (`identify/fontlabel.py`, `identify/tmpfont.py`).
+  The labels are TextMeshPro. The Bender font assets are taken from the installed game's
+  `resources.assets` with UnityPy, once, on first run (`data/fonts/`, gitignored, never committed).
+  That covers the raw OpenType fonts and the TMP SDF assets: 1024² atlas, 369 glyph records, face
+  info, `normalSpacingOffset`, and the material. The game is IL2CPP, so the MonoBehaviour has no
+  type tree, and `tmpfont.parse_font_asset` reads the TMP 1.1.0 layout directly. The label uses
+  *Bender Outline SDF* (a dark halo all round, `UNDERLAY_ON`). The short name of each candidate is
+  rendered by sampling the game's distance field with its glyph rects, bearings and advances. The
+  layout is right-aligned, and TMP overflow mode Truncate turns "Powerbank" into "Powerban". The
+  size, character spacing, face/halo edges in SDF texels, anti-aliasing ramp and text colour were
+  calibrated on real strips (`scripts/calibrate_label.py`, stored in
+  `identify/assets/label_params.json`): 11.35 px at 63 px/slot, spacing −6.7 em/100.
+  * The material's own shader constants were tried first, with TMP's exact `GetColor` and underlay
+    maths, but they did not reproduce the strips: mean ink residual 22 to 38. The label component
+    evidently overrides them. The FreeType raster of the extracted OTF reached 10 to 12 but has the
+    wrong advances, because TMP adds `normalSpacingOffset`.
+  * The calibrated SDF rendering reaches a mean ink residual of about 14.5 (63 px/slot) and 14.9
+    (84 px/slot) on held-out strips. It is visually indistinguishable from the real label, but it
+    is not pixel-zero: the remaining error is the inpainted background under the anti-aliased halo.
+  * Matching is closed-set. The candidates are the stage-1 items, the OCR hits, the render's hint,
+    and the printed names nearest to the leading guesses, all footprint-checked. Each is scored by
+    its ink residual plus a penalty for observed label ink that it leaves unexplained.
+  * The label is certain when the best candidate is exact (total ≤ 24, unexplained ink ≤ 10 %),
+    the runner-up is at least 1.6× worse and 8 levels worse, and the game prints that text for
+    exactly one item that fits the footprint. A text printed for several items ("MP5", "D3CRX",
+    "BP") is settled only by an exact render of one of them. Otherwise the tile is flagged
+    *uncertain*, never guessed.
+* **Self-reinforcing.** When a tile is label-certified and also exactly matches one render, that
+  render is bound to the item permanently (`LearnedNames.bind_certain`; ordinary reads can never
+  overwrite it). From then on the render alone certifies, even with the label covered.
+* **Decision.** The final answer is certified if either anchor is exact and the two do not
+  disagree. A disagreement is flagged uncertain and logged. Otherwise the stage 1/2/3 pipeline
+  answers with its own confidence. `extra={'strict_anchors': True}` instead flags every
+  uncertified tile, as the design asked. That mode was not measured. With
+  `uncertain_below = 0.80`, the default hybrid is what the tables below report.
+
+### Render identities: tarkov.dev association is not proof
+
+A render's item is known only from (a) a binding made by a certain label match, or (b) the
+catalog's picture association with a tarkov.dev icon, and (b) is trusted only when the distance is
+≤ 1.5 and the runner-up is ≥ 3× further away. The first measurement trusted every association with
+the old 1.4× rule, and it certified 3 tiles wrong. The Secure Flash drive's render associates to
+*"Flash drive with Mr. Kerman's hash codes"* at distance 4.2 against 15.6 for the next item:
+tarkov.dev's art for the right item differs from the render, while the wrong item's art happens to
+match it. Two of those 3 tiles were this case. The third was a Marlin rifle vs its "Default" preset,
+which is not a real error (presets map to the gun). Picture association is therefore only a hint.
+
+### Measured residuals (`scripts/anchor_measure.py`, `scripts/label_measure.py`)
+
+Anchor 1, aligned residual of every labelled un-clipped tile against its shortlisted renders,
+"true" meaning the render the catalog associates with the truth item:
+
+| pitch | tiles | true-render residual min / median / p90 / max | best other-item render min / median / p90 |
+|---|---|---|---|
+| 63 (1080p, native) | 258 | 0.17 / 4.75 / 12.1 / 22.3 (n = 137) | 4.4 / 19.9 / 41.5 (n = 252) |
+| 84 (1440p, bilinear ×4/3) | 778 | 0.17 / 3.51 / 11.3 / 22.4 (n = 312) | **0.53** / 15.5 / 33.5 (n = 759) |
+
+A pixel-exact match measures 0.2 to 2. The tail of the "true" column comes from associations to
+a *different* render of the same item (another colour or state), and the screenshots from the web
+were taken on other accounts and game versions. Their exact renders are mostly not in this cache:
+652 of 1036 tiles have no exact render, against 7 to 17 per screenshot on the user's own
+screenshots. The 0.53 "other item" value is the flash-drive pair above: two items, one render. That
+is why a render certifies only when no render of a different item is also exact
+(`another item renders the same`). Thresholds: exact ≤ 3.0 (native) / 4.5 (resampled),
+≥ 250 opaque px at 63 px/slot, runner-up ≥ 2.5× worse.
+
+Anchor 2, adversarial set: truth + the 25 printed names nearest to it among every item that fits
+the footprint (988 non-weapon tiles):
+
+| pitch | true text total min / median / p90 / max | best wrong text min / median / p90 |
+|---|---|---|
+| 63 | 8.8 / 14.3 / 24.3 / 55.3 | 8.7 / 31.6 / 44.9 |
+| 84 | 9.0 / 20.0 / 34.3 / 87.7 | 16.8 / 38.2 / 49.0 |
+
+On that set, 570 were certain and right, **0 were certain and wrong**, and 418 were not certain:
+art behind the label, truncated names, look-alike candidates.
+
 Measured with `python scripts/accuracy_report.py [--no-dino]` on every `data/eval/**/*.png` that has a
 `*.truth.full.json` (11 screenshots, 1063 labelled tiles; `w08_1080p_junk` has every row marked
 uncertain, so it contributes nothing). Every tile counts as exactly one of these:
