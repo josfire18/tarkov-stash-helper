@@ -100,6 +100,40 @@ probably came through the learned-icon store, which the next section closes.
   is too few to fit and check a calibration curve. Of the certain answers, 997 / 998 (full) and
   1003 / 1008 (lean) are correct.
 
+## Zero-wrong pass (lean path, this checkout's data)
+
+Measured on this worktree's copy of the eval data with `accuracy_report.py --no-dino`:
+
+| | correct | wrong | uncertain | missed | certified-but-wrong |
+|---|---|---|---|---|---|
+| before | 923 | **2** | 136 | 2 | 0 |
+| after | 924 | **0** | 137 | 2 | 0 |
+
+(The 94.4 % lean figure above came from a richer data set than this checkout has; the two
+runs here differ only by the changes below.)
+
+* **w09 #106, TOZ-106 shotgun read as "TOZ-106 stock": now CORRECT.** The partial read "TOZ-186"
+  scores equally for the gun, the stock and a pistol grip, and the picture did not separate gun from
+  stock; the calibre probe ("20g") did fire but `_label_authority` then refused because another
+  *part* ("TOZ-106 custom cut Mosin stock", 90.9) was within 5 points. When the calibre says gun, only
+  weapons are rivals (`only_weapons`). The gun is confident (0.95, `verified: weapon+calibre`) only when
+  the printed calibre is that gun's own AND no non-weapon item that shares the label names the same
+  calibre (`_calibre_names_gun`): an MP5 upper receiver's art reads "9x19PARA" and its name carries 9x19,
+  so it can never vouch for the gun.
+* **w02 #87, MP5 upper receiver -> MP5 30-round magazine (conf 0.978): now UNCERTAIN ("Check").** The
+  exact label "MP5" is printed by the receiver (2x1), the magazine (1x2) and the gun. The picture chose
+  the magazine only by turning its template (residual 5.29 vs 6.49 for the receiver, which fits the tile
+  unturned) and the font-label anchor was not certain (MP5 20.05 vs "PS" 25.36), so nothing separated
+  them. `_unresolved_label_twins` caps such a pick at 0.5 when the chosen item fits only turned, a
+  same-label differently named item fits unturned, and the picture lead is below `TWIN_GAP_OK`. Narrower
+  variants of the guard (any same-label twin, any residual gap) flagged 4 correct ammo / headset colour
+  variants, so it is restricted to the turned-vs-unturned case. Not promoted to correct: the residual
+  difference is within noise and no other evidence is left on the lean path.
+* **w03 #49 / #50 (MP5 upper receiver -> MP5 gun) and w02 #96 (D3CRX Ranger Green vs Black)**: already
+  uncertain (0.5, "printed label is shared by N items") in this checkout, so not wrong; not promoted to
+  correct. The D3CRX colour comparison over the opaque pixels (residual 4.77 vs 5.64) was not built in
+  the time available.
+
 ## What remains (every failure is listed by `accuracy_report.py`)
 
 * **Wrong, full**: w09 #106. A TOZ-106 shotgun was read as "TOZ-186" and the picture chose the stock
