@@ -631,8 +631,8 @@ def test_save_settings_route_applies_the_lifecycle_settings(monkeypatch, tmp_pat
     monkeypatch.setattr(tsh_app.lifecycle, 'apply_settings', lambda s: applied.append(dict(s)))
     c = tsh_app.app.test_client()
     body = {'hotkey': '<ctrl>+x', 'start_with_windows': False, 'follow_tarkov': True}
-    assert c.post('/api/settings', json=body).get_json() == {'ok': True}
-    assert applied == [body]
+    assert c.post('/api/settings', json=body).get_json()['ok'] is True
+    assert len(applied) == 1 and all(applied[0][k] == v for k, v in body.items())   # merged, validated
     got = c.get('/api/settings').get_json()
     assert got['start_with_windows'] is False and got['follow_tarkov'] is True
     assert got['show_window_on_game_start'] is True                   # filled in: the file never had it
