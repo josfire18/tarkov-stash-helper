@@ -57,14 +57,18 @@ RES_PLAUSIBLE = 8.5        # mean level error above which a visual match needs t
 OCR_AUTH = 90.0            # fuzzy score at/above which a label is considered a real read
 LABEL_PARTIAL_CAP = 94.0   # best score a non-exact label match can get (exact = 100)
 LABEL_RIVAL_GAP = 5.0      # a label this much better than the chosen item's gets a say
-LITERAL_RES = 3.0          # a stage-1 residual this low with LITERAL_DINO is a near pixel-exact match
-LITERAL_DINO = 0.9
+LITERAL_RES = 5.0          # a stage-1 residual this low with LITERAL_DINO is a near pixel-exact match
+LITERAL_DINO = 0.85
 TIE_MARGIN = 0.1           # fused-score gap below which two differently named items are indistinguishable
 TIE_CONF_CAP = 0.5         # ...and the answer is a coin flip, so it may not be reported as certain
 LEARN_MAX_RES = 4.0        # stage-1 residual of a near-literal match to a cached icon
 NAMED_DINO_SLACK = 0.03    # a named candidate this close in DINO to a nameless winner may name it
 LEARN_DISTINCT = 2.0       # learn only if every different look-alike is at least this x worse
 LEARN_CONFIRMATIONS = 2    # independent confirmations before a learned name is used
+TWIN_GAP_OK = 2.0          # fused-score lead that settles same-label twins by picture (see docs/accuracy.md)
+TWIN_GAP_OK_RES = 6.0      # ...when the picture score is the residual alone (no DINO: colour variants differ by little)
+LABEL_VERIFIED_CONF = 0.97  # exact, unambiguous label read of an item that fits the footprint
+WEAPON_SURE_CONF = 0.95    # certainly a gun (guns are skipped, the exact gun does not matter)
 # logistic calibration of the reported confidence: p = sigmoid(b + sum(w * feature)); fitted by
 # `python -m identify.calibrate` on degraded variants of the labelled stash (see that module)
 CALIB = {'b': 1.753, 'margin': 0.372, 'res': -0.311, 'ocr': 3.225, 'dino': 0.947}
@@ -196,6 +200,16 @@ class Engine:
         near pixel-exact match to that icon AND its label is an exact, unique read."""
         if (self.cat.src[row] == 'api' or residual > LEARN_MAX_RES
                 or label_score < 100.0 or twins != 1 or self._read_is_ambiguous(item_id)):
+            return
+        # the item must be able to take this icon's footprint (a 1x1 sight never draws 1x2) and
+        # its label must not be one glyph away from another item's ("MPX FS" / "MPX F5")
+        a = self._id_row[item_id]
+        c = self.cat
+        same = (int(c.tw[a]), int(c.th[a])) in ((int(c.tw[row]), int(c.th[row])), (int(c.th[row]), int(c.tw[row])))
+        if not same and str(c.cats[a]) not in ('weapon', 'mod'):
+            return
+        f = self._fold_of.get(a)
+        if not f or sum(1 for v in self._fold_of.values() if v == f) > 1:
             return
         key = self._icon_key(row)
         name = str(self.cat.names[self._id_row[item_id]]) if item_id in self._id_row else item_id
@@ -509,33 +523,61 @@ class Engine:
         # only says what the footprint looks like: the identity comes from the printed label.
         auth = None
         edge = _at_viewport_edge(it, panel, tile)
+
+        def gun_probe() -> bool:
+            # guns print their calibre bottom-left ("20ga", "5.45x39"); parts never do
+            if it.clipped_bottom or not self._use_ocr():
+                return False
+            st = ocr_mod.bottom_strip(img_bgr, it.rect, panel.pitch_x, panel.pitch_y, left=True)
+            return st is not None and ocr_mod.looks_like_caliber(ocr_mod.read_strips([st])[0])
         if cat.src[c.row] == 'build' or (str(cat.cats[c.row]) == 'weapon' and c.score > 3.0) \
                 or best_res > 9.0:
             auth = self._label_authority(w.get('ocr_all') or [], tile,
                                          prefer_weapon=str(cat.cats[c.row]) in ('weapon', 'build'),
                                          res_by_row=_best_res_by_id(cat, cands), at_edge=edge,
-                                         twin_rank=self._twin_ranker(w))
+                                         twin_rank=self._twin_ranker(w), is_gun=gun_probe)
         elif text and (o is None or o < 60 or o < self._best_label(w, tile) - LABEL_RIVAL_GAP):
             # label conflict: the picture says one thing, a clean unambiguous printed name
             # says another (e.g. a 2x1 suppressor whose label names a 1x1 flash hider)
             auth = self._label_authority(w.get('ocr_all') or [], tile, prefer_weapon=False,
                                          res_by_row=_best_res_by_id(cat, cands), at_edge=edge,
-                                         twin_rank=self._twin_ranker(w))
+                                         twin_rank=self._twin_ranker(w), is_gun=gun_probe)
             if auth is not None and (str(cat.ids[auth[0]]) == str(cat.ids[c.row])
                                      or literal_beats_label(c.score, s_dino, auth[1])):
                 auth = None
+        if auth is None and text and o is not None and o >= OCR_AUTH and str(cat.cats[c.row]) != 'weapon':
+            # the picture chose a part whose printed name is also a gun's ("TOZ-106" stock / gun):
+            # a gun prints its calibre bottom-left, a part does not
+            rd = self._id_row
+            guns = {rd[i] for t_ in (w.get('ocr_all') or []) for i, s_ in self._label_hits(t_, tile.W).items()
+                    if i in rd and str(cat.cats[rd[i]]) == 'weapon' and s_ >= o - 0.01
+                    and self._footprint_ok(rd[i], tile, edge)}
+            me = rd.get(str(cat.ids[c.row]))
+            close = False
+            if guns and me is not None:
+                # only when the picture cannot tell the part from the gun (incl. its presets)
+                rk = self._twin_ranker(w)([me] + sorted(guns))
+                g_best = max((rk[g] for g in guns if g in rk), default=None)
+                close = g_best is not None and me in rk and rk[me] - g_best < TWIN_GAP_OK
+            if close and gun_probe():
+                auth = self._label_authority(w.get('ocr_all') or [], tile, prefer_weapon=True,
+                                             res_by_row=_best_res_by_id(cat, cands), at_edge=edge,
+                                             twin_rank=self._twin_ranker(w))
         item_id = str(cat.ids[c.row])
         name = str(cat.names[c.row])
         evidence = {'residual': round(c.score, 3), 'stage1_best': round(best_res, 3),
                     'dino': None if s_dino is None else round(s_dino, 4),
                     'ocr_text': text, 'ocr': None if o is None else round(o, 1),
-                    'source': str(cat.src[c.row])}
+                    'source': str(cat.src[c.row]),
+                    'visual': f'{cat.names[c.row]} [{cat.src[c.row]} #{c.row}]'}
         chosen_row = c.row
         twins = 1
+        twin_gap = None
         if auth is not None:
-            row, sc, twins = auth
+            row, sc, twins, twin_gap = auth
             item_id, name = str(cat.ids[row]), str(cat.names[row])
-            evidence.update(ocr_authority=True, ocr=round(sc, 1), source='ocr-authority', twins=twins)
+            evidence.update(ocr_authority=True, ocr=round(sc, 1), source='ocr-authority', twins=twins,
+                            twin_gap=None if twin_gap is None else round(twin_gap, 2))
             o = sc
             chosen_row = row
         elif item_id == '':
@@ -587,6 +629,15 @@ class Engine:
             if len(alts) == 3:
                 break
         evidence['alternatives'] = alts
+        pool_rows, seen_n = [], set()
+        for S2, c2, _, _ in scored:
+            nm = str(cat.names[c2.row])
+            if nm not in seen_n:
+                seen_n.add(nm)
+                pool_rows.append((int(c2.row), int(c2.rot), nm, round(S2, 2)))
+            if len(pool_rows) == 6:
+                break
+        evidence['pool_rows'] = pool_rows
         evidence['catalog_row'] = int(chosen_row)
         evidence['rot'] = int(c.rot)
 
@@ -596,9 +647,25 @@ class Engine:
         z = CALIB['b'] + sum(CALIB[k] * v for k, v in feats.items())
         if item_id == '':
             z -= 4.0
-        if twins > 1:
+        twin_ok = twin_gap is not None and twin_gap >= (TWIN_GAP_OK if have_dino else TWIN_GAP_OK_RES)
+        if twins > 1 and not twin_ok:
             z -= 1.5 * math.log(twins)
         conf = _sigmoid(z)
+        if twins > 1 and not twin_ok:
+            # same-label twins the picture did not separate: the choice is a coin flip
+            conf = min(conf, TIE_CONF_CAP)
+            evidence['note'] = 'label twins not separated by the picture'
+        if auth is not None and auth[1] >= 100.0 and (twins == 1 or twin_ok):
+            # label-verified: the printed short name was read exactly, no differently named
+            # item (not even one that differs by an ambiguous glyph) fits this footprint, and
+            # among same-label twins the picture decided clearly
+            conf = max(conf, LABEL_VERIFIED_CONF)
+            evidence['verified'] = 'label'
+        if str(cat.cats[chosen_row]) == 'weapon' and self._weapon_sure(
+                evidence.get('pool_rows'), auth if (twins == 1 or twin_ok) else None):
+            # guns are skipped by the sell list: being sure it IS a gun is all that matters
+            conf = max(conf, WEAPON_SURE_CONF)
+            evidence['verified'] = 'weapon'
         if is_tie(tie_gap):
             conf = min(conf, TIE_CONF_CAP)
             evidence['note'] = 'indistinguishable look-alike (same picture, same label read)'
@@ -641,13 +708,47 @@ class Engine:
             guns = [(str(c.names[r]), int(r)) for r in self._api if str(c.cats[r]) == 'weapon']
             guns.sort(key=lambda t: -len(t[0]))
             self.preset_base = {}
+            self.gun_presets = {}       # base gun row -> preset item ids
+            self.gun_sizes = {grow: {(int(c.tw[grow]), int(c.th[grow]))} for _, grow in guns}
             for r in np.where(c.preset & (c.src == 'api'))[0]:
                 nm = str(c.names[r])
                 for gname, grow in guns:
                     if nm.startswith(gname):
                         self.preset_base[str(c.ids[r])] = grow
+                        self.gun_presets.setdefault(grow, []).append(str(c.ids[r]))
+                        self.gun_sizes[grow].add((int(c.tw[r]), int(c.th[r])))
                         break
+            self._fold_of = {int(r): ocr_mod.fold_glyph(str(c.shorts[r])) for r in self._api}
         return self._api
+
+    def _weapon_like(self, row: int) -> bool:
+        c = self.cat
+        return bool(str(c.cats[row]) == 'weapon' or c.preset[row] or c.src[row] == 'build')
+
+    def _weapon_sure(self, pool_rows, auth) -> bool:
+        """The tile is certainly *a gun* (which one does not matter: guns are skipped).  True when
+        the printed name confidently names a gun, or every one of the best three differently
+        named pictures is a gun / preset / weapon build."""
+        if auth is not None and auth[1] >= OCR_AUTH and str(self.cat.cats[auth[0]]) == 'weapon':
+            return True
+        top = (pool_rows or [])[:3]
+        return len(top) >= 2 and all(self._weapon_like(r) for r, *_ in top)
+
+    def _footprint_ok(self, row: int, tile: Tile, at_edge: bool) -> bool:
+        """Can item ``row`` occupy this tile?  An item's footprint is fixed (either orientation)
+        unless it takes attachments: weapons (any of their preset sizes, or bigger when built)
+        and weapon mods (a handguard with rails) only ever grow.  At the viewport edge a tile can
+        be cut, so anything goes there."""
+        if at_edge:
+            return True
+        cat = self.cat
+        W, H = tile.W, tile.H
+        sizes = self.gun_sizes.get(row) or {(int(cat.tw[row]), int(cat.th[row]))}
+        if any((w_, h_) in ((W, H), (H, W)) for w_, h_ in sizes):
+            return True
+        if str(cat.cats[row]) in ('weapon', 'mod') and 'magazine' not in str(cat.names[row]).lower():
+            return any(w_ * h_ <= W * H for w_, h_ in sizes)      # magazines take nothing: fixed size
+        return False
 
     def _twin_ranker(self, w):
         """Picture score of label twins: ``-W_RES * residual + W_DINO * cosine`` of each twin's
@@ -665,66 +766,86 @@ class Engine:
                 iid = str(cat.ids[c.row])
                 if iid and iid not in best:
                     best[iid] = c
-            have = {r: best[str(cat.ids[r])] for r in rows if str(cat.ids[r]) in best}
-            out = {r: -W_RES * c.score for r, c in have.items()}
-            if qe is None or self.store is None or w['tile'].clip or not have                     or any(c.rot != 0 for c in have.values()) or len(have) < len(rows):
-                return out
-            emb = self.store.get([c.row for c in have.values()])
-            return {r: out[r] + W_DINO * float(qe @ e) for r, e in zip(have, emb)}
+            have = {}
+            for r in rows:
+                # a gun is also every default build (preset) of it: built guns draw like those
+                ids = [str(cat.ids[r])] + list(getattr(self, 'gun_presets', {}).get(r, ()))
+                cs = [best[i] for i in ids if i in best]
+                if cs:
+                    have[r] = cs
+            sims = w.get('sims') or {}
+            use_dino = qe is not None and self.store is not None and not w['tile'].clip
+
+            def fused(c):
+                s = -W_RES * c.score
+                if not use_dino:
+                    return s, True
+                v = sims.get((c.row, c.rot))
+                if v is None and c.rot == 0:
+                    v = float(qe @ self.store.get([c.row])[0])
+                return (s + W_DINO * v, True) if v is not None else (s, False)
+            vals = {r: [fused(c) for c in cs] for r, cs in have.items()}
+            if use_dino and all(ok for v in vals.values() for _, ok in v) and len(have) == len(rows):
+                return {r: max(s for s, _ in v) for r, v in vals.items()}
+            return {r: max(-W_RES * c.score for c in cs) for r, cs in have.items()}
         return rank
 
     def _label_authority(self, texts: list, tile: Tile, prefer_weapon: bool, res_by_row: dict | None = None,
-                         at_edge: bool = False, twin_rank=None):
-        """Identity from the printed short name over *all* base items (any footprint no
-        larger than the tile: a modded item draws bigger than its base; a viewport-clipped
-        tile may hide up to 3 rows).  Needs a confident read (>= ``OCR_AUTH``) that beats
-        any *different* name by 5 points.  Equal-score twins (same short name) are resolved
-        by preferring base weapons when the picture looks like a weapon, else footprint
-        closeness, and are counted so the confidence can be lowered.
-        Returns ``(row, score, n_twins)`` or None."""
+                         at_edge: bool = False, twin_rank=None, is_gun=None):
+        """Identity from the printed short name over *all* base items whose footprint can be
+        this tile (:meth:`_footprint_ok`).  All OCR variants of the label are pooled: needs a
+        confident read (>= ``OCR_AUTH``) and no *different* name within 5 points, except names
+        that only differ by glyphs the label font makes ambiguous (``MPX F5`` / ``MPX FS``: same
+        :func:`ocr.fold`), which are label twins like equal short names.  Twins are resolved by
+        preferring base weapons when the picture looks like a weapon, then exact footprint, then
+        the picture (:meth:`_twin_ranker`).
+        Returns ``(row, score, n_finalists, picture_gap)`` or None; ``picture_gap`` is the
+        fused-score lead of the chosen twin over the best differently named finalist (None when
+        there was only one finalist or no picture score)."""
         self._api_rows()
         cat = self.cat
-        max_area = tile.W * (tile.H + (3 if tile.clip else 0))
-        best = None
+        allsc: dict[int, float] = {}
         for txt in texts:
-            hits = self._label_hits(txt, tile.W)
-            sc = [(s_, self._id_row[i]) for i, s_ in hits.items() if i in self._id_row]
-            # An exact read names one item even when it is bigger than the visible tile: the
-            # stash viewport cuts items in half at its edges, and clip detection can miss it.
-            fits = [(s_, r) for s_, r in sc
-                    if int(cat.tw[r]) * int(cat.th[r]) <= max_area or str(cat.cats[r]) == 'weapon']
-            exact_fits = any(s_ >= 100.0 for s_, _ in fits)
-            # ...but only where the viewport really cuts items (the tile touches the edge of
-            # the visible stash) and no exact twin fits the tile: OCR that drops a character
-            # can land on another item's real short name ("M80" read as "M8").
-            sc = fits if (exact_fits or not at_edge) else fits + [
-                (s_, r) for s_, r in sc if s_ >= 100.0 and (s_, r) not in fits]
-            if not sc:
-                continue
-            sc.sort(key=lambda t: -t[0])
-            # between equally good reads (one variant says M82, another M80) the one that names
-            # an item fitting the tile wins: a bigger item is only possible at the viewport edge
-            key_ = (sc[0][0], sc[0] in fits)
-            if sc[0][0] >= OCR_AUTH and (best is None or key_ > best[2]):
-                best = (sc, txt, key_)
-        if best is None:
+            for i, s_ in self._label_hits(txt, tile.W).items():
+                r = self._id_row.get(i)
+                if r is not None and s_ > allsc.get(r, -1.0):
+                    allsc[r] = s_
+        sc = [(s_, r) for r, s_ in allsc.items() if self._footprint_ok(r, tile, False)]
+        if at_edge and not any(s_ >= 100.0 for s_, _ in sc):
+            # the viewport may cut an item: an exact read of a bigger item is possible there
+            sc += [(s_, r) for r, s_ in allsc.items() if s_ >= 100.0 and (s_, r) not in sc]
+        if not sc:
             return None
-        sc = best[0]
+        sc.sort(key=lambda t: -t[0])
         top = sc[0][0]
-        rivals = {ocr_mod.canon_nospace(str(cat.shorts[r])) for s_, r in sc if s_ >= top - 5.0}
+        if top < OCR_AUTH:
+            return None
+        f0 = self._fold_of.get(sc[0][1], '')
+        rivals = {self._fold_of.get(r, '') for s_, r in sc if s_ >= top - 5.0}
         if len(rivals) > 1:
             return None
-        twins = [r for s_, r in sc if s_ >= top - 0.01]
-        area = tile.W * tile.H
-
+        twins = [r for s_, r in sc if s_ >= top - 0.01 or (f0 and self._fold_of.get(r) == f0)]
+        W, H = tile.W, tile.H
         def coarse(r):
             weap = str(cat.cats[r]) == 'weapon'
-            return (0 if (prefer_weapon and weap) else 1, abs(int(cat.tw[r]) * int(cat.th[r]) - area))
-        # equal-label twins (a loose round and its ammo pack share one short name): among those
-        # that fit the tile equally well the picture decides
+            sizes = self.gun_sizes.get(r) or {(int(cat.tw[r]), int(cat.th[r]))}
+            exact = any((a, b) in ((W, H), (H, W)) for a, b in sizes)
+            return (0 if (prefer_weapon and weap) else 1, 0 if exact else 1)
         c0 = min(coarse(r) for r in twins)
         finalists = [r for r in twins if coarse(r) == c0]
         vis = twin_rank(finalists) if (twin_rank and len(finalists) > 1) else {}
+        kinds = {str(cat.cats[r]) == 'weapon' for r in finalists}
+        probed, n_before = False, len(finalists)
+        if not prefer_weapon and len(kinds) == 2 and is_gun is not None:
+            ranked = sorted(vis.values(), reverse=True)
+            if (len(ranked) < 2 or ranked[0] - ranked[1] < TWIN_GAP_OK) and is_gun():
+                # "TOZ-106" names the gun and its stock and the picture cannot tell: a calibre
+                # printed bottom-left says gun (parts print none)
+                prefer_weapon = True
+                probed, n_before = True, len(finalists)
+                c0 = min(coarse(r) for r in twins)
+                finalists = [r for r in twins if coarse(r) == c0]
+                vis = twin_rank(finalists) if (twin_rank and len(finalists) > 1) else {}
 
         def key(r):
             if vis:
@@ -732,8 +853,17 @@ class Engine:
             else:
                 rr = round(res_by_row.get(r, 99.0), 1) if res_by_row else 0.0
             return coarse(r) + (rr, r)
-        twins.sort(key=key)
-        return twins[0], float(top), len(twins)
+        finalists.sort(key=key)
+        gap = None
+        if len(finalists) > 1 and vis and finalists[0] in vis:
+            nm0 = str(cat.names[finalists[0]])
+            others = [vis.get(r, -99.0) for r in finalists[1:] if str(cat.names[r]) != nm0]
+            if others:
+                gap = vis[finalists[0]] - max(others)
+        if probed:
+            # the calibre read only breaks the tie: art can look like text, so never "verified"
+            return finalists[0], float(top), max(2, n_before), None
+        return finalists[0], float(top), len(finalists), gap
 
 
 def _at_viewport_edge(it, panel, tile) -> bool:
