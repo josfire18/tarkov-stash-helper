@@ -677,7 +677,7 @@ def catalog_summary():
 _v2_engine = [None, None]    # [settings key, Engine]
 
 
-def scan_with_v2(img_bgr, settings, warnings):
+def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None):
     """
     Run the identification engine (identify/ package) and adapt its output to what the
     scan routes consume: raw detections as dicts (col,row,W,H,item_id,name,rotated,
@@ -696,7 +696,16 @@ def scan_with_v2(img_bgr, settings, warnings):
     key = repr(es)
     if _v2_engine[0] != key:
         _v2_engine[:] = [key, Engine(es)]
-    res = _v2_engine[1].scan(img_bgr)
+    scene = None
+    try:                                  # which grids are stash / own gear / loot / windows
+        from identify.scene import analyze_scene
+        scene = analyze_scene(img_bgr, in_raid=in_raid)
+        if scene_out is not None:
+            scene_out.update({'scene': scene.scene, 'in_raid': scene.in_raid,
+                              'regions': [r.as_dict() for r in scene.regions]})
+    except Exception as e:                # never lose the scan over the scene layer
+        warnings.append(f'Scene analysis failed ({e}); every grid is treated as stash.')
+    res = _v2_engine[1].scan(img_bgr, scene)
     warnings.extend(res.warnings)
     panels = [{**p.as_grid_dict(), 'strength': p.strength} for p in res.grid.panels]
     if not panels:
@@ -709,6 +718,9 @@ def scan_with_v2(img_bgr, settings, warnings):
     records = []
     for d in res.detections:
         rec = d.to_record()
+        reg = res.regions[d.panel] if d.panel < len(res.regions) else None
+        if reg is not None:
+            rec['role'], rec['side'], rec['region_title'] = reg.role, reg.side, reg.title
         if d.uncertain:
             rec['alternatives'] = [a['name'] for a in (d.evidence.get('alternatives') or ())][:3]
         records.append(rec)
@@ -2704,7 +2716,16 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
 
         # --- Identification (grid, per-panel origins, every item) -------------
         _scan_state['phase'] = 'identify'
-        raw_detections, panels, grid_failed = scan_with_v2(img_bgr, settings, warnings)
+        scene_info = {}
+        in_raid = None
+        if frame_bgr is not None:          # whole game frame: the lobby menu bar tells raid from lobby
+            try:
+                from autoscan.detect import menu_chrome
+                in_raid = not menu_chrome(img_bgr)
+            except Exception:
+                pass
+        raw_detections, panels, grid_failed = scan_with_v2(img_bgr, settings, warnings,
+                                                           scene_out=scene_info, in_raid=in_raid)
         grid = panels[0]
         print(f"Grid: {len(panels)} panel(s), "
               f"cell={grid['cell_w']:.2f}×{grid['cell_h']:.2f} "
@@ -2730,6 +2751,22 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
         print(f"[sell_scan] matches: {len(raw_detections)}")
         if settings.get('debug_dumps', True):
             _save_debug_bundle(img_bgr, panels, raw_detections, 'sell')
+
+        # Sell advice covers the stash and open container windows only.  What is on the player
+        # (rig / pockets / backpack / pouch), loot and unclear grids are listed apart ("On you").
+        on_you = []
+        if any(d.get('role') for d in raw_detections):
+            advice = []
+            for d in raw_detections:
+                if d.get('role') in (None, 'stash', 'container_window'):
+                    advice.append(d)
+                else:
+                    it = id_to_item.get(d['item_id']) or {}
+                    on_you.append({'matched_name': it.get('name') or d.get('name'), 'item_id': d['item_id'],
+                                   'count': d.get('count') or 1, 'role': d['role'], 'side': d.get('side'),
+                                   'title': d.get('region_title'), 'uncertain': bool(d.get('uncertain')),
+                                   'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph']})
+            raw_detections = advice
 
         # --- Build every entry, numbered in SELL order ---------------------------
         # The picture goes out untouched: the Live page outlines every tile in its action's
@@ -2767,6 +2804,9 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
             'grid_failed': grid_failed,
             'warnings':    warnings,
             'skipped_weapons': skipped_weapons,
+            'scene':       scene_info.get('scene'),
+            'regions':     scene_info.get('regions') or [],
+            'on_you':      on_you,
         })
     finally:
         _scan_state.update({'running': False, 'phase': None, 'ts': time.time()})

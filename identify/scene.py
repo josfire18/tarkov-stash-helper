@@ -167,11 +167,11 @@ def trace_window(frame: np.ndarray, btn: tuple):
         last = cy
         while 0 <= yy + step < H:
             yy += step
-            if np.abs(frame[yy, xl].astype(np.int16) - bcol).max() <= 30:
+            if np.abs(frame[yy, xl].astype(np.int16) - bcol).max() <= 16:
                 last, gap = yy, 0
             else:
                 gap += 1
-                if gap > 4:
+                if gap > 3:
                     break
         return last
     top, bot = run(-1), run(1)

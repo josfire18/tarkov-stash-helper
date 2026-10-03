@@ -33,6 +33,7 @@
 }
 .tile.check { border-style: dashed; }
 .tile.skip { --acc: #777; border-width: 1px; border-style: dashed; background: none; cursor: default; }
+.tile.region { --acc: var(--faint); border-width: 1px; border-style: dotted; background: none; cursor: default; pointer-events: none; }
 .tile.dim { opacity: .2; }
 .tile.hl { background: color-mix(in srgb, var(--acc) 38%, transparent); box-shadow: 0 0 0 2px #fff, 0 0 10px 3px var(--acc); z-index: 2; }
 
@@ -110,8 +111,10 @@ const $ = id => document.getElementById(id);
 
 // ---- data -> groups ------------------------------------------------------------------------
 const tileKey = r => r.px + ',' + r.py;
-function classify(results) {
-  const g = { flea: [], traders: new Map(), none: [], keep: [], check: [] };
+const OWN_LABEL = { own_rig: 'Tactical rig', own_pockets: 'Pockets', own_backpack: 'Backpack', own_pouch: 'Pouch',
+  own_special: 'Special slots', own_other: 'Equipment', loot: 'Loot', unknown: 'Unclear' };
+function classify(results, onYou) {
+  const g = { flea: [], traders: new Map(), none: [], keep: [], check: [], own: onYou || [] };
   for (const r of results) {
     if (MONEY.has(r.matched_name)) continue;                 // cash is not something to sell
     if (r.recommend === 'keep') (r.check || r.uncertain ? g.check : g.keep).push(r);
@@ -162,6 +165,9 @@ function rowEl(r, kind, acc) {
     sub = r.count > 1 ? `${rub(r.trader_price)} each` : '';
     if (r.flea_list) more.push(`Flea: ${rub(r.flea_list)}`);
     if (r.trader_currency && r.trader_currency !== 'RUB') more.push(`Paid in ${esc(r.trader_currency)}`);
+  } else if (kind === 'own') {
+    sub = OWN_LABEL[r.role] || 'On you';
+    if (r.uncertain) more.push('Not sure which item this is');
   } else if (kind === 'keep') {
     amt = '×' + (r.count || 1);
     sub = r.reason || 'On your list';
@@ -213,6 +219,7 @@ function renderList(g) {
   groupEl(list, 'No buyer', g.none, 'none', 'var(--faint)', false);
   groupEl(list, 'Keep', g.keep, 'keep', 'var(--keep)', false);
   groupEl(list, 'Check', g.check, 'check', 'var(--check)', false);
+  groupEl(list, 'On you', g.own, 'own', 'var(--faint)', false);
   if (!list.children.length) {
     list.innerHTML = `<div class="none">${filterText ? 'No items match' : 'No items found'}</div>`;
   }
@@ -238,6 +245,12 @@ function renderTiles(res) {
   };
   const tiles = $('tiles'); tiles.innerHTML = '';
   for (const s of res.skipped || []) tiles.append(box(s, 'skip', '#777'));
+  for (const o of res.on_you || []) tiles.append(box(o, 'skip', '#777'));
+  for (const g of res.regions || []) {
+    if (g.role === 'picker') continue;
+    const [x, y, w, h] = g.bbox, t = box({ px: x, py: y, pw: w, ph: h }, 'region', 'var(--faint)');
+    t.title = g.title || g.role; tiles.append(t);
+  }
   const done = new Set();
   for (const r of res.results || []) {
     if (r.px == null || (r.recommend === 'keep' && r.drawn === false)) continue;   // a partly kept stack is drawn by its sell row
@@ -285,7 +298,7 @@ function apply(res) {
     return;
   }
   scan = res;
-  const g = classify(res.results || []);
+  const g = classify(res.results || [], res.on_you);
   renderSummary(g, res);
   renderList(g);
   const img = $('img');
@@ -336,7 +349,7 @@ fetchResult();
 // ---- toolbar -------------------------------------------------------------------------------
 $('filter').addEventListener('input', e => {
   filterText = e.target.value.trim().toLowerCase();
-  if (scan) { const g = classify(scan.results || []); renderList(g); applyFilterToTiles(); renderTiles(scan); }
+  if (scan) { const g = classify(scan.results || [], scan.on_you); renderList(g); applyFilterToTiles(); renderTiles(scan); }
 });
 
 $('scan-now').addEventListener('click', async () => {
