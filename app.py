@@ -677,7 +677,7 @@ def catalog_summary():
 _v2_engine = [None, None]    # [settings key, Engine]
 
 
-def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None):
+def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None, on_provisional=None, cancel=None):
     """
     Run the identification engine (identify/ package) and adapt its output to what the
     scan routes consume: raw detections as dicts (col,row,W,H,item_id,name,rotated,
@@ -705,11 +705,31 @@ def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None):
                               'regions': [r.as_dict() for r in scene.regions]})
     except Exception as e:                # never lose the scan over the scene layer
         warnings.append(f'Scene analysis failed ({e}); every grid is treated as stash.')
-    res = _v2_engine[1].scan(img_bgr, scene)
+    def adapt(res):
+        panels = [{**p.as_grid_dict(), 'strength': p.strength} for p in res.grid.panels]
+        records = []
+        for d in res.detections:
+            rec = d.to_record()
+            reg = res.regions[d.panel] if d.panel < len(res.regions) else None
+            if reg is not None:
+                rec['role'], rec['side'], rec['region_title'] = reg.role, reg.side, reg.title
+            if d.uncertain:
+                rec['alternatives'] = [a['name'] for a in (d.evidence.get('alternatives') or ())][:3]
+            records.append(rec)
+        if scene_out is not None and res.regions:
+            scene_out['grids'] = _region_grids(res)
+        return records, panels
+
+    cb = None
+    if on_provisional is not None:
+        def cb(res):                      # the fast first look: (records, panels), items marked provisional
+            if res.grid.panels:
+                records, panels = adapt(res)
+                print(f"[v2] provisional {len(records)} items in {res.timings.get('provisional', 0):.2f}s")
+                on_provisional(records, panels)
+    res = _v2_engine[1].scan(img_bgr, scene, on_provisional=cb, cancel=cancel)
     warnings.extend(res.warnings)
-    if scene_out is not None and res.regions:
-        scene_out['grids'] = _region_grids(res)
-    panels = [{**p.as_grid_dict(), 'strength': p.strength} for p in res.grid.panels]
+    records, panels = adapt(res)
     if not panels:
         warnings.append('Stash grid not detected — check the capture region covers '
                         'the stash, or recalibrate.')
@@ -717,15 +737,6 @@ def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None):
                      'x0': 0, 'y0': 0, 'x1': img_bgr.shape[1], 'y1': img_bgr.shape[0]}], True
     print(f"[v2] {len(res.detections)} items in {res.timings.get('total', 0):.2f}s "
           f"({', '.join(f'{k} {v:.2f}' for k, v in res.timings.items() if k != 'total')})")
-    records = []
-    for d in res.detections:
-        rec = d.to_record()
-        reg = res.regions[d.panel] if d.panel < len(res.regions) else None
-        if reg is not None:
-            rec['role'], rec['side'], rec['region_title'] = reg.role, reg.side, reg.title
-        if d.uncertain:
-            rec['alternatives'] = [a['name'] for a in (d.evidence.get('alternatives') or ())][:3]
-        records.append(rec)
     return records, panels, False
 
 
@@ -2709,7 +2720,112 @@ def sell_scan():
     print(f"[sell_scan] ERROR:\n{tb}")
     return jsonify({'error': str(e), 'traceback': tb, 'image': None, 'results': [], 'grid': None})
 
-def _sell_scan_inner(from_calibration=False, frame_bgr=None, lean=False):
+def _sell_payload(raw_detections, panels, grid_failed, warnings, scene_info, settings, img, img_bgr,
+                  lean, final=True):
+    """Everything after identification: prices, protection plan, advice, rows.  Pure of the
+    capture; ``final=False`` builds the provisional payload of a progressive scan."""
+    warnings = list(warnings)
+    grid = panels[0]
+    print(f"Grid: {len(panels)} panel(s), "
+          f"cell={grid['cell_w']:.2f}×{grid['cell_h']:.2f} "
+          f"origin=({grid['origin_x']:.1f},{grid['origin_y']:.1f})")
+
+    prices     = get_prices()
+    if prices.get('stale_error'):
+        age_h = (time.time() - prices.get('timestamp', 0)) / 3600
+        warnings.append(f'Price refresh failed ({prices["stale_error"]}); '
+                        f'using prices from {age_h:.0f} h ago')
+    price_idx  = build_price_index(prices)
+    id_to_item = {it['id']: it for it in prices.get('items', [])}
+
+    # Everything the player shouldn't sell: unacquired keep-list entries +
+    # task/hideout items still short of their required count.
+    keep_list = load_json(KEEPLIST_PATH, default_keep_list)
+    protected, any_of = get_protected_plan(keep_list, price_idx)
+
+    if not tesseract_available():
+        warnings.append('Tesseract OCR not installed — name reading disabled '
+                        '(winget install UB-Mannheim.TesseractOCR)')
+
+    print(f"[sell_scan] matches: {len(raw_detections)}")
+    if settings.get('debug_dumps', True) and not lean and final:    # the live view saves its frames elsewhere
+        _save_debug_bundle(img_bgr, panels, raw_detections, 'sell')
+
+    # Sell advice covers the stash and open container windows only.  What is on the player
+    # (rig / pockets / backpack / pouch), loot and unclear grids are listed apart ("On you").
+    on_you = []
+    raid = bool(scene_info.get('in_raid')) or str(scene_info.get('scene') or '').startswith('raid')
+    live_advice = None
+    if raid:           # grab / drop advice from the raw detections; nothing is sold from a raid view
+        try:
+            import liveadvice
+            live_advice = liveadvice.compute_advice(
+                raw_detections, scene_info.get('grids') or [], id_to_item, protected, any_of,
+                settings, build_sell_context(settings, prices), scene_info.get('scene'), True)
+        except Exception as e:
+            print(f'[live] raid advice failed: {e}')
+            warnings.append(f'Raid advice failed ({e})')
+    if any(d.get('role') for d in raw_detections):
+        advice = []
+        for d in raw_detections:
+            if d.get('role') in (None, 'stash', 'container_window') and not raid:
+                advice.append(d)
+            else:
+                it = id_to_item.get(d['item_id']) or {}
+                on_you.append({'matched_name': it.get('name') or d.get('name'), 'item_id': d['item_id'],
+                               'count': d.get('count') or 1, 'role': d.get('role') or 'unknown', 'side': d.get('side'),
+                               'title': d.get('region_title'), 'uncertain': bool(d.get('uncertain')),
+                               **({'provisional': True} if d.get('provisional') else {}),
+                               'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph']})
+        raw_detections = advice
+
+    # --- Build every entry, numbered in SELL order ---------------------------
+    # The picture goes out untouched: the Live page outlines every tile in its action's
+    # colour client-side.  The decisions themselves are sellcalc.plan_entries (pure).
+    skipped = []          # guns/dogtags: recognised but never priced
+    sellable = []
+    for d in sorted(raw_detections, key=lambda r: (r['panel'], r['row'], r['col'])):
+        badge = skip_badge(id_to_item.get(d['item_id']), d.get('category'))
+        if badge:
+            skipped.append({'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph'],
+                            'label': badge, 'matched_name': d.get('name')})
+        else:
+            sellable.append(d)
+    skipped_weapons = len(skipped)
+
+    ctx = build_sell_context(settings, prices)
+    results, keep_results = sellcalc.plan_entries(sellable, id_to_item, protected, settings, ctx, any_of)
+
+    alts = {(d['px'], d['py']): d['alternatives'] for d in raw_detections if d.get('alternatives')}
+    for k in keep_results:
+        if k.get('check') and alts.get((k['px'], k['py'])):
+            k['candidates'] = alts[(k['px'], k['py'])]
+
+    results.extend(keep_results)   # KEEP items always at the end
+
+    if lean:           # the live view fetches the picture separately (/api/autoscan/frame)
+        encoded = None
+    else:
+        buf = BytesIO()
+        img.save(buf, format='JPEG', quality=88)
+        encoded = base64.b64encode(buf.getvalue()).decode()
+    return {
+        'image':       encoded,
+        'image_mime':  'image/jpeg',
+        'skipped':     skipped,
+        'results':     results,
+        'grid':        grid,
+        'grid_failed': grid_failed,
+        'warnings':    warnings,
+        'skipped_weapons': skipped_weapons,
+        'scene':       scene_info.get('scene'),
+        'regions':     scene_info.get('regions') or [],
+        'on_you':      on_you,
+        'advice':      live_advice,
+    }
+
+
+def _sell_scan_inner(from_calibration=False, frame_bgr=None, lean=False, publish=None, cancel=None):
     settings = load_json(SETTINGS_PATH, default_settings)
 
     _scan_state.update({'running': True, 'phase': 'capture',
@@ -2739,105 +2855,18 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None, lean=False):
                 in_raid = not menu_chrome(img_bgr)
             except Exception:
                 pass
-        raw_detections, panels, grid_failed = scan_with_v2(img_bgr, settings, warnings,
-                                                           scene_out=scene_info, in_raid=in_raid)
-        grid = panels[0]
-        print(f"Grid: {len(panels)} panel(s), "
-              f"cell={grid['cell_w']:.2f}×{grid['cell_h']:.2f} "
-              f"origin=({grid['origin_x']:.1f},{grid['origin_y']:.1f})")
+        def first_look(records, prov_panels):
+            payload = _sell_payload(records, prov_panels, False, warnings, scene_info, settings,
+                                    img, img_bgr, lean, final=False)
+            payload['provisional'] = True
+            publish(payload)
 
-        prices     = get_prices()
-        if prices.get('stale_error'):
-            age_h = (time.time() - prices.get('timestamp', 0)) / 3600
-            warnings.append(f'Price refresh failed ({prices["stale_error"]}); '
-                            f'using prices from {age_h:.0f} h ago')
-        price_idx  = build_price_index(prices)
-        id_to_item = {it['id']: it for it in prices.get('items', [])}
-
-        # Everything the player shouldn't sell: unacquired keep-list entries +
-        # task/hideout items still short of their required count.
-        keep_list = load_json(KEEPLIST_PATH, default_keep_list)
-        protected, any_of = get_protected_plan(keep_list, price_idx)
-
-        if not tesseract_available():
-            warnings.append('Tesseract OCR not installed — name reading disabled '
-                            '(winget install UB-Mannheim.TesseractOCR)')
-
-        print(f"[sell_scan] matches: {len(raw_detections)}")
-        if settings.get('debug_dumps', True) and not lean:    # the live view saves its frames elsewhere
-            _save_debug_bundle(img_bgr, panels, raw_detections, 'sell')
-
-        # Sell advice covers the stash and open container windows only.  What is on the player
-        # (rig / pockets / backpack / pouch), loot and unclear grids are listed apart ("On you").
-        on_you = []
-        raid = bool(scene_info.get('in_raid')) or str(scene_info.get('scene') or '').startswith('raid')
-        live_advice = None
-        if raid:           # grab / drop advice from the raw detections; nothing is sold from a raid view
-            try:
-                import liveadvice
-                live_advice = liveadvice.compute_advice(
-                    raw_detections, scene_info.get('grids') or [], id_to_item, protected, any_of,
-                    settings, build_sell_context(settings, prices), scene_info.get('scene'), True)
-            except Exception as e:
-                print(f'[live] raid advice failed: {e}')
-                warnings.append(f'Raid advice failed ({e})')
-        if any(d.get('role') for d in raw_detections):
-            advice = []
-            for d in raw_detections:
-                if d.get('role') in (None, 'stash', 'container_window') and not raid:
-                    advice.append(d)
-                else:
-                    it = id_to_item.get(d['item_id']) or {}
-                    on_you.append({'matched_name': it.get('name') or d.get('name'), 'item_id': d['item_id'],
-                                   'count': d.get('count') or 1, 'role': d.get('role') or 'unknown', 'side': d.get('side'),
-                                   'title': d.get('region_title'), 'uncertain': bool(d.get('uncertain')),
-                                   'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph']})
-            raw_detections = advice
-
-        # --- Build every entry, numbered in SELL order ---------------------------
-        # The picture goes out untouched: the Live page outlines every tile in its action's
-        # colour client-side.  The decisions themselves are sellcalc.plan_entries (pure).
-        skipped = []          # guns/dogtags: recognised but never priced
-        sellable = []
-        for d in sorted(raw_detections, key=lambda r: (r['panel'], r['row'], r['col'])):
-            badge = skip_badge(id_to_item.get(d['item_id']), d.get('category'))
-            if badge:
-                skipped.append({'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph'],
-                                'label': badge, 'matched_name': d.get('name')})
-            else:
-                sellable.append(d)
-        skipped_weapons = len(skipped)
-
-        ctx = build_sell_context(settings, prices)
-        results, keep_results = sellcalc.plan_entries(sellable, id_to_item, protected, settings, ctx, any_of)
-
-        alts = {(d['px'], d['py']): d['alternatives'] for d in raw_detections if d.get('alternatives')}
-        for k in keep_results:
-            if k.get('check') and alts.get((k['px'], k['py'])):
-                k['candidates'] = alts[(k['px'], k['py'])]
-
-        results.extend(keep_results)   # KEEP items always at the end
-
-        if lean:           # the live view fetches the picture separately (/api/autoscan/frame)
-            encoded = None
-        else:
-            buf = BytesIO()
-            img.save(buf, format='JPEG', quality=88)
-            encoded = base64.b64encode(buf.getvalue()).decode()
-        return jsonify({
-            'image':       encoded,
-            'image_mime':  'image/jpeg',
-            'skipped':     skipped,
-            'results':     results,
-            'grid':        grid,
-            'grid_failed': grid_failed,
-            'warnings':    warnings,
-            'skipped_weapons': skipped_weapons,
-            'scene':       scene_info.get('scene'),
-            'regions':     scene_info.get('regions') or [],
-            'on_you':      on_you,
-            'advice':      live_advice,
-        })
+        raw_detections, panels, grid_failed = scan_with_v2(
+            img_bgr, settings, warnings, scene_out=scene_info, in_raid=in_raid,
+            on_provisional=first_look if publish is not None else None, cancel=cancel)
+        payload = _sell_payload(raw_detections, panels, grid_failed, warnings, scene_info, settings,
+                                img, img_bgr, lean)
+        return jsonify(payload)
     finally:
         _scan_state.update({'running': False, 'phase': None, 'ts': time.time()})
 
@@ -2846,10 +2875,12 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None, lean=False):
 # Auto-scan (autoscan/): passive capture of the game window, scan on a settled stash
 # ---------------------------------------------------------------------------
 
-def _autoscan_scan(frame_bgr):
-    """Run the normal sell scan on an already-captured full frame; returns its JSON payload."""
+def _autoscan_scan(frame_bgr, publish=None, cancel=None):
+    """Run the normal sell scan on an already-captured full frame; returns its JSON payload.
+    ``publish(payload)`` receives the provisional payload (fast first look) before the final one is
+    returned; ``cancel()`` stops the pending certification when a newer view arrived."""
     with app.app_context():
-        return _sell_scan_inner(frame_bgr=frame_bgr, lean=True).get_json()
+        return _sell_scan_inner(frame_bgr=frame_bgr, lean=True, publish=publish, cancel=cancel).get_json()
 
 
 def _load_settings():
@@ -2858,7 +2889,7 @@ def _load_settings():
 
 import autoscan  # noqa: E402  (needs app + the helpers above)
 autoscanner = autoscan.AutoScanner(_autoscan_scan, _load_settings,
-                                   busy_fn=lambda: _scan_state['running'],
+                                   busy_fn=lambda: _scan_state['running'], progressive=True,
                                    collect_dir=os.path.join(DATA, 'scenes', 'live'))
 app.register_blueprint(autoscan.make_blueprint(
     autoscanner, _load_settings, lambda s: save_json(SETTINGS_PATH, s)))

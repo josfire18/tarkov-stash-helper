@@ -8,7 +8,9 @@ context and puts the result into the payload as ``advice``.
 Rules
 -----
 * Only identified items count.  An *uncertain* identification is never ranked as treasure and
-  never suggested for dropping.
+  never suggested for dropping.  A *provisional* one (fast first look of a progressive scan,
+  certification pending) may be listed as a grab, flagged ``provisional``, but no drop is ever
+  planned for it until the final result replaces it.
 * grab  = detections in ``loot`` / ``container_window`` regions, valued per slot as the better of
   the trader's net and (when the item may be sold on the flea) the flea net after the fee.  Items
   needed for an open quest / hideout upgrade come first, flagged "Quest" / "Hideout", whatever they
@@ -72,7 +74,9 @@ def rank_grab(dets, id_to_item, protected, any_of_ids, settings, ctx, top_n=DEFA
     """The loot worth taking, best first (see module doc)."""
     quest, rest = [], []
     for d in dets:
-        if d.get('role') not in LOOT_ROLES or d.get('uncertain'):
+        # a provisional read (fast first look, certification pending) may be ranked, flagged;
+        # an uncertain one never counts
+        if d.get('role') not in LOOT_ROLES or (d.get('uncertain') and not d.get('provisional')):
             continue
         item = id_to_item.get(d['item_id'])
         if not item or _unpriced(item, d.get('category')):
@@ -85,6 +89,8 @@ def rank_grab(dets, id_to_item, protected, any_of_ids, settings, ctx, top_n=DEFA
         per_slot = value / slots
         flag = need_flag(d['item_id'], protected, any_of_ids)
         e = _entry(d, item, flag, value, round(per_slot), slots)
+        if d.get('provisional'):
+            e['provisional'] = True
         if flag:
             e['why'] = 'Needed for a quest' if flag == 'Quest' else 'Needed for the hideout'
             quest.append(e)
@@ -130,6 +136,8 @@ def plan_drop(grab, grids, own_dets, id_to_item, protected, any_of_ids, settings
     if not grab:
         return [], ''
     best = grab[0]
+    if best.get('provisional'):
+        return [], 'checking items...'                          # no swap for an unverified read
     w, h = best['w'], best['h']
     cand_grids = [g for g in grids if g.get('role') in DROP_ROLES and g.get('rows') and g.get('cols')]
     if not cand_grids:

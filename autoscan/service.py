@@ -45,6 +45,7 @@ MESSAGES = {
     'raid_inventory': 'Raid inventory open - live view in raid is off (Settings > Live)',
     'settling': 'Inventory found - waiting for it to settle',
     'scanning': 'Scanning...',
+    'verifying': 'First look ready - verifying items...',
     'scanned': 'Stash scanned',
     'busy': 'Another scan is running',
     'failed': 'Last scan failed',
@@ -64,8 +65,14 @@ def _below_normal_priority():
 
 class AutoScanner:
     def __init__(self, scan_fn, get_settings, busy_fn=None, win32=None, capture=None,
-                 detector=None, clock=time.monotonic, wall=time.time, collect_dir=None):
-        self.scan_fn = scan_fn                    # frame_bgr -> sell-scan payload dict
+                 detector=None, clock=time.monotonic, wall=time.time, collect_dir=None, progressive=False):
+        # frame_bgr -> sell-scan payload dict.  With ``progressive`` the scan runs in a worker thread
+        # and is called as ``scan_fn(frame, publish=cb, cancel=fn)``: ``cb(payload)`` publishes a
+        # provisional result (own seq), the return value is the final one (next seq); ``fn()`` turns
+        # true when a newer view superseded the scan, which then raises / returns and is dropped.
+        self.scan_fn = scan_fn
+        self.progressive = progressive
+        self._job = None                          # (thread, cancel Event) of the running progressive scan
         self.get_settings = get_settings
         self.busy_fn = busy_fn or (lambda: False)
         self.win = win32 if win32 is not None else Win32()
@@ -114,6 +121,7 @@ class AutoScanner:
     def stop(self):
         self._stop.set()
         self._wake.set()
+        self._supersede()
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=3)
         self.capture.close()
@@ -227,7 +235,7 @@ class AutoScanner:
         if game.covered_by_us:
             self._set('covered', game=game_info)
             return POLL_IDLE_S
-        if self.busy_fn():
+        if self.busy_fn() and not self.scanning():
             self._set('busy', game=game_info)
             return POLL_IDLE_S
 
@@ -253,6 +261,8 @@ class AutoScanner:
         if dec.scan:
             self._scan(res.frame, thumb, now, game_info)
             return POLL_ACTIVE_S
+        if self.scanning() and dec.state in ('scanned', 'settling'):
+            return POLL_ACTIVE_S                  # certification of the current view is still running
         extra = {'detail': self._last_error} if dec.state == 'failed' else {}
         self._set(dec.state, game=game_info, score=round(det.score, 2), **extra)
         if dec.state in ('settling', 'scanned', 'failed', 'raid_inventory'):
@@ -261,10 +271,74 @@ class AutoScanner:
         self._idle_polls += 1
         return POLL_RAID_S if self._idle_polls >= RAID_BACKOFF and not det.menu_chrome else POLL_IDLE_S
 
+    def scanning(self) -> bool:
+        """A progressive scan (first look published, certification pending) is running."""
+        job = self._job
+        return bool(job and job[0].is_alive())
+
+    def _supersede(self):
+        """Cancel the pending certification (a newer view arrived / shutdown) and wait for it."""
+        job = self._job
+        if job is None:
+            return
+        with self._lock:
+            job[1].set()                          # under the lock: a publish in flight is either done or dropped
+        if job[0] is not threading.current_thread():
+            job[0].join(timeout=15)
+        self._job = None
+
+    def _publish(self, payload, frame, t0, game_info, final, cancel=None):
+        payload['timing'] = {'scan_ms': round((time.perf_counter() - t0) * 1e3), 'final': final}
+        with self._lock:
+            if cancel is not None and cancel.is_set():
+                return                            # superseded while the payload was being built
+            self._seq += 1
+            self._last_scan_wall = self.wall()
+            self._result = payload
+            self._frame = frame
+            self._frame_jpeg = None
+        self._set('scanned' if final else 'verifying', game=game_info)
+        with self._cond:
+            self._cond.notify_all()
+
+    def _work(self, frame, cancel, t0, game_info):
+        def publish(payload):
+            if isinstance(payload, dict):
+                self._publish(payload, frame, t0, game_info, False, cancel)
+
+        try:
+            payload = self.scan_fn(frame, publish=publish, cancel=cancel.is_set)
+        except Exception as e:
+            if cancel.is_set():
+                return                            # superseded: not a failure
+            self._fail(f'scan failed: {e}', game_info)
+            return
+        if cancel.is_set():
+            return
+        if not isinstance(payload, dict) or payload.get('error') or payload.get('grid_failed'):
+            self._fail((payload or {}).get('error') or 'stash grid not detected', game_info)
+            return
+        self._publish(payload, frame, t0, game_info, True, cancel)
+
+    def _fail(self, msg, game_info):
+        self.trigger.scan_failed(self.clock())
+        self._last_error = msg
+        self._set('error', detail=msg, game=game_info)
+
     def _scan(self, frame, thumb, now, game_info):
+        t0 = time.perf_counter()
+        if self.progressive:
+            self._supersede()
+            self._set('scanning', game=game_info)
+            self.trigger.scan_started(thumb, now)
+            cancel = threading.Event()
+            th = threading.Thread(target=self._work, args=(frame, cancel, t0, game_info),
+                                  name='autoscan-scan', daemon=True)
+            self._job = (th, cancel)
+            th.start()
+            return
         self._set('scanning', game=game_info)
         self.trigger.scan_started(thumb, now)
-        t0 = time.perf_counter()
         try:
             payload = self.scan_fn(frame)
         except Exception as e:

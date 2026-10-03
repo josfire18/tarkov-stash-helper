@@ -32,6 +32,11 @@
   border-radius: 2px; cursor: pointer; transition: box-shadow .1s, background .1s;
 }
 .tile.check { border-style: dashed; }
+.tile.pending { --acc: var(--faint); border-style: dotted; background: none; animation: pend 1.4s ease-in-out infinite; }
+@keyframes pend { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .tile.pending { animation: none; opacity: .7; } }
+.row.pending { opacity: .7; }
+.row.pending .name { font-style: italic; }
 .tile.skip { --acc: #777; border-width: 1px; border-style: dashed; background: none; cursor: default; }
 .tile.region { --acc: var(--faint); border-width: 1px; border-style: dotted; background: none; cursor: default; pointer-events: none; }
 .tile.region.own { --acc: var(--blue); border-style: solid; opacity: .7; }
@@ -124,11 +129,12 @@ const tileKey = r => r.px + ',' + r.py;
 const OWN_LABEL = { own_rig: 'Tactical rig', own_pockets: 'Pockets', own_backpack: 'Backpack', own_pouch: 'Pouch',
   own_special: 'Special slots', own_other: 'Equipment', loot: 'Loot', unknown: 'Unclear' };
 function classify(results, onYou, adv) {
-  const g = { flea: [], traders: new Map(), none: [], keep: [], check: [], own: onYou || [],
+  const g = { flea: [], traders: new Map(), none: [], keep: [], check: [], pending: [], own: onYou || [],
               grab: (adv && adv.grab) || [], drop: (adv && adv.drop) || [] };
   for (const r of results) {
     if (MONEY.has(r.matched_name)) continue;                 // cash is not something to sell
-    if (r.recommend === 'keep') (r.check || r.uncertain ? g.check : g.keep).push(r);
+    if (r.provisional && r.recommend === 'keep') g.pending.push(r);      // first look, certification pending
+    else if (r.recommend === 'keep') (r.check || r.uncertain ? g.check : g.keep).push(r);
     else if (r.recommend === 'flea') g.flea.push(r);
     else if (!r.trader_name) g.none.push(r);
     else { const k = r.trader_name; if (!g.traders.has(k)) g.traders.set(k, []); g.traders.get(k).push(r); }
@@ -158,6 +164,7 @@ function renderSummary(g, res) {
   const extra = [];
   if (g.keep.length) extra.push(`Keep ${units(g.keep)}`);
   if (g.check.length) extra.push(`Check ${g.check.length}`);
+  if (g.pending.length) extra.push(`Verifying ${g.pending.length}…`);
   if (extra.length) bits.push(`<span class="more">${extra.join(' · ')}</span>`);
   const w = res.warnings && res.warnings[0];
   if (w) bits.push(`<span class="warn" title="${esc(res.warnings.join('\n'))}">${esc(w.length > 60 ? w.slice(0, 58) + '…' : w)}</span>`);
@@ -167,7 +174,7 @@ function renderSummary(g, res) {
 // ---- list -----------------------------------------------------------------------------------
 function rowEl(r, kind, acc) {
   const el = document.createElement('div');
-  el.className = 'row'; el.tabIndex = 0; el.style.setProperty('--acc', acc);
+  el.className = 'row' + (kind === 'pending' || r.provisional ? ' pending' : ''); el.tabIndex = 0; el.style.setProperty('--acc', acc);
   const n = r.count > 1 ? ` <span class="q">×${r.count}</span>` : '';
   if (kind === 'grab' || kind === 'drop') acc = kind === 'grab' ? 'var(--flea)' : 'var(--red)';
   el.style.setProperty('--acc', acc);
@@ -191,8 +198,11 @@ function rowEl(r, kind, acc) {
     amt = rubShort(r.per_slot) + '/slot';
     sub = r.flag ? (r.flag === 'Quest' ? 'Needed for a quest' : 'Needed for the hideout')
                  : `${rubShort(r.value)}${r.slots > 1 ? ' · ' + r.slots + ' slots' : ''}`;
+    if (r.provisional) more.push('Verifying — read from the first look only');
     if (kind === 'drop' && r.why) more.push(esc(r.why));
     if (kind === 'grab' && !r.flag) more.push(`${rubShort(r.value)} for ${r.slots} slot${r.slots === 1 ? '' : 's'}`);
+  } else if (kind === 'pending') {
+    sub = 'Verifying…';
   } else if (kind === 'own') {
     sub = OWN_LABEL[r.role] || 'On you';
     if (r.uncertain) more.push('Not sure which item this is');
@@ -214,7 +224,7 @@ function rowEl(r, kind, acc) {
   if (kind === 'keep' && r.reason) more.push(esc(r.reason));
   const nm = r.matched_name || r.name;
   const tag = kind === 'grab' && r.flag ? `<span class="tag">${esc(r.flag)}</span>` : '';
-  el.innerHTML = `<div class="name">${esc(kind === 'check' ? 'Looks like ' + nm : nm)}${n}${tag}</div>
+  el.innerHTML = `<div class="name">${esc(kind === 'check' || kind === 'pending' ? 'Looks like ' + nm : nm)}${n}${tag}</div>
     <div class="amt num">${esc(amt)}</div>
     <div class="sub">${esc(sub)}</div><div class="sub2">${sub2}</div>
     <div class="more">${more.map(m => `<div>${m}</div>`).join('')}</div>`;
@@ -233,7 +243,7 @@ function groupEl(list, label, rows, kind, acc, total) {
   if (!shown.length) return;
   const h = document.createElement('div');
   h.className = 'group-h'; h.style.setProperty('--acc', acc);
-  h.innerHTML = `<span>${esc(label)}</span><span class="n">${kind === 'check' ? shown.length : units(shown)}</span>`
+  h.innerHTML = `<span>${esc(label)}</span><span class="n">${kind === 'check' || kind === 'pending' ? shown.length : units(shown)}</span>`
     + (total ? `<span class="tot num">${rubShort(sum(shown))}</span>` : '');
   list.append(h);
   for (const r of shown) list.append(rowEl(r, kind, acc));
@@ -251,6 +261,7 @@ function renderList(g) {
   groupEl(list, 'No buyer', g.none, 'none', 'var(--faint)', false);
   groupEl(list, 'Keep', g.keep, 'keep', 'var(--keep)', false);
   groupEl(list, 'Check', g.check, 'check', 'var(--check)', false);
+  groupEl(list, 'Verifying', g.pending, 'pending', 'var(--faint)', false);
   groupEl(list, 'On you', g.own, 'own', 'var(--faint)', false);
   if (!list.children.length) {
     list.innerHTML = `<div class="none">${filterText ? 'No items match' : 'No items found'}</div>`;
@@ -260,6 +271,7 @@ function renderList(g) {
 
 // ---- picture + tiles ------------------------------------------------------------------------
 function tileColor(r) {
+  if (r.provisional) return 'var(--faint)';
   if (r.recommend === 'keep') return r.check || r.uncertain ? 'var(--check)' : 'var(--keep)';
   if (r.recommend === 'flea') return 'var(--flea)';
   if (!r.trader_name) return '#777';
@@ -289,7 +301,7 @@ function renderTiles(res) {
     t.title = g.title || g.role; tiles.append(t);
   }
   for (const [list, cls] of [[adv.grab, 'grab'], [adv.drop, 'drop']]) for (const a of list) {
-    const t = box(a, cls, ''); t.dataset.k = tileKey(a); t.title = (a.name || '') + ' · ' + rubShort(a.per_slot) + '/slot';
+    const t = box(a, cls + (a.provisional ? ' pending' : ''), ''); t.dataset.k = tileKey(a); t.title = (a.name || '') + ' · ' + rubShort(a.per_slot) + '/slot';
     t.style.removeProperty('--acc');
     t.addEventListener('mouseenter', () => hl(t.dataset.k, true, true));
     t.addEventListener('mouseleave', () => hl(t.dataset.k, false, true));
@@ -298,7 +310,7 @@ function renderTiles(res) {
   const done = new Set();
   for (const r of res.results || []) {
     if (r.px == null || (r.recommend === 'keep' && r.drawn === false)) continue;   // a partly kept stack is drawn by its sell row
-    const t = box(r, (r.check || r.uncertain) && r.recommend === 'keep' ? 'check' : '', tileColor(r));
+    const t = box(r, r.provisional ? 'check pending' : (r.check || r.uncertain) && r.recommend === 'keep' ? 'check' : '', tileColor(r));
     t.dataset.k = tileKey(r);
     t.dataset.m = matches(r) ? '' : 'x';
     t.addEventListener('mouseenter', () => hl(t.dataset.k, true, true));
