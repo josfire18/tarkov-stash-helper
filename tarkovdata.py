@@ -70,9 +70,11 @@ FALLBACK_TRADER_NAMES = {
 
 ITEM_OBJECTIVES = ('giveItem', 'findItem', 'plantItem')   # GraphQL's TaskObjectiveItem
 # Cache layout version of tasks_cache.json.  2 = item objectives carry ``items`` (every
-# accepted alternative) next to the legacy ``item`` (the first one).  A cache written
-# before that has no ``schema`` and is re-fetched even when the ETags say "unchanged".
-TASKS_SCHEMA = 2
+# accepted alternative) next to the legacy ``item`` (the first one).  3 = tasks carry
+# ``taskRequirements`` (the prerequisite tasks) and ``factionName`` (BEAR/USEC-only tasks), which
+# the automatic task progress (eftlogs) needs.  A cache written before the current schema is
+# re-fetched even when the ETags say "unchanged".
+TASKS_SCHEMA = 3
 FLEA_KEYS = ('minPlayerLevel', 'enabled', 'sellOfferFeeRate', 'sellRequirementFeeRate',
              'foundInRaidRequired', 'reputationLevels')
 
@@ -372,6 +374,9 @@ def convert_tasks(tasks_body, en_body, trader_names, item_names):
             'id': t.get('id') or tid, 'name': tr(t.get('name'), t.get('normalizedName') or tid),
             'minPlayerLevel': t.get('minPlayerLevel') or 0,
             'kappaRequired': bool(t.get('kappaRequired')),
+            'factionName': t.get('factionName') or 'Any',
+            'taskRequirements': [{'task': {'id': r['task']}, 'status': list(r.get('status') or ())}
+                                 for r in t.get('taskRequirements') or () if r.get('task')],
             'trader': {'name': trader_names.get(t.get('trader')) or '?'},
             'objectives': objectives,
         })
