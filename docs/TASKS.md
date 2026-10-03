@@ -1,7 +1,7 @@
 # Work queue
 
 Orchestrator → worker. One Opus worker at a time (hard problems), Sonnet workers alongside on
-non-overlapping files, orchestrator reviews / tests / merges into `identify-v2` and pushes.
+non-overlapping files, orchestrator reviews / tests / merges into `identify-v2`, pushes, then PRs + merges `identify-v2` → `master` after every landed task.
 Usage window 06:40–11:40 UTC (2026-10-03), target ≈ 20 %/h, checked every ~25 min.
 
 | # | Task | Worker | Status |
