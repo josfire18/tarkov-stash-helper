@@ -289,6 +289,17 @@ def read_strips(strips: list, workers: int = 4, whitelist: str | None = None,
     return out
 
 
+# anchored at the start: the calibre is printed flush with the tile's left edge, while item art
+# further right can read as anything ('a "98g' on a suppressor)
+_CALIBER = re.compile(r'\s*((\d{1,2}\s*g)|(\d+[.,]?\d*\s*[xX×]\s*\d{2})|([.,]\d{2,3}\b))', re.I)
+
+
+def looks_like_caliber(text: str) -> bool:
+    """True for a weapon's bottom-left calibre text ("20ga", "12g", "5.45x39", "9x19", ".366").
+    The label of a narrow gun is cut ("20g")."""
+    return bool(text) and bool(_CALIBER.match(text))
+
+
 def parse_count(text: str) -> int | None:
     """Stack count from bottom-right text ('80', '29', '296/400' -> 296)."""
     m = re.search(r'\d+', text.replace('O', '0'))
@@ -317,6 +328,16 @@ def canon(text: str) -> str:
 
 def canon_nospace(text: str) -> str:
     return canon(text).replace(' ', '')
+
+
+_GLYPH = str.maketrans({'s': '5', 'o': '0', 'i': '1', 'l': '1', 'b': '8', 'z': '2', 'g': '6'})
+
+
+def fold_glyph(text: str) -> str:
+    """Narrow folding of the letter/digit pairs the label font really draws alike (5/S, 0/O,
+    1/l/I, 8/B, 2/Z, 6/G): two short names with the same ``fold_glyph`` cannot be told apart
+    by a read alone ("MPX F5" / "MPX FS")."""
+    return canon_nospace(text).translate(_GLYPH)
 
 
 def fold(text: str) -> str:
@@ -373,7 +394,8 @@ def fuzzy_score(ocr: str, name: str, short: str = '', width: int | None = None) 
         r = canon_nospace(ref)
         if not r:
             continue
-        trunc = len(o) >= (6 if width is None else label_capacity(width) - 1)
+        # (-2: punctuation the canonical form drops, "SCAR-SD" -> "scarsd", still took label room)
+        trunc = len(o) >= (6 if width is None else label_capacity(width) - 2)
         cost = _align(o, r, trunc)
         # junk around the label is free only for names long enough to be unambiguous: a
         # 2-3 letter name ('ME', 'P', 'L1') must not match inside a longer read ('Meds')
