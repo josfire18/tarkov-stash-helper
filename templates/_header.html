@@ -45,6 +45,7 @@ window.TSH = (() => {
     if (!st) { cls = 'bad'; msg = 'App not responding'; }
     else if (!st.enabled) { cls = ''; msg = 'Auto-scan off'; tip = 'Turn it on in Settings.'; }
     else switch (st.state) {
+      case 'starting': case 'disabled': cls = ''; msg = st.state === 'starting' ? 'Starting…' : 'Auto-scan off'; break;
       case 'no_game': cls = ''; msg = 'Tarkov not running'; break;
       case 'minimized': cls = ''; msg = 'Tarkov minimized'; break;
       case 'covered': cls = 'warn'; msg = 'Window covers the game'; tip = 'Move this window off the game.'; break;

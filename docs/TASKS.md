@@ -8,7 +8,7 @@ Usage window 06:40–11:40 UTC (2026-10-03), target ≈ 20 %/h, checked every ~2
 |---|------|--------|--------|
 | 1 | Exact-anchor identification: game font extracted from Unity assets, closed-set label render match, pixel-exact game-render match, self-binding, per-tile cache (`feat/exact`) | Opus | landed 9a41427: 478 tiles certified, 0 certified-wrong; lean 1028/5/28/2 (was 1003/5/53/2). WIP (scan-loop wiring of tile cache) on `feat/exact-wip` |
 | 2 | Auto-scan saves every settled inventory view (lobby + raid) to `data/scenes/live/` as the scene dataset | orchestrator | done (a07af07) |
-| 3 | UI restructure: Live (home) · Needs · Settings. Header clutter gone, no region/build buttons, Needs = quests + hideout (level steppers) + Kappa + pins in one list | Sonnet | paused (pacing), resumes after 1 |
+| 3 | UI restructure: Live (home) · Needs · Settings. Header clutter gone, no region/build buttons, Needs = quests + hideout (level steppers) + Kappa + pins in one list | Sonnet | landed (feat/ui) |
 | 4 | Scene layer `identify/scene.py`: split the screen by landmarks (stash filter toolbar, slot headers, floating windows with title bar + red ✕), grids per region, roles own / loot / stash / container window / picker; picker + occluded cells never scanned | Opus | after 1 |
 | 5 | Live pipeline: incremental scan via tile cache, SSE push, in-raid advice (grab by ₽/slot, quest items, drop cheapest own item when full), scene-filtered sell advice | Opus | after 4 |
 | 6 | Hideout levels read from the hideout screen by the auto-scan | Sonnet | after 3 |
