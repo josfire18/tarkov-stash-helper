@@ -27,6 +27,7 @@ data/cache_map.json
 data/settings.json
 data/keep_list.json
 data/app.log
+data/lifecycle.log
 
 # Keep the data folder itself
 !data/.gitkeep

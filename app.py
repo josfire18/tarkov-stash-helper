@@ -1,5 +1,13 @@
 import os
 import sys
+
+if __name__ == '__main__' and '--watch' in sys.argv:
+    # Watcher mode (lifecycle.py): the few-MB process Windows starts at sign-in that launches the
+    # real app when Tarkov starts.  Dispatched HERE, before the numpy / cv2 / flask imports below,
+    # so it never loads them (also true of the packaged exe: a PyInstaller bundle imports lazily).
+    import lifecycle
+    sys.exit(lifecycle.watch_main(sys.argv[1:]))
+
 import shutil
 import json
 import base64
@@ -23,6 +31,7 @@ import numpy as np
 
 import sellcalc
 import tarkovdata
+import lifecycle    # open/close with the game (stdlib + ctypes only)
 # The sell-advice economics live in sellcalc.py (pure functions); the historical
 # names stay importable from here (test_scan.py scores sell decisions via app.*).
 from sellcalc import (best_trader_price, calc_flea_fee, price_420, flea_block_reason,  # noqa: F401
@@ -782,6 +791,10 @@ def default_settings():
         'skip_traders': ['Ref'],   # Ref pays GP coins, not roubles
         'trader_levels': {},       # e.g. {'Ref': 4} - only Ref's pay rate changes with loyalty level
         'auto_scan': True,  # watch the game passively and scan the stash when it settles (autoscan/)
+        # Open and close with the game (lifecycle.py); changes take effect when settings are saved
+        'start_with_windows': True,  # register the tiny watcher at sign-in + keep it running (False: unregister, stop it)
+        'follow_tarkov': True,       # open when Tarkov starts, close ~15 s after it exits (False: the watcher opens the app once at sign-in and it stays)
+        'show_window_on_game_start': True,  # False: when Tarkov starts the app opens straight to the tray, no window
     }
 
 def default_keep_list():
@@ -1865,12 +1878,14 @@ def calibration_screenshot():
 
 @app.route('/api/settings', methods=['GET'])
 def get_settings():
-    return jsonify(load_json(SETTINGS_PATH, default_settings))
+    # lifecycle keys filled in for settings files saved before they existed
+    return jsonify(lifecycle.with_defaults(load_json(SETTINGS_PATH, default_settings)))
 
 @app.route('/api/settings', methods=['POST'])
 def save_settings():
     settings = request.json
     save_json(SETTINGS_PATH, settings)
+    lifecycle.apply_settings(settings)   # start_with_windows: register/unregister + start/stop the watcher, now
     return jsonify({'ok': True})
 
 @app.route('/api/reset', methods=['POST'])
@@ -2027,7 +2042,8 @@ def update_apply():
         # Give the HTTP response time to flush to the browser before tearing
         # the window/tray down.
         time.sleep(1.5)
-        _shutdown_desktop()
+        # the watcher runs from this same exe file, and updater.bat cannot replace a running exe
+        _shutdown_desktop(stop_watcher=True)
     threading.Thread(target=_delayed_restart, daemon=True).start()
 
     return jsonify({'ok': True, 'restarting': True})
@@ -2423,6 +2439,8 @@ autoscanner = autoscan.AutoScanner(_autoscan_scan, _load_settings,
                                    busy_fn=lambda: _scan_state['running'])
 app.register_blueprint(autoscan.make_blueprint(
     autoscanner, _load_settings, lambda s: save_json(SETTINGS_PATH, s)))
+# GET /api/lifecycle/status, POST /api/lifecycle/show (a second launch by hand brings this window up)
+app.register_blueprint(lifecycle.make_blueprint(_load_settings, lambda: _show_window()))
 
 
 HOST = '127.0.0.1'
@@ -2542,16 +2560,29 @@ def start_refresher():
 # (which has no closure over _run_app's locals) tear the desktop down through
 # the exact same path the tray's Quit menu item uses. Stays all-None when run
 # from source without the desktop shell (e.g. under pytest).
-_desktop = {'window': None, 'tray': None, 'quitting': None}
+_desktop = {'window': None, 'tray': None, 'tray_thread': None, 'quitting': None}
 
 
-def _shutdown_desktop():
+def _show_window():
+    """Bring the window up (tray 'Open', and a second launch by hand via /api/lifecycle/show)."""
+    window = _desktop.get('window')
+    if window is None:
+        raise RuntimeError('no window yet')
+    lifecycle.allow_activation(window)   # a window started with focus=False could not take focus on click
+    window.show()
+
+
+def _shutdown_desktop(stop_watcher=False):
     """
     Tear down the tray + window the same way the tray's Quit action does,
-    then exit the process. Shared by on_quit and the post-update-apply
-    restart so both paths behave identically. When _desktop was never
-    populated (no pywebview window — running windowless from source), this
-    just falls back to os._exit(0).
+    then exit the process. Shared by on_quit, the post-update-apply
+    restart and "Tarkov exited" so all paths behave identically. When
+    _desktop was never populated (no pywebview window — running windowless
+    from source), this just falls back to os._exit(0).
+
+    The watcher (lifecycle.py) is left running - it opens the app again
+    for the next Tarkov launch - unless ``stop_watcher``: the self-update
+    must be able to replace the exe the watcher is running from.
     """
     quitting = _desktop.get('quitting')
     if quitting is not None:
@@ -2561,10 +2592,18 @@ def _shutdown_desktop():
         autoscanner.stop()      # releases the screen duplication
     except Exception:
         pass
+    if stop_watcher:
+        try:
+            lifecycle.stop_watcher()
+        except Exception:
+            pass
     tray = _desktop.get('tray')
     if tray is not None:
         try:
             tray.stop()
+            t = _desktop.get('tray_thread')
+            if t is not None:
+                t.join(1.0)     # let it delete its notification-area icon, or a ghost icon stays until hovered
         except Exception:
             pass
     window = _desktop.get('window')
@@ -2581,9 +2620,16 @@ def _run_app():
     browser tab, so there's no URL for the user to see or navigate to — it
     just looks like a normal desktop app. Closing the window minimizes to
     the tray; Quit from the tray menu actually exits."""
+    import inspect
     import webview
     import pystray
     from icon_asset import load_tray_image
+
+    # Single instance, the startup entry + watcher, and "close when Tarkov exits" (lifecycle.py).
+    # None = a copy is already running; it was told to show its window and this one just leaves.
+    session = lifecycle.begin_app_session(sys.argv[1:], _load_settings, _shutdown_desktop)
+    if session is None:
+        return
 
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=_startup_maintenance, daemon=True).start()
@@ -2591,9 +2637,13 @@ def _run_app():
     start_hotkey_listener()
     autoscanner.start()
 
+    # Started by the watcher (or to the tray): never take the focus from the game, and with
+    # show_window_on_game_start off do not open a window at all.
+    opts = lifecycle.window_kwargs(inspect.signature(webview.create_window).parameters,
+                                   session['quiet'], session['hidden'])
     window = webview.create_window(
         'Tarkov Stash Helper', URL,
-        width=1180, height=860, min_size=(900, 640),
+        width=1180, height=860, min_size=(900, 640), **opts,
     )
 
     quitting = threading.Event()
@@ -2607,12 +2657,23 @@ def _run_app():
         return False  # veto the close — minimize to tray instead
 
     window.events.closing += on_closing
+    window.events.loaded += lambda: lifecycle.allow_activation(window)
 
     def on_open(icon, item):
-        window.show()
+        _show_window()
 
     def on_quit(icon, item):
-        _shutdown_desktop()
+        _shutdown_desktop()      # the watcher stays: it opens the app again at the next Tarkov launch
+
+    def on_quit_stop(icon, item):
+        try:
+            s = _load_settings()
+            s['start_with_windows'] = False
+            save_json(SETTINGS_PATH, s)
+            lifecycle.apply_settings(s)      # unregisters the startup entry and stops the watcher
+        except Exception as e:
+            print(f"[lifecycle] could not turn auto-launch off: {e}")
+        _shutdown_desktop(stop_watcher=True)
 
     tray_icon = pystray.Icon(
         'TarkovStashHelper',
@@ -2621,10 +2682,23 @@ def _run_app():
         menu=pystray.Menu(
             pystray.MenuItem('Open Stash Helper', on_open, default=True),
             pystray.MenuItem('Quit', on_quit),
+            pystray.MenuItem('Quit and stop auto-launch', on_quit_stop),
         ),
     )
+
+    def tray_setup(icon):
+        icon.visible = True
+        if session.get('first_registration'):
+            try:
+                icon.notify('It will now open when Tarkov starts and close when Tarkov exits. '
+                            'Right-click this icon > "Quit and stop auto-launch" to turn that off.',
+                            'Tarkov Stash Helper')
+            except Exception:
+                pass
+
     _desktop['tray'] = tray_icon
-    threading.Thread(target=tray_icon.run, daemon=True).start()
+    _desktop['tray_thread'] = threading.Thread(target=tray_icon.run, args=(tray_setup,), daemon=True)
+    _desktop['tray_thread'].start()
 
     webview.start()  # blocks; owns the main thread
 
