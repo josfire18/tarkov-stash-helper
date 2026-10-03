@@ -20,7 +20,8 @@ import time
 
 from .capture import CaptureManager
 from .detect import InventoryDetector
-from .trigger import Observation, Trigger, thumbnail
+from .collect import SceneCollector
+from .trigger import Observation, Trigger, thumbnail, view_hash
 from .winapi import GAME_EXE, Win32, locate_game
 
 POLL_ACTIVE_S = 0.5          # inventory (or candidate) on screen
@@ -60,7 +61,7 @@ def _below_normal_priority():
 
 class AutoScanner:
     def __init__(self, scan_fn, get_settings, busy_fn=None, win32=None, capture=None,
-                 detector=None, clock=time.monotonic, wall=time.time):
+                 detector=None, clock=time.monotonic, wall=time.time, collect_dir=None):
         self.scan_fn = scan_fn                    # frame_bgr -> sell-scan payload dict
         self.get_settings = get_settings
         self.busy_fn = busy_fn or (lambda: False)
@@ -83,6 +84,8 @@ class AutoScanner:
         self._last_detect_ms = 0.0
         self._last_error = ''
         self._last_grab_ms = 0.0
+        # settled inventory views (lobby + raid) kept as the scene dataset (collect.py)
+        self.collector = SceneCollector(collect_dir) if collect_dir else None
 
     # -- settings ----------------------------------------------------------------------------
     def enabled(self) -> bool:
@@ -189,6 +192,13 @@ class AutoScanner:
         det = self.detector.detect(res.frame)
         self._last_detect_ms = det.ms
         thumb = thumbnail(res.frame) if det.is_inventory else None
+        if (thumb is not None and self.collector is not None
+                and (self.get_settings() or {}).get('collect_scene_frames', True)):
+            try:
+                self.collector.observe(res.frame, view_hash(thumb), in_raid=not det.menu_chrome,
+                                       meta={'monitor': game.monitor.device})
+            except Exception as e:
+                print(f'[collect] {e}')
         dec = self.trigger.observe(Observation(det.is_inventory, det.menu_chrome, thumb, res.blank), now)
         if dec.scan:
             self._scan(res.frame, thumb, now, game_info)

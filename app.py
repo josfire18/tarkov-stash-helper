@@ -2747,7 +2747,8 @@ def _load_settings():
 
 import autoscan  # noqa: E402  (needs app + the helpers above)
 autoscanner = autoscan.AutoScanner(_autoscan_scan, _load_settings,
-                                   busy_fn=lambda: _scan_state['running'])
+                                   busy_fn=lambda: _scan_state['running'],
+                                   collect_dir=os.path.join(DATA, 'scenes', 'live'))
 app.register_blueprint(autoscan.make_blueprint(
     autoscanner, _load_settings, lambda s: save_json(SETTINGS_PATH, s)))
 # GET /api/lifecycle/status, POST /api/lifecycle/show (a second launch by hand brings this window up)
