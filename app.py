@@ -707,6 +707,8 @@ def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None):
         warnings.append(f'Scene analysis failed ({e}); every grid is treated as stash.')
     res = _v2_engine[1].scan(img_bgr, scene)
     warnings.extend(res.warnings)
+    if scene_out is not None and res.regions:
+        scene_out['grids'] = _region_grids(res)
     panels = [{**p.as_grid_dict(), 'strength': p.strength} for p in res.grid.panels]
     if not panels:
         warnings.append('Stash grid not detected — check the capture region covers '
@@ -725,6 +727,17 @@ def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None):
             rec['alternatives'] = [a['name'] for a in (d.evidence.get('alternatives') or ())][:3]
         records.append(rec)
     return records, panels, False
+
+
+def _region_grids(res):
+    """Per scanned panel: its role and every footprint in it (col, row, w, h, empty) - what the
+    raid advice needs to find free room on the player."""
+    out = []
+    for pi, (panel, reg) in enumerate(zip(res.grid.panels, res.regions)):
+        cells = [(it.col, it.row, it.w, it.h, bool(it.empty)) for it in res.items if it.panel == pi]
+        out.append({'panel': pi, 'role': reg.role, 'cols': panel.n_cols, 'rows': panel.n_rows,
+                    'clip_bottom': bool(panel.clip_bottom), 'cells': cells})
+    return out
 
 
 def tesseract_path_override():
@@ -1554,7 +1567,7 @@ def get_protected_plan(keep_list, price_idx):
                 continue
             fir_only = cat.get('id') == 'kappa'
             protected[tid] = {
-                'reason': 'On keep list', 'fir_only': fir_only,
+                'reason': 'On keep list', 'fir_only': fir_only, 'kinds': ['list'],
                 'need': 1, 'fir_need': 1 if fir_only else 0,
                 'why': [f"{cat.get('label') or 'Keep list'}: 1 needed"
                         + (' (Found in Raid)' if fir_only else '')],
@@ -1597,11 +1610,13 @@ def get_protected_plan(keep_list, price_idx):
                     cur['need'] += need
                     cur['fir_need'] += fir_need
                     cur['why'] += why
+                    cur['kinds'] = sorted(set(cur.get('kinds') or ()) | {x['type'] for x in srcs})
                     cur['fir_only'] = cur['need'] == cur['fir_need']
                     continue
                 protected[rec['item_id']] = {
                     'reason': f"Needed: {first} (×{rec['total_needed']}){more}",
                     'fir_only': need == fir_need, 'need': need, 'fir_need': fir_need,
+                    'kinds': sorted({x['type'] for x in srcs}),
                     'why': why[:] if not have else why + [have.lstrip(', ')],
                 }
     except Exception as e:
@@ -2694,7 +2709,7 @@ def sell_scan():
     print(f"[sell_scan] ERROR:\n{tb}")
     return jsonify({'error': str(e), 'traceback': tb, 'image': None, 'results': [], 'grid': None})
 
-def _sell_scan_inner(from_calibration=False, frame_bgr=None):
+def _sell_scan_inner(from_calibration=False, frame_bgr=None, lean=False):
     settings = load_json(SETTINGS_PATH, default_settings)
 
     _scan_state.update({'running': True, 'phase': 'capture',
@@ -2749,21 +2764,32 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
                             '(winget install UB-Mannheim.TesseractOCR)')
 
         print(f"[sell_scan] matches: {len(raw_detections)}")
-        if settings.get('debug_dumps', True):
+        if settings.get('debug_dumps', True) and not lean:    # the live view saves its frames elsewhere
             _save_debug_bundle(img_bgr, panels, raw_detections, 'sell')
 
         # Sell advice covers the stash and open container windows only.  What is on the player
         # (rig / pockets / backpack / pouch), loot and unclear grids are listed apart ("On you").
         on_you = []
+        raid = bool(scene_info.get('in_raid')) or str(scene_info.get('scene') or '').startswith('raid')
+        live_advice = None
+        if raid:           # grab / drop advice from the raw detections; nothing is sold from a raid view
+            try:
+                import liveadvice
+                live_advice = liveadvice.compute_advice(
+                    raw_detections, scene_info.get('grids') or [], id_to_item, protected, any_of,
+                    settings, build_sell_context(settings, prices), scene_info.get('scene'), True)
+            except Exception as e:
+                print(f'[live] raid advice failed: {e}')
+                warnings.append(f'Raid advice failed ({e})')
         if any(d.get('role') for d in raw_detections):
             advice = []
             for d in raw_detections:
-                if d.get('role') in (None, 'stash', 'container_window'):
+                if d.get('role') in (None, 'stash', 'container_window') and not raid:
                     advice.append(d)
                 else:
                     it = id_to_item.get(d['item_id']) or {}
                     on_you.append({'matched_name': it.get('name') or d.get('name'), 'item_id': d['item_id'],
-                                   'count': d.get('count') or 1, 'role': d['role'], 'side': d.get('side'),
+                                   'count': d.get('count') or 1, 'role': d.get('role') or 'unknown', 'side': d.get('side'),
                                    'title': d.get('region_title'), 'uncertain': bool(d.get('uncertain')),
                                    'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph']})
             raw_detections = advice
@@ -2792,9 +2818,12 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
 
         results.extend(keep_results)   # KEEP items always at the end
 
-        buf = BytesIO()
-        img.save(buf, format='JPEG', quality=88)
-        encoded = base64.b64encode(buf.getvalue()).decode()
+        if lean:           # the live view fetches the picture separately (/api/autoscan/frame)
+            encoded = None
+        else:
+            buf = BytesIO()
+            img.save(buf, format='JPEG', quality=88)
+            encoded = base64.b64encode(buf.getvalue()).decode()
         return jsonify({
             'image':       encoded,
             'image_mime':  'image/jpeg',
@@ -2807,6 +2836,7 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
             'scene':       scene_info.get('scene'),
             'regions':     scene_info.get('regions') or [],
             'on_you':      on_you,
+            'advice':      live_advice,
         })
     finally:
         _scan_state.update({'running': False, 'phase': None, 'ts': time.time()})
@@ -2819,7 +2849,7 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
 def _autoscan_scan(frame_bgr):
     """Run the normal sell scan on an already-captured full frame; returns its JSON payload."""
     with app.app_context():
-        return _sell_scan_inner(frame_bgr=frame_bgr).get_json()
+        return _sell_scan_inner(frame_bgr=frame_bgr, lean=True).get_json()
 
 
 def _load_settings():
