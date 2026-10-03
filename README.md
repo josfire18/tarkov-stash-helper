@@ -15,9 +15,15 @@ sent anywhere except public item-price lookups against [tarkov.dev](https://tark
    ```
    winget install UB-Mannheim.TesseractOCR
    ```
-3. Double-click `TarkovStashHelper.exe`. A window opens — no browser, no URL,
-   no console window. Closing the window minimizes it to the system tray;
-   right-click the tray icon to reopen or fully quit.
+3. Double-click `TarkovStashHelper.exe` once. A window opens — no browser, no URL,
+   no console window. From then on it **opens with Tarkov and closes when Tarkov exits**:
+   the first launch registers a tiny watcher (~2 MB, no window) that Windows starts at
+   sign-in; it starts the app when `EscapeFromTarkov.exe` appears, and the app closes
+   itself ~15 s after the game is gone. Closing the window minimizes it to the tray;
+   tray **Quit** closes it until the next Tarkov launch, **Quit and stop auto-launch**
+   (or the Settings toggles `start_with_windows` / `follow_tarkov`) turns that off.
+   Launching the app by hand while Tarkov is not running keeps it open until the game
+   has started and exited.
 4. First run: build the icon database (button in the app) so it can recognize
    items. This pulls the item catalog + icons from tarkov.dev and reads EFT's
    local icon cache if it can find your game install — it can take a few

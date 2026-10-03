@@ -53,8 +53,11 @@ else:
 #   sellcalc          top-level module (sell calculator)             - branch feat/sell
 #   autoscan          package (screen watcher; uses dxcam, else mss) - branch feat/autoscan
 #   dxcam, comtypes   imported lazily inside autoscan; comtypes builds COM wrappers at run time
+#   lifecycle         `app.py --watch` (the Windows-startup watcher) imports it before anything heavy;
+#                     winreg is its only non-obvious import (stdlib, startup registration)
 import importlib.util
 
+hidden += ['lifecycle', 'winreg']
 for mod in ('sellcalc',):
     if os.path.exists(os.path.join(SPECPATH, mod + '.py')):
         hidden.append(mod)

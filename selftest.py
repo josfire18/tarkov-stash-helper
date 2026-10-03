@@ -97,6 +97,32 @@ def run(app_mod) -> dict:
         return 'ok'
     _check(C, 'desktop_shell_imports', desktop_shell)
 
+    def lifecycle_checks():
+        # Everything the watcher / the open-and-close-with-Tarkov logic needs from Windows, without
+        # side effects: the process snapshot, a named mutex + event (throwaway names), a READ of the
+        # startup key (never written here), the command line the startup entry would use.
+        import lifecycle as L
+        win = L.get_win()
+        pids = win.find_pids('definitely-not-running.exe')
+        assert pids == [], pids
+        assert isinstance(win.find_pids('explorer.exe'), list)
+        name = f'Local\\TarkovStashHelperSelftest{os.getpid()}'
+        assert win.create_mutex(name) is False, 'fresh named mutex reported as already existing'
+        assert win.mutex_exists(name), 'named mutex not visible'
+        ev = win.create_event(name + 'Ev')
+        assert win.signal_event(name + 'Ev') and win.wait(ev, 0), 'named event round trip failed'
+        cmd = L.run_command()
+        assert cmd.endswith('--watch') and (not report['frozen'] or sys.executable in cmd), cmd
+        assert set(L.DEFAULTS) <= set(app_mod.default_settings()), 'lifecycle keys missing from default_settings()'
+        client = app_mod.app.test_client()
+        r = client.get('/api/lifecycle/status')
+        assert r.status_code == 200, r.status_code
+        st = r.get_json()
+        assert {'registered', 'watcher_running', 'game_running', 'follow_tarkov', 'started_with_tarkov'} <= set(st), st
+        return {'run_command': cmd, 'registered': L.is_registered(), 'status': st,
+                'memory': win.memory()}
+    _check(C, 'lifecycle', lifecycle_checks)
+
     def optional_modules():
         import importlib
         out = {}
