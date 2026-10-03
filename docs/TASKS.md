@@ -29,3 +29,11 @@ Usage window 06:40–11:40 UTC (2026-10-03), target ≈ 20 %/h, checked every ~2
 - 10. Rig / backpack / pocket cells (different border style) scanned so "On you" and in-raid Drop advice see your own items. — landed on `feat/own-grids` (identify/owngrid.py)
 - 11. Task 6 (hideout levels from the hideout screen). — next window
 - 12. Rebuild exe + GitHub release. — orchestrator, ~11:15 UTC
+
+## Status at 11:00 UTC 2026-10-03 (end of window)
+Landed this window: exact anchors (#4), UI Live·Needs·Settings (#5), scene layer (#6), live pipeline + raid advice (#7), progressive scans + taskbar icon (#8), v0.4.0 release (#9), own rig/pockets/backpack grids (#10), lean path 0 confidently-wrong on its eval (this PR).
+Next window, in order:
+1. Re-run scripts/accuracy_report.py in the MAIN checkout (with learned_icons/fonts) to confirm 0 wrong at the higher coverage; push certification coverage up (the remaining "Check" buckets).
+2. Verify scene + raid advice on real raid frames from data/scenes/live/ (collected while playing).
+3. Hideout levels read from the hideout screen (task 11).
+4. First-look latency: certification is 55–70 % of a cold view.
