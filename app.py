@@ -782,6 +782,8 @@ def default_settings():
         'skip_traders': ['Ref'],   # Ref pays GP coins, not roubles
         'trader_levels': {},       # e.g. {'Ref': 4} - only Ref's pay rate changes with loyalty level
         'auto_scan': True,  # watch the game passively and scan the stash when it settles (autoscan/)
+        'ignore_task_items': False,     # never hold items back for tasks / Kappa: flea vs trader only
+        'ignore_hideout_items': False,  # never hold items back for hideout upgrades
     }
 
 def default_keep_list():
@@ -1407,12 +1409,19 @@ def get_protected_plan(keep_list, price_idx):
     no single-item need claims.
     """
     protected, any_of = {}, []
+    settings = load_json(SETTINGS_PATH, default_settings)
+    # "Pure money" switches (Settings page): skip whole need sources so every item is routed
+    # to the flea or a trader.  Task items include the Collector (Kappa) and manual task lists.
+    ignore_tasks = bool(settings.get('ignore_task_items'))
+    ignore_hideout = bool(settings.get('ignore_hideout_items'))
     entry_cat = {e['id']: cat
                  for cat in keep_list['categories'] for e in cat['items']}
     mapped, _unmapped = map_keep_entries_to_ids(keep_list, price_idx)
     for tid, entry in mapped.items():
         if not entry.get('acquired'):
             cat = entry_cat.get(entry['id']) or {}
+            if ignore_tasks and cat.get('id') in ('kappa', 'tasks'):
+                continue
             fir_only = cat.get('id') == 'kappa'
             protected[tid] = {
                 'reason': 'On keep list', 'fir_only': fir_only,
@@ -1422,9 +1431,12 @@ def get_protected_plan(keep_list, price_idx):
             }
     try:
         cache = get_tasks(allow_fetch=False)
+        if cache and (ignore_tasks or ignore_hideout):
+            cache = {**cache,
+                     'tasks': [] if ignore_tasks else cache.get('tasks', []),
+                     'hideoutStations': [] if ignore_hideout else cache.get('hideoutStations', [])}
         if cache:
             progress = load_json(PROGRESS_PATH, default_progress)
-            settings = load_json(SETTINGS_PATH, default_settings)
             view = compute_tasks_view(cache, progress,
                                       kappa_only=settings.get('kappa_only_tasks', True),
                                       kinds=('giveItem', 'plantItem'), split_any_of=True)
