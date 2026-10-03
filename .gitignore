@@ -57,3 +57,5 @@ data/learned_icons.json
 data/learned_icons.json.tmp
 data/eftlogs_cache.json
 data/scenes/
+data/fonts/
+data/identify_dino_v2_onnx.npz

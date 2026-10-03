@@ -11,3 +11,4 @@ pywebview
 opencv-python
 numpy
 dxcam
+UnityPy

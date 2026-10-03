@@ -1,12 +1,12 @@
 # Work queue
 
 Orchestrator → worker. One Opus worker at a time (hard problems), Sonnet workers alongside on
-non-overlapping files, orchestrator reviews / tests / merges into `identify-v2` and pushes.
+non-overlapping files, orchestrator reviews / tests / merges into `identify-v2`, pushes, then PRs + merges `identify-v2` → `master` after every landed task.
 Usage window 06:40–11:40 UTC (2026-10-03), target ≈ 20 %/h, checked every ~25 min.
 
 | # | Task | Worker | Status |
 |---|------|--------|--------|
-| 1 | Exact-anchor identification: game font extracted from Unity assets, closed-set label render match, pixel-exact game-render match, self-binding, per-tile cache (`feat/exact`) | Opus | running |
+| 1 | Exact-anchor identification: game font extracted from Unity assets, closed-set label render match, pixel-exact game-render match, self-binding, per-tile cache (`feat/exact`) | Opus | landed 9a41427: 478 tiles certified, 0 certified-wrong; lean 1028/5/28/2 (was 1003/5/53/2). WIP (scan-loop wiring of tile cache) on `feat/exact-wip` |
 | 2 | Auto-scan saves every settled inventory view (lobby + raid) to `data/scenes/live/` as the scene dataset | orchestrator | done (a07af07) |
 | 3 | UI restructure: Live (home) · Needs · Settings. Header clutter gone, no region/build buttons, Needs = quests + hideout (level steppers) + Kappa + pins in one list | Sonnet | paused (pacing), resumes after 1 |
 | 4 | Scene layer `identify/scene.py`: split the screen by landmarks (stash filter toolbar, slot headers, floating windows with title bar + red ✕), grids per region, roles own / loot / stash / container window / picker; picker + occluded cells never scanned | Opus | after 1 |
