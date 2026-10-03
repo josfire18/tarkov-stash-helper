@@ -47,6 +47,7 @@ from .grid import GridResult, detect_grid
 from .match import Cand, Tile, normalize_tile, stage1
 from .match import enable_torch as match_enable_torch, disable_torch as match_disable_torch
 from .segment import segment_panel
+from . import verify as verify_mod
 
 # fusion weights (tuned on data/eval/stash1.truth.full.json, see test_scan.py --score)
 W_RES = 1.0
@@ -67,6 +68,9 @@ LEARN_DISTINCT = 2.0       # learn only if every different look-alike is at leas
 LEARN_CONFIRMATIONS = 2    # independent confirmations before a learned name is used
 TWIN_GAP_OK = 2.0          # fused-score lead that settles same-label twins by picture (see docs/accuracy.md)
 TWIN_GAP_OK_RES = 6.0      # ...when the picture score is the residual alone (no DINO: colour variants differ by little)
+TWIN_GAP_BIG = 3.0         # a label-twin lead this large stands unless the difference pixels object
+TWIN_GAP_BIG_RES = 6.0     # ...on residual alone
+PAIR_OK = 0.7              # verify.pair ratio that confirms a label-twin choice with any positive lead
 LABEL_VERIFIED_CONF = 0.97  # exact, unambiguous label read of an item that fits the footprint
 WEAPON_SURE_CONF = 0.95    # certainly a gun (guns are skipped, the exact gun does not matter)
 # logistic calibration of the reported confidence: p = sigmoid(b + sum(w * feature)); fitted by
@@ -233,7 +237,7 @@ class Engine:
 
     # ------------------------------------------------------------------
     def _use_dino(self) -> bool:
-        return bool(self.s.use_dino and dino_mod.available(self.s.device))
+        return bool(self.s.use_dino and dino_mod.available(self.s.device, self.s.dino_backend))
 
     def _use_ocr(self) -> bool:
         return bool(self.s.use_ocr and ocr_mod.tesseract_available())
@@ -345,31 +349,36 @@ class Engine:
         if not q_imgs:
             return
         qe = dino_mod.embed(q_imgs)
-        direct_rows, fly_imgs, fly_keys = [], [], []
+        direct_rows, fly_keys, tile_key = [], [], {}
         for i in q_idx:
             tile = work[i]['tile']
             for c in work[i]['top']:
                 if c.rot == 0 and not tile.clip:
                     direct_rows.append(c.row)
                     continue
-                full = self.cat.full_icon(c.row)
-                if full is None:
-                    continue
-                bg = TINT.get(str(self.cat.tint[c.row]), TINT['default'])
-                comp = dino_mod.composite_icon(full, bg, c.rot)
-                if tile.clip:
-                    vis = int(round(tile.vis_rows / 32.0 * 64.0))
-                    comp = comp[:vis] if tile.clip == 'bottom' else comp[-vis:]
-                fly_imgs.append(dino_mod.blank_bands(comp, bg, SLOT, tile.clip))
-                fly_keys.append((i, c.row, c.rot))
+                k = (c.row, c.rot) if not tile.clip else (c.row, c.rot, tile.clip, int(tile.vis_rows))
+                tile_key[(i, c.row, c.rot)] = k
+                fly_keys.append(k)
+
+        def make(k):
+            full = self.cat.full_icon(k[0])
+            if full is None:
+                return None
+            bg = TINT.get(str(self.cat.tint[k[0]]), TINT['default'])
+            comp = dino_mod.composite_icon(full, bg, k[1])
+            clip = k[2] if len(k) > 2 else ''
+            if clip:
+                vis = int(round(k[3] / 32.0 * 64.0))
+                comp = comp[:vis] if clip == 'bottom' else comp[-vis:]
+            return dino_mod.blank_bands(comp, bg, SLOT, clip)
         direct_rows = sorted(set(direct_rows))
         demb = dict(zip(direct_rows, self.store.get(direct_rows))) if direct_rows else {}
-        femb = dict(zip(fly_keys, dino_mod.embed(fly_imgs))) if fly_imgs else {}
+        kemb = self.store.get_keyed(fly_keys, make) if fly_keys else {}
         for qi, i in enumerate(q_idx):
             tile = work[i]['tile']
             sims = {}
             for c in work[i]['top']:
-                v = demb.get(c.row) if (c.rot == 0 and not tile.clip) else femb.get((i, c.row, c.rot))
+                v = demb.get(c.row) if (c.rot == 0 and not tile.clip) else kemb.get(tile_key.get((i, c.row, c.rot)))
                 if v is not None:
                     sims[(c.row, c.rot)] = float(qe[qi] @ v)
             work[i]['sims'] = sims
@@ -522,10 +531,24 @@ class Engine:
         # A build template (anonymous cache render of a modded item) or a poor visual match
         # only says what the footprint looks like: the identity comes from the printed label.
         auth = None
+        gun_doubt = False
         edge = _at_viewport_edge(it, panel, tile)
 
+        top3, seen3 = [], set()
+        for _S, c3, _d, _o in scored:
+            if str(cat.names[c3.row]) not in seen3:
+                seen3.add(str(cat.names[c3.row]))
+                top3.append(int(c3.row))
+            if len(top3) == 3:
+                break
+        pic_gun = len(top3) >= 2 and all(self._weapon_like(r) for r in top3)
+
         def gun_probe() -> bool:
-            # guns print their calibre bottom-left ("20ga", "5.45x39"); parts never do
+            # guns print their calibre bottom-left ("20ga", "5.45x39"); parts never do.  The
+            # calibre can be hidden by art (an MDR's stock): a picture whose three best different
+            # candidates are all guns says gun regardless.
+            if pic_gun:
+                return True
             if it.clipped_bottom or not self._use_ocr():
                 return False
             st = ocr_mod.bottom_strip(img_bgr, it.rect, panel.pitch_x, panel.pitch_y, left=True)
@@ -555,14 +578,15 @@ class Engine:
             me = rd.get(str(cat.ids[c.row]))
             close = False
             if guns and me is not None:
-                # only when the picture cannot tell the part from the gun (incl. its presets)
+                # the label cannot tell the part from the gun; the picture (gun incl. presets)
+                # and the calibre probe must agree, or the answer is uncertain
                 rk = self._twin_ranker(w)([me] + sorted(guns))
                 g_best = max((rk[g] for g in guns if g in rk), default=None)
-                close = g_best is not None and me in rk and rk[me] - g_best < TWIN_GAP_OK
-            if close and gun_probe():
-                auth = self._label_authority(w.get('ocr_all') or [], tile, prefer_weapon=True,
-                                             res_by_row=_best_res_by_id(cat, cands), at_edge=edge,
-                                             twin_rank=self._twin_ranker(w))
+                close = g_best is None or me not in rk or rk[me] - g_best < TWIN_GAP_OK
+                if gun_probe():
+                    gun = max(guns, key=lambda g: rk.get(g, -1e9))
+                    auth = (gun, float(o), 2, None, None)          # unresolved twin -> uncertain
+                # no calibre printed: not a gun, the part the picture chose stands
         item_id = str(cat.ids[c.row])
         name = str(cat.names[c.row])
         evidence = {'residual': round(c.score, 3), 'stage1_best': round(best_res, 3),
@@ -572,9 +596,9 @@ class Engine:
                     'visual': f'{cat.names[c.row]} [{cat.src[c.row]} #{c.row}]'}
         chosen_row = c.row
         twins = 1
-        twin_gap = None
+        twin_gap = twin_rival = None
         if auth is not None:
-            row, sc, twins, twin_gap = auth
+            row, sc, twins, twin_gap, twin_rival = auth
             item_id, name = str(cat.ids[row]), str(cat.names[row])
             evidence.update(ocr_authority=True, ocr=round(sc, 1), source='ocr-authority', twins=twins,
                             twin_gap=None if twin_gap is None else round(twin_gap, 2))
@@ -630,11 +654,11 @@ class Engine:
                 break
         evidence['alternatives'] = alts
         pool_rows, seen_n = [], set()
-        for S2, c2, _, _ in scored:
+        for S2, c2, _, o2 in scored:
             nm = str(cat.names[c2.row])
             if nm not in seen_n:
                 seen_n.add(nm)
-                pool_rows.append((int(c2.row), int(c2.rot), nm, round(S2, 2)))
+                pool_rows.append((int(c2.row), int(c2.rot), nm, round(S2, 2), None if o2 is None else round(o2, 1)))
             if len(pool_rows) == 6:
                 break
         evidence['pool_rows'] = pool_rows
@@ -647,10 +671,25 @@ class Engine:
         z = CALIB['b'] + sum(CALIB[k] * v for k, v in feats.items())
         if item_id == '':
             z -= 4.0
-        twin_ok = twin_gap is not None and twin_gap >= (TWIN_GAP_OK if have_dino else TWIN_GAP_OK_RES)
+        twin_ok = twin_gap is not None and twin_rival is not None and self._twin_settled(
+            img_bgr, it, tile, cands, chosen_row, twin_rival, twin_gap, have_dino, evidence)
         if twins > 1 and not twin_ok:
             z -= 1.5 * math.log(twins)
         conf = _sigmoid(z)
+        if auth is None and text and o is not None and o >= 60:
+            # the label reads as well for a differently named pool item (colour variants, "MP5" on a
+            # receiver and a magazine): the picture alone decides between them, so it must settle it
+            riv = [(chosen_S - S2, c2.row) for S2, c2, _, o2 in scored[1:]
+                   if str(cat.names[c2.row]) != name and o2 is not None and o2 >= o - 0.01]
+            if riv:
+                lead, rrow = min(riv)
+                evidence['label_twin_lead'] = round(lead, 2)
+                if not self._twin_settled(img_bgr, it, tile, cands, c.row, rrow, lead, have_dino, evidence):
+                    gun_doubt = True
+                    evidence['note'] = 'label twins not separated by the picture'
+        if gun_doubt:
+            conf = min(conf, TIE_CONF_CAP)
+            evidence.setdefault('note', 'label names a gun and a part; picture and calibre do not settle it')
         if twins > 1 and not twin_ok:
             # same-label twins the picture did not separate: the choice is a coin flip
             conf = min(conf, TIE_CONF_CAP)
@@ -826,26 +865,25 @@ class Engine:
             return None
         twins = [r for s_, r in sc if s_ >= top - 0.01 or (f0 and self._fold_of.get(r) == f0)]
         W, H = tile.W, tile.H
+        probed, n_before, decided = False, len(twins), False
+        if len({str(cat.cats[r]) == 'weapon' for r in twins}) == 2 and is_gun is not None:
+            # "TOZ-106" / "MP5" name a gun and its parts.  A gun prints its calibre bottom-left, a
+            # part prints none: the probe decides between gun and part.  When it contradicts the
+            # picture's guess the answer is reported uncertain (art can look like text).
+            g = is_gun()
+            if g != bool(prefer_weapon):
+                probed = True
+            prefer_weapon, decided = g, True
+
         def coarse(r):
             weap = str(cat.cats[r]) == 'weapon'
             sizes = self.gun_sizes.get(r) or {(int(cat.tw[r]), int(cat.th[r]))}
             exact = any((a, b) in ((W, H), (H, W)) for a, b in sizes)
-            return (0 if (prefer_weapon and weap) else 1, 0 if exact else 1)
+            pref = (prefer_weapon == weap) if decided else (prefer_weapon and weap)
+            return (0 if pref else 1, 0 if exact else 1)
         c0 = min(coarse(r) for r in twins)
         finalists = [r for r in twins if coarse(r) == c0]
         vis = twin_rank(finalists) if (twin_rank and len(finalists) > 1) else {}
-        kinds = {str(cat.cats[r]) == 'weapon' for r in finalists}
-        probed, n_before = False, len(finalists)
-        if not prefer_weapon and len(kinds) == 2 and is_gun is not None:
-            ranked = sorted(vis.values(), reverse=True)
-            if (len(ranked) < 2 or ranked[0] - ranked[1] < TWIN_GAP_OK) and is_gun():
-                # "TOZ-106" names the gun and its stock and the picture cannot tell: a calibre
-                # printed bottom-left says gun (parts print none)
-                prefer_weapon = True
-                probed, n_before = True, len(finalists)
-                c0 = min(coarse(r) for r in twins)
-                finalists = [r for r in twins if coarse(r) == c0]
-                vis = twin_rank(finalists) if (twin_rank and len(finalists) > 1) else {}
 
         def key(r):
             if vis:
@@ -854,16 +892,53 @@ class Engine:
                 rr = round(res_by_row.get(r, 99.0), 1) if res_by_row else 0.0
             return coarse(r) + (rr, r)
         finalists.sort(key=key)
-        gap = None
+        gap, rival = None, None
         if len(finalists) > 1 and vis and finalists[0] in vis:
             nm0 = str(cat.names[finalists[0]])
-            others = [vis.get(r, -99.0) for r in finalists[1:] if str(cat.names[r]) != nm0]
+            others = [(vis.get(r, -99.0), r) for r in finalists[1:] if str(cat.names[r]) != nm0]
             if others:
-                gap = vis[finalists[0]] - max(others)
+                best_o, rival = max(others)
+                gap = vis[finalists[0]] - best_o
         if probed:
             # the calibre read only breaks the tie: art can look like text, so never "verified"
-            return finalists[0], float(top), max(2, n_before), None
-        return finalists[0], float(top), len(finalists), gap
+            return finalists[0], float(top), max(2, n_before), None, None
+        return finalists[0], float(top), len(finalists), gap, rival
+
+    def _twin_settled(self, img_bgr, it, tile, cands, row_a, row_b, lead, have_dino, evidence) -> bool:
+        """Is the picture's choice between two label twins (``row_a`` chosen, ``row_b`` the best
+        differently named rival, ``lead`` the fused-score lead) safe to report as certain?
+        Measured on 323 real label-twin pairs (docs/accuracy.md): certain when the lead is
+        positive and the difference-only residual clearly agrees (ratio <= PAIR_OK), or the lead
+        is large and the difference pixels do not object (ratio <= 1)."""
+        if lead is None or lead <= 0:
+            return False
+        r = self._pair_ratio(img_bgr, it, tile, cands, row_a, row_b)
+        evidence['pair_ratio'] = None if r is None else round(r, 3)
+        r = 1.0 if r is None else r
+        big = TWIN_GAP_BIG if have_dino else TWIN_GAP_BIG_RES
+        return r <= PAIR_OK or (lead >= big and r <= 1.0)
+
+    def _pair_ratio(self, img_bgr, it, tile, cands, row_a, row_b):
+        """verify.pair over the best-matching template of each item (a game render when the
+        catalog has one), in the orientation stage 1 found; None when either has no template
+        of the tile's footprint or the tile is cut by the viewport."""
+        if it.clipped_top or it.clipped_bottom:
+            return None
+        cat = self.cat
+        best = {}
+        for c2 in cands:
+            k = str(cat.ids[c2.row]) or f'#{c2.row}'
+            if k not in best:
+                best[k] = c2
+        ca = best.get(str(cat.ids[row_a]) or f'#{row_a}')
+        cb = best.get(str(cat.ids[row_b]) or f'#{row_b}')
+        if ca is None or cb is None:
+            return None
+        th = verify_mod.tile_hi(img_bgr, it.rect, tile.W, tile.H)
+        if th is None:
+            return None
+        res = verify_mod.pair(th, cat.full_icon(ca.row), ca.rot, cat.full_icon(cb.row), cb.rot, tile.bg)
+        return None if res is None else res.ratio
 
 
 def _at_viewport_edge(it, panel, tile) -> bool:

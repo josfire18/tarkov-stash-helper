@@ -46,7 +46,7 @@ _ARRS = ('ids', 'names', 'shorts', 'cats', 'tint', 'src')
 _snap: dict = {}
 
 
-def run_clean(img, use_dino, use_ocr):
+def run_clean(img, use_dino, use_ocr, exe=False):
     """One scan from a clean engine state: the learned-icon store and the in-memory renames it
     causes are reset before every image, so a result never depends on which screenshots (or a
     warm-up scan of the same screenshot) were seen before."""
@@ -54,8 +54,9 @@ def run_clean(img, use_dino, use_ocr):
     if key not in T._v2_engines:
         from identify.config import EngineSettings
         from identify.pipeline import Engine
+        kw = dict(dino_backend='onnx', accelerate=False) if exe else {}
         eng = Engine(EngineSettings(use_dino=use_dino, use_ocr=use_ocr,
-                                    extra={'learned_path': T._EVAL_LEARNED}))
+                                    extra={'learned_path': T._EVAL_LEARNED}, **kw))
         eng.learned.data = {}
         T._v2_engines[key] = eng
         _snap[key] = {k: getattr(eng.cat, k).copy() for k in _ARRS}   # before any scan
@@ -104,6 +105,8 @@ def main():
     ap.add_argument('images', nargs='*')
     ap.add_argument('--no-dino', action='store_true')
     ap.add_argument('--no-ocr', action='store_true')
+    ap.add_argument('--exe', action='store_true',
+                    help='what the packaged exe runs: stage 2 on onnxruntime (CPU), stage 1 on numpy')
     ap.add_argument('--json')
     ap.add_argument('--quiet', action='store_true', help='no per-failure lines')
     a = ap.parse_args()
@@ -117,7 +120,7 @@ def main():
         truth, _ = T.load_truth(p, 'full')
         if img is None or truth is None:
             continue
-        dets, dt, _ = run_clean(img, not a.no_dino, not a.no_ocr)
+        dets, dt, _ = run_clean(img, not a.no_dino, not a.no_ocr, a.exe)
         g = grade(truth, dets, cats)
         name = os.path.basename(p)
         cov = (g['correct'] + g['wrong']) / g['n'] if g['n'] else 0.0
