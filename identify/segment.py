@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from .grid import Panel, line_mask, ridge_masks
+from .grid import Panel, frame_memo, line_mask, ridge_masks
 
 
 @dataclass
@@ -186,7 +186,7 @@ def _tight_line_mask(img_bgr: np.ndarray) -> np.ndarray:
     G-R in 6..11 (nominal (84, 81, 73), a little brighter under the top gradient).  The wider box
     the grid finder uses also passes green camo, olive tints and warm browns, which is how a
     backpack's cloth edge became a 'line'."""
-    return line_mask(img_bgr) & _hue_ok(img_bgr)
+    return frame_memo(img_bgr, 'tight', lambda: line_mask(img_bgr) & _hue_ok(img_bgr))
 
 
 RIDGE_WIDTH = 2     # resampled / JPEG lines smear over 2 px; the exact-colour model needs exactly 1
@@ -256,8 +256,8 @@ def edge_model(img_bgr: np.ndarray, panel: Panel, ridge: bool | None = None) -> 
     # exact-colour model misses it and the item would be merged with the empties.  Art cannot
     # fake a line there (one side is flat dark), so on those edges a one-sided step test counts:
     # a thin line clearly brighter than the empty side along the whole edge.
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    hue_ok = _hue_ok(img_bgr)
+    gray = frame_memo(img_bgr, 'gray32', lambda: cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32))
+    hue_ok = frame_memo(img_bgr, 'hue', lambda: _hue_ok(img_bgr))
     empty = {(c, r): cell_is_empty(img_bgr, panel.rect(c, r, 1, 1)) for r in range(nr) for c in range(nc)}
 
     def _step(vertical, pos, a, b, e0, e1):

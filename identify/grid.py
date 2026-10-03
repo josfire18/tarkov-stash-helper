@@ -139,7 +139,31 @@ def line_mask(img_bgr: np.ndarray, tol: int | None = None) -> np.ndarray:
             & ((B - R) >= 2) & ((B - R) <= 24 + t) & ((B - G) <= 16 + t) & ((G - R) >= 0))
 
 
+_FRAME_MEMO: dict = {'img': None, 'vals': {}}
+
+
+def frame_memo(img_bgr: np.ndarray, key, fn):
+    """``fn()`` computed once per *frame object*: the whole-frame masks are asked for again by
+    every panel and every stage of one scan.  The memo holds the latest frame only (so memory is
+    bounded) and compares by identity; the cached arrays are read-only."""
+    if _FRAME_MEMO['img'] is not img_bgr:
+        _FRAME_MEMO['img'], _FRAME_MEMO['vals'] = img_bgr, {}
+    vals = _FRAME_MEMO['vals']
+    if key not in vals:
+        v = fn()
+        for a in (v if isinstance(v, tuple) else (v,)):
+            if isinstance(a, np.ndarray):
+                a.flags.writeable = False
+        vals[key] = v
+    return vals[key]
+
+
 def ridge_masks(img_bgr: np.ndarray, contrast: int | None = 14, neutral_only: bool = True) -> tuple[np.ndarray, np.ndarray]:
+    return frame_memo(img_bgr, ('ridge', contrast, neutral_only),
+                      lambda: _ridge_masks_raw(img_bgr, contrast, neutral_only))
+
+
+def _ridge_masks_raw(img_bgr: np.ndarray, contrast: int | None = 14, neutral_only: bool = True):
     """Fallback for captures whose lines were resampled (windowed / scaled /
     stretched), where the exact colour no longer survives: neutral-grey 1-2 px
     ridges that stand out from both neighbours.  Returns (horizontal, vertical)
@@ -212,8 +236,26 @@ def _min_gap_pitch(pos: list[float], lo: float = MIN_PITCH, hi: float = MAX_PITC
     return float(np.median(cl))
 
 
+_LATTICE_MEMO: dict = {}
+_LATTICE_MEMO_MAX = 256
+
+
 def _lattice_search(pos: list[float], strength: list[float], hint: float | None,
                     lo: float = MIN_PITCH, hi: float = MAX_PITCH) -> float | None:
+    """Memoised :func:`_lattice_search_raw` (live re-scans feed it the same line positions again
+    and again: a re-scan of an unchanged panel costs nothing)."""
+    key = (tuple(float(v) for v in pos), tuple(float(v) for v in strength), hint, lo, hi)
+    if key in _LATTICE_MEMO:
+        return _LATTICE_MEMO[key]
+    out = _lattice_search_raw(pos, strength, hint, lo, hi)
+    if len(_LATTICE_MEMO) >= _LATTICE_MEMO_MAX:
+        _LATTICE_MEMO.pop(next(iter(_LATTICE_MEMO)))
+    _LATTICE_MEMO[key] = out
+    return out
+
+
+def _lattice_search_raw(pos: list[float], strength: list[float], hint: float | None,
+                        lo: float = MIN_PITCH, hi: float = MAX_PITCH) -> float | None:
     """Pitch whose lattice explains the most line energy.
 
     Score(P) = max over anchor lines of sum_i s_i * exp(-(residual_i / sigma)^2)
@@ -440,7 +482,7 @@ def detect_grid(img_bgr: np.ndarray, pitch_hint: float | None = None,
 
 def _line_masks(img_bgr: np.ndarray, mode: str, contrast):
     if mode == 'strict':
-        m = line_mask(img_bgr)
+        m = frame_memo(img_bgr, "line", lambda: line_mask(img_bgr))
         return m, m
     return ridge_masks(img_bgr, contrast)
 

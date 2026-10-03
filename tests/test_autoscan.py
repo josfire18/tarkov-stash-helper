@@ -297,7 +297,7 @@ class FakeCapture:
 
 
 def make_scanner(frame, scan=None, settings=None, win32=None, busy=None):
-    settings = settings if settings is not None else {'auto_scan': True}
+    settings = settings if settings is not None else {'auto_scan': True, 'live_in_raid': False}
     clock, calls = {'t': 0.0}, []
 
     def scan_fn(f):

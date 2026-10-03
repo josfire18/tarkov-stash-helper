@@ -22,7 +22,7 @@ def tile_key(img_bgr: np.ndarray, rect: tuple, pitch_x: float, pitch_y: float, e
         return None
     crop = np.ascontiguousarray(img_bgr[y:y + h, x:x + w])
     hs = hashlib.blake2b(crop.tobytes(), digest_size=16)
-    hs.update(f'{w}x{h}|{pitch_x:.3f}|{pitch_y:.3f}|{extra}'.encode())
+    hs.update(f'{w}x{h}|{pitch_x:.1f}|{pitch_y:.1f}|{extra}'.encode())   # pitch estimates jitter in the 3rd decimal
     return hs.hexdigest()
 
 

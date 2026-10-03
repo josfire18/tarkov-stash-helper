@@ -61,3 +61,4 @@ data/fonts/
 data/identify_dino_v2_onnx.npz
 data/frames/
 data/scene_*.png
+data/live_frames/

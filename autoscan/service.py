@@ -4,7 +4,7 @@ runs the cheap inventory detector on the passively captured frame and - only whe
 screen has settled - hands the full frame to the app's normal scan function.
 
 Cost rules (Tarkov is main-thread bound; frame drops are the one thing this must not cause):
-  * poll 2 Hz while an inventory is on screen, 1 Hz otherwise, 0.5 Hz after ~30 s of gameplay,
+  * poll 4 Hz while an inventory is on screen (settled = two identical polls, ~0.5 s), 1 Hz otherwise, 0.5 Hz after ~30 s of gameplay,
     one process lookup every 3 s while the game is not running;
   * detection runs on decimated data (autoscan.detect), a few ms per poll;
   * the identify pipeline runs only on a settled, menu-context inventory frame, never in a raid;
@@ -14,9 +14,12 @@ Cost rules (Tarkov is main-thread bound; frame drops are the one thing this must
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import threading
 import time
+
+import cv2
 
 from .capture import CaptureManager
 from .detect import InventoryDetector
@@ -24,7 +27,7 @@ from .collect import SceneCollector
 from .trigger import Observation, Trigger, thumbnail, view_hash
 from .winapi import GAME_EXE, Win32, locate_game
 
-POLL_ACTIVE_S = 0.5          # inventory (or candidate) on screen
+POLL_ACTIVE_S = 0.25         # inventory (or candidate) on screen: live view
 POLL_IDLE_S = 1.0            # menus / gameplay
 POLL_RAID_S = 2.0            # after RAID_BACKOFF idle polls with no menu bar: gameplay
 POLL_NO_GAME_S = 3.0
@@ -39,7 +42,7 @@ MESSAGES = {
     'covered': 'Helper window is covering the game',
     'blank': 'Capture returned black frames',
     'waiting': 'Waiting for stash',
-    'raid_inventory': 'Raid inventory open - not scanned mid-raid',
+    'raid_inventory': 'Raid inventory open - live view in raid is off (Settings > Live)',
     'settling': 'Inventory found - waiting for it to settle',
     'scanning': 'Scanning...',
     'scanned': 'Stash scanned',
@@ -84,6 +87,9 @@ class AutoScanner:
         self._last_detect_ms = 0.0
         self._last_error = ''
         self._last_grab_ms = 0.0
+        self._cond = threading.Condition()        # wakes the SSE streams when seq / state change
+        self._frame = None                         # BGR frame of the last published result
+        self._frame_jpeg = None                    # (seq, bytes) - encoded lazily on first request
         # settled inventory views (lobby + raid) kept as the scene dataset (collect.py)
         self.collector = SceneCollector(collect_dir) if collect_dir else None
 
@@ -93,7 +99,9 @@ class AutoScanner:
 
     def _opts(self) -> dict:
         s = self.get_settings() or {}
-        return {'exe': s.get('auto_scan_exe') or GAME_EXE, 'allow_raid': bool(s.get('auto_scan_in_raid', False))}
+        # Settings > Live "work in raid" (default on); the older auto_scan_in_raid still counts
+        return {'exe': s.get('auto_scan_exe') or GAME_EXE,
+                'allow_raid': bool(s.get('live_in_raid', True) or s.get('auto_scan_in_raid', False))}
 
     # -- public ------------------------------------------------------------------------------
     def start(self):
@@ -118,7 +126,9 @@ class AutoScanner:
         with self._lock:
             st = dict(self._status)
             seq, ts = self._seq, self._last_scan_wall
-        st.update(enabled=self.enabled(), seq=seq, last_scan_ts=ts,
+            scene = (self._result or {}).get('scene')
+            timing = (self._result or {}).get('timing')
+        st.update(scene=scene, timing=timing, enabled=self.enabled(), seq=seq, last_scan_ts=ts,
                   last_scan_age=(self.wall() - ts) if ts else None,
                   message=MESSAGES.get(st.get('state'), ''),
                   backend=self.capture.backend_name, detect_ms=round(self._last_detect_ms, 1),
@@ -129,7 +139,43 @@ class AutoScanner:
         with self._lock:
             if self._result is None or self._seq <= since:
                 return {'ready': False, 'seq': self._seq}
-            return {'ready': True, 'seq': self._seq, 'ts': self._last_scan_wall, **self._result}
+            return {'ready': True, 'seq': self._seq, 'ts': self._last_scan_wall,
+                    'frame_url': f'/api/autoscan/frame?seq={self._seq}', **self._result}
+
+    def frame_jpeg(self, seq=None):
+        """The frame the published result was computed from, JPEG-encoded on first request (the
+        result payload stays small; the browser caches the picture by ``seq``)."""
+        with self._lock:
+            cur, frame = self._seq, self._frame
+            cached = self._frame_jpeg
+        if seq is not None and seq != cur:
+            return cached[1] if cached and cached[0] == seq else None
+        if frame is None:
+            return None
+        if cached and cached[0] == cur:
+            return cached[1]
+        ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            return None
+        data = buf.tobytes()
+        with self._lock:
+            if self._seq == cur:
+                self._frame_jpeg = (cur, data)
+        return data
+
+    def state_key(self) -> tuple:
+        with self._lock:
+            return (self._seq, self._status.get('state'))
+
+    def wait_change(self, seen, timeout: float) -> tuple:
+        """Block until ``(seq, state)`` differs from ``seen`` (or ``timeout``); returns the current
+        pair.  Feeds the SSE stream."""
+        with self._cond:
+            cur = self.state_key()
+            if cur == seen:
+                self._cond.wait(timeout)
+                cur = self.state_key()
+        return cur
 
     # -- loop --------------------------------------------------------------------------------
     def _run(self):
@@ -147,7 +193,11 @@ class AutoScanner:
 
     def _set(self, state: str, **kw):
         with self._lock:
+            changed = self._status.get('state') != state
             self._status = {'state': state, **kw}
+        if changed:
+            with self._cond:
+                self._cond.notify_all()
 
     def _locate(self, now: float, exe: str):
         if self._game is None or now - self._game_ts >= RELOCATE_S:
@@ -214,6 +264,7 @@ class AutoScanner:
     def _scan(self, frame, thumb, now, game_info):
         self._set('scanning', game=game_info)
         self.trigger.scan_started(thumb, now)
+        t0 = time.perf_counter()
         try:
             payload = self.scan_fn(frame)
         except Exception as e:
@@ -227,17 +278,67 @@ class AutoScanner:
             self._last_error = msg
             self._set('error', detail=msg, game=game_info)
             return
+        payload['timing'] = {'scan_ms': round((time.perf_counter() - t0) * 1e3)}
         with self._lock:
             self._seq += 1
             self._last_scan_wall = self.wall()
             self._result = payload
+            self._frame = frame
+            self._frame_jpeg = None
         self._set('scanned', game=game_info)
+        with self._cond:
+            self._cond.notify_all()
 
 
 def make_blueprint(scanner: AutoScanner, get_settings, save_settings):
     """Flask routes: /api/autoscan/status, /api/autoscan/result?since=N, POST /api/autoscan/toggle."""
-    from flask import Blueprint, jsonify, request
+    from flask import Blueprint, Response, jsonify, request
     bp = Blueprint('autoscan', __name__)
+
+    @bp.route('/api/autoscan/frame')
+    def frame():
+        try:
+            seq = int(request.args['seq']) if 'seq' in request.args else None
+        except ValueError:
+            seq = None
+        data = scanner.frame_jpeg(seq)
+        if data is None:
+            return Response(status=404)
+        # the picture of one result never changes: the browser may keep it for good
+        return Response(data, mimetype='image/jpeg',
+                        headers={'Cache-Control': 'private, max-age=31536000, immutable'})
+
+    @bp.route('/api/autoscan/stream')
+    def stream():
+        """Server-Sent Events: one ``data: {"seq": N, "state": "..."}`` event each time the result
+        sequence number or the scanner state changes (and once on connect).  The page then GETs
+        /api/autoscan/result?since=N; polling stays the fallback.  ``max_s`` ends the stream after
+        that many seconds (tests); a ``: ping`` comment every 15 s keeps idle connections open."""
+        try:
+            max_s = float(request.args.get('max_s', 0))
+        except ValueError:
+            max_s = 0.0
+
+        def gen():
+            t_end = time.monotonic() + max_s if max_s > 0 else None
+            seen = None
+            last = time.monotonic()
+            yield 'retry: 2000\n\n'
+            while True:
+                left = 15.0 if t_end is None else min(15.0, t_end - time.monotonic())
+                if left <= 0:
+                    return
+                cur = scanner.wait_change(seen, left) if seen is not None else scanner.state_key()
+                if cur != seen:
+                    seen = cur
+                    st = scanner.status()
+                    yield 'data: ' + json.dumps({'seq': cur[0], 'state': cur[1], 'scene': st.get('scene')}) + '\n\n'
+                    last = time.monotonic()
+                elif time.monotonic() - last >= 15:
+                    yield ': ping\n\n'
+                    last = time.monotonic()
+        return Response(gen(), mimetype='text/event-stream',
+                        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
     @bp.route('/api/autoscan/status')
     def status():

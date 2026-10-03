@@ -38,6 +38,9 @@ window.TSH = (() => {
   };
   T.ago = sec => sec < 90 ? Math.max(0, Math.round(sec)) + ' s ago' : sec < 5400 ? Math.round(sec / 60) + ' min ago' : Math.round(sec / 3600) + ' h ago';
 
+  T.sceneLabel = sc => ({ lobby_gear: 'Lobby · gear', lobby_stash: 'Lobby · stash', raid_inventory: 'Raid · inventory',
+    raid_loot: 'Raid · looting', trader: 'Trader' })[sc] || '';
+
   const pill = document.getElementById('pill'), text = document.getElementById('pill-text');
   function paint() {
     const st = T.status;
@@ -50,10 +53,13 @@ window.TSH = (() => {
       case 'minimized': cls = ''; msg = 'Tarkov minimized'; break;
       case 'covered': cls = 'warn'; msg = 'Window covers the game'; tip = 'Move this window off the game.'; break;
       case 'scanning': case 'busy': cls = 'busy'; msg = 'Scanning…'; break;
-      case 'raid_inventory': cls = 'warn'; msg = 'Raid inventory not scanned'; tip = 'Settings > Scanning > Also scan during a raid.'; break;
+      case 'raid_inventory': cls = 'warn'; msg = 'Raid inventory not scanned'; tip = 'Settings > Live > Work in raid.'; break;
       case 'failed': case 'error': case 'blank': cls = 'bad'; msg = 'Scan failed'; tip = st.detail || st.message || ''; break;
       case 'scanned': if (st.last_scan_ts) msg = 'Updated ' + T.ago(Date.now() / 1000 - st.last_scan_ts); break;
     }
+    const scene = st && T.sceneLabel(st.scene);
+    if (scene && !tip) tip = scene;
+    else if (scene) tip = scene + ' · ' + tip;
     if (st && st.game && !tip) tip = `Tarkov ${st.game.size[0]}×${st.game.size[1]}, capture: ${st.backend || '?'}`;
     pill.className = 'pill ' + cls; text.textContent = msg; pill.title = tip || (st && st.message) || '';
   }
