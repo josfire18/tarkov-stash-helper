@@ -15,26 +15,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 3.12 is what the app is developed and tested on
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
 
+      # Lean release flavour: requirements.txt only - NO torch / transformers (the spec also
+      # excludes them).  See TarkovStashHelper.spec and README "Packaging".
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pytest pyinstaller
+
+      - name: Unit tests
+        run: python -m pytest tests -q
 
       - name: Generate app icon
         run: python icon_asset.py
 
+      # The same spec build.bat uses; it bundles templates/ and identify/assets/
       - name: Build exe
-        run: >
-          pyinstaller --noconfirm --onefile --windowed
-          --name TarkovStashHelper
-          --icon assets\icon.ico
-          --add-data "templates;templates"
-          app.py
+        run: pyinstaller --noconfirm --clean TarkovStashHelper.spec
+
+      # Runs the built exe without opening a window: checks that templates, identify/assets,
+      # the desktop-shell modules and the engine imports survived packaging.
+      - name: Smoke-test the exe
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\TarkovStashHelper.exe -ArgumentList '--selftest','selftest.json' -Wait -PassThru
+          if (Test-Path selftest.json) { Get-Content selftest.json }
+          if ($p.ExitCode -ne 0) { throw "selftest failed (exit code $($p.ExitCode))" }
+          Get-Item dist\TarkovStashHelper.exe | Select-Object Name, Length
 
       - uses: actions/upload-artifact@v4
         with:

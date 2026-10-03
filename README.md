@@ -15,15 +15,21 @@ sent anywhere except public item-price lookups against [tarkov.dev](https://tark
    ```
    winget install UB-Mannheim.TesseractOCR
    ```
-3. Double-click `TarkovStashHelper.exe`. A window opens — no browser, no URL,
-   no console window. Closing the window minimizes it to the system tray;
-   right-click the tray icon to reopen or fully quit.
+3. Double-click `TarkovStashHelper.exe` once. A window opens — no browser, no URL,
+   no console window. From then on it **opens with Tarkov and closes when Tarkov exits**:
+   the first launch registers a tiny watcher (~2 MB, no window) that Windows starts at
+   sign-in; it starts the app when `EscapeFromTarkov.exe` appears, and the app closes
+   itself ~15 s after the game is gone. Closing the window minimizes it to the tray;
+   tray **Quit** closes it until the next Tarkov launch, **Quit and stop auto-launch**
+   (or the Settings toggles `start_with_windows` / `follow_tarkov`) turns that off.
+   Launching the app by hand while Tarkov is not running keeps it open until the game
+   has started and exited.
 4. First run: build the icon database (button in the app) so it can recognize
    items. This pulls the item catalog + icons from tarkov.dev and reads EFT's
    local icon cache if it can find your game install — it can take a few
    minutes the first time and is cached afterward.
-5. Set your capture region/hotkey in Settings, then press the hotkey in-game
-   to scan your stash.
+5. Open your stash with Tarkov running: Auto-scan (below) scans it by itself. Or set a capture
+   region/hotkey in Settings and press the hotkey in-game to scan manually.
 
 Windows may show a SmartScreen warning on first run because the exe isn't
 code-signed — click "More info" → "Run anyway". This is a local, open-source
@@ -31,7 +37,7 @@ tool; check the source in this repo if you want to verify that yourself.
 
 ## Running from source
 
-Requires Python 3.11+.
+Requires Python 3.11+ (developed and tested on 3.12).
 
 ```
 pip install -r requirements.txt
@@ -39,20 +45,127 @@ winget install UB-Mannheim.TesseractOCR
 python app.py
 ```
 
+Optional, for the best accuracy (DINOv2 re-rank, +~1 point) and a GPU-resident stage 1 (about
+2x faster): `pip install -r requirements-dino.txt`, then for an NVIDIA GPU replace the CPU torch
+with a CUDA build, e.g. `pip install torch --index-url https://download.pytorch.org/whl/cu128`.
+The model (`facebook/dinov2-small`, ~88 MB) downloads once into the Hugging Face cache on first
+use. Without a GPU the CPU-only torch still works (same accuracy, ~+0.5 s per scan) but embedding the
+catalog the first time takes ~3 min.
+
+## Packaging
+
+`build.bat` (or `pyinstaller TarkovStashHelper.spec`, which is what CI runs) produces the single
+file `dist\TarkovStashHelper.exe` in an isolated venv. The release exe is the **lean** flavour:
+no torch/transformers, so stage 1 runs on the CPU and DINO is off (the engine degrades by itself;
+measured on 12 labelled screenshots: end-to-end 96.3% vs 97.1%, sell decision 97.0% vs 98.0%),
+and it is ~74 MB. `TarkovStashHelper.exe --selftest [report.json]` checks a built exe without
+opening the window (bundled templates and `identify/assets`, data dir, engine imports). `data/`
+always lives next to the exe, so settings and the item database survive updates.
+
 ## How it works
 
-- `app.py` — Flask backend: screenshot capture (`mss`), stash-grid detection,
-  icon identification (masked NCC template matching against a catalog built
-  from tarkov.dev + EFT's local icon cache), OCR-based label fusion
-  (`pytesseract`) to resolve ambiguous matches, and price/sell-recommendation
-  logic.
-- `icon_cache.py` — reads EFT's local icon cache and visually associates each
-  cached icon with a tarkov.dev item ID.
-- The UI (`templates/`) is served locally and hosted in a native window via
-  `pywebview` — there's no browser tab or URL involved, it just looks like a
-  normal desktop app. A `pystray` tray icon handles minimize/reopen/quit.
-- `test_scan.py` — scoring harness for identification accuracy against
-  labeled screenshots in `data/eval/`.
+Item identification lives in the `identify/` package. (The older masked-NCC engine that used to
+sit inside `app.py` was removed; it is preserved in git history and on the `wip/pre-identify-v2`
+branch.)
+
+1. `identify/grid.py` - finds the stash lattice from the 1 px border line EFT draws around
+   every item (colour range tolerant of the UI's top gradient, ridge fallbacks for
+   JPEG/resampled captures). Returns every panel with its pitch (per axis), all rows/columns
+   and viewport-clipped first/last rows.
+2. `identify/segment.py` - item footprints = cells joined across edges that have *no* border
+   line, so multi-cell items stay whole, identical neighbouring stacks stay separate and
+   rotated items need no special case. Empty cells are detected.
+3. `identify/catalog.py` - one `.npz` template catalog of **every** item (ammo, guns, presets
+   and containers included) from tarkov.dev base images plus EFT's icon cache (re-associated
+   to items on every build; unmatched cache renders are kept as anonymous "build" templates).
+   `data/identify_catalog_v2.npz` is rebuilt automatically when a source changes. The Sell
+   Advisor's **Build Icon DB** button downloads the tarkov.dev base image of every item into
+   `data/tmpl_src/` and then rebuilds this catalog (first run: a few minutes, needs internet).
+4. `identify/match.py` + `ocr.py` + `dino.py` - stage 1 masked pixel residual against
+   same-footprint templates (overlay bands only down-weighted, background measured from the
+   tile), stage 2 DINOv2-small re-rank of the shortlist (optional: needs torch +
+   transformers; the exe ships without them), stage 3 OCR of the printed short name
+   (batched Tesseract, glyph-confusion-aware fuzzy match) which is authoritative for ammo
+   calibres and built weapons.
+5. `identify/pipeline.py` - `scan(image) -> list[Detection]` with footprint, rotation, item id,
+   calibrated confidence, an `uncertain` flag (a tile the catalog cannot explain is flagged,
+   not guessed), per-stage evidence, stack count and Found-in-Raid.
+
+Other pieces: the UI (`templates/`) is served locally and hosted in a native window via `pywebview`, with a
+`pystray` tray icon.
+
+## Auto-scan
+
+Hands-free mode (default on): the app finds `EscapeFromTarkov.exe`, watches its screen, and when you open an
+inventory screen (stash, container window, trader / flea sell screen) and leave it alone for about a second it runs
+the normal sell scan on the **whole frame** - no capture region, no hotkey, no screenshots to send. The sell page
+shows an **Auto** toggle, a status line ("Waiting for stash" / "Inventory found - waiting for it to settle" /
+"Auto: last scan 3 s ago") and refreshes the picture and list by itself when a new result arrives.
+Turn it off with the Auto checkbox on the Sell page, or `"auto_scan": false` in `data/settings.json`
+(`"auto_scan_exe"` overrides the process name, `"auto_scan_in_raid": true` allows scans of the in-raid inventory).
+
+**How it works** (`autoscan/`):
+
+1. `winapi.py` - process -> main window -> monitor (read-only Win32 queries; the 2560x1440 game window on
+   monitor 1 is found even if this app sits on a second monitor). Skips minimised games and frames where this
+   app's own window covers the game.
+2. `capture.py` - passive capture, chosen after reading the Desktop Duplication, Windows.Graphics.Capture, `dxcam`
+   and OBS material: **DXGI Desktop Duplication via `dxcam` is the primary method**, `mss` (GDI) the fallback.
+   Desktop Duplication is pull based (one frame per request, only the game's region is copied) and is what OBS
+   "Display Capture" uses. On Windows 10 DX11 "exclusive fullscreen" runs through Fullscreen Optimisations (a
+   flip-model surface that the DWM still composes), so duplication sees it; Microsoft's docs warn a surface that
+   truly bypasses the DWM can come out black, so every frame is black-checked and after 3 black frames (or an
+   error) the next backend is tried, with the primary retried every 60 s. Windows.Graphics.Capture was
+   rejected: it pushes a callback per composed frame (165/s here) and Microsoft says it is not reliable for
+   exclusive fullscreen either. Measured on this machine (2560x1440 primary, RTX 5080): DXGI 3-7 ms per
+   grab, GDI ~75 ms.
+3. `detect.py` - the cheap detector. It never processes the full frame: line-colour `(84,81,73)` runs are
+   taken from every 4th row / column (decimation keeps 1 px lines; an area filter would erase them), fitted with
+   a lattice `x0 + k*pitch` on both axes, and a frame counts as an inventory when each axis has 4 lattice lines that
+   each run for 2+ cells. A second check looks for the lobby's bottom menu bar (two black hairline rows with lit UI
+   between them): an inventory **without** the bar is the in-raid inventory and is never scanned.
+4. `trigger.py` - state machine: scan only when two consecutive polls are near-identical (stability), the view
+   differs from the last scan (32x32 difference hash, so tooltips and the cursor are ignored but a scroll or tab
+   change is not), at least 3 s after the previous scan; scrolling therefore gives one scan per resting position. A
+   failed scan is retried only after a view change or 30 s.
+5. `service.py` - the below-normal-priority polling thread and the `/api/autoscan/{status,result,toggle}` routes.
+   `app.py` only gained the `auto_scan` setting, a `frame_bgr` argument on `_sell_scan_inner`, and start/stop.
+
+**Cost.** Polling is 2 Hz while an inventory is on screen, 1 Hz otherwise, 0.5 Hz after ~30 s of gameplay and every
+3 s while the game is not running. The thread runs at `THREAD_PRIORITY_BELOW_NORMAL`, the duplication is released when
+the game is gone / the feature is off, and the identify pipeline never runs outside a settled lobby inventory.
+Measured (idle loop at 2 Hz, 2560x1440, dev machine): grab 3 ms + detect 7 ms per poll, ~5 % of one CPU core
+(about 0.3 % of the whole CPU; 0.5 Hz gameplay polling is a quarter of that), ~0.2 % of the GPU's 3D engine.
+Detector per-frame cost: 5 ms on raid frames, 7 ms on inventories (max 15 ms), 720p-1440p.
+Frame-time impact on the game itself needs an elevated PresentMon capture and was not measurable without
+elevation: run `PresentMon --process_name EscapeFromTarkov.exe` with Auto on and off to check your own setup.
+
+**Detector accuracy** (`python scripts/autoscan_eval.py --frames-dir <extracted frames>`): on 1802 frames sampled from
+raid recordings (1440p NVIDIA clips, 1080p captures, Medal clips) there are no false positives on gameplay; the
+only frames it flags are real stash / gear screens that were in the recordings. Recall on the 11 labelled
+screenshots (+ each crop pasted onto a dark 1440p canvas): 17 of 19, the misses being a stash dimmed by a modal
+error dialog and one sparse 1080p screen pasted at the wrong UI scale. The pass also needs the lobby menu bar
+to start a scan, so cropped screenshots without it do not count as "in the stash".
+
+**Anti-cheat stance.** Escape from Tarkov is protected by BattlEye. Auto-scan is passive screen capture of the same
+kind OBS and Discord perform: it reads pixels the Windows compositor has already produced and queries the window
+manager for the game window's rectangle. It does **not** read or write game memory, open the game process,
+inject DLLs or hook anything, simulate input, or move/resize/focus the game window.
+
+## Evaluating / labelling
+
+```
+python -m pytest tests                                        # unit tests (no network, no game data)
+python test_scan.py --score data/eval/stash1.png               # segmentation / identification / sell decision, per category
+python test_scan.py --robustness data/eval/stash1.png          # JPEG / blur / rescale / stretch per stage
+python test_scan.py --prefill data/eval/new.png                # draft truth + contact sheets (crop | predicted icon | name)
+python test_scan.py --relabel data/eval/new.png fixes.json     # apply the corrections you read off the sheets
+python -m identify.calibrate data/eval/new.png                 # refit the confidence calibration
+```
+
+Truth files (`<name>.truth.full.json`) label *every* item with its pixel rectangle and mark
+items you cannot identify from the crop as `"uncertain": true` (excluded from accuracy, still
+counted for segmentation). See `identify/evaltools.py` for the format.
 
 ## Known limitations
 
@@ -60,3 +173,23 @@ python app.py
   Tesseract path are all Windows-specific).
 - OCR accuracy depends on screen resolution/scaling — a native-resolution
   capture of the stash region reads noticeably better than a downscaled one.
+- v2 needs about 50 px/slot or more (1080p UI scale 80%+) and, for JPEG captures, quality 70+;
+  below that the border lines are too degraded to segment reliably.
+- Items released after the last price refresh are not in the catalog until the next refresh
+  (see "Data freshness" below; v2 flags unknown items `uncertain` instead of guessing). Items that share an icon family (dogtags, colour
+  variants hidden under attachments) are flagged too.
+
+## Data freshness
+
+Prices, items, tasks and hideout requirements come from tarkov.dev's static JSON documents
+(`https://json.tarkov.dev/regular/...`, the ones tarkov.dev's own site uses) via `tarkovdata.py`;
+its GraphQL API is only the fallback, then the last good cache (the Sell Advisor then shows the
+prices as stale). While the app runs a background thread checks items/prices every 15 minutes
+(an unchanged data set is a cheap `304 Not Modified`) and tasks/hideout/traders every 3 hours, and
+immediately at startup when a cache is older than that. A refresh never replaces a good cache with
+an empty or partial one. When new item ids appear, their base images are downloaded and the item
+catalog is rebuilt in the background and swapped into the engine (after a running scan finishes) -
+no need to press Build Icon DB again. `GET /api/prices/status` reports the source, age, item count
+and last error; the Sell Advisor header shows the same. `data/tarkovdev_meta.json` holds the ETags
+and bookkeeping (safe to delete).
+

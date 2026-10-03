@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.pyo
 *.pyd
@@ -8,6 +9,7 @@ __pycache__/
 dist/
 build/
 *.spec
+!TarkovStashHelper.spec
 
 # Data — downloaded/generated locally, not committed
 data/icons/
@@ -16,6 +18,8 @@ data/eval/
 data/debug/
 data/prices_cache.json
 data/icon_db.npz
+data/identify_catalog_v2.npz
+data/identify_dino_v2.npz
 data/icon_model.pt
 data/icon_model_meta.json
 data/icon_index.json
@@ -23,6 +27,7 @@ data/cache_map.json
 data/settings.json
 data/keep_list.json
 data/app.log
+data/lifecycle.log
 
 # Keep the data folder itself
 !data/.gitkeep
@@ -31,7 +36,7 @@ data/app.log
 venv/
 .venv/
 env/
-.buildvenv/
+.buildvenv*/
 
 # IDE
 .vscode/
@@ -42,6 +47,13 @@ env/
 .claude/
 data/kappa_wiki.json
 data/tasks_cache.json
+data/tarkovdev_meta.json
 data/progress.json
 data/prestige_wiki.json
 data/eft_hash_status.json
+
+# per-user: cache icons named from confirmed scans
+data/learned_icons.json
+data/learned_icons.json.tmp
+data/eftlogs_cache.json
+data/scenes/

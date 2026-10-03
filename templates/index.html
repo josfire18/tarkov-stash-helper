@@ -405,6 +405,8 @@
     <a href="/" style="display:flex;align-items:center;padding:0 16px;font-size:12px;color:#c4a040;text-decoration:none;border-bottom:2px solid #c4a040">Keep List</a>
     <a href="/tasks" style="display:flex;align-items:center;padding:0 16px;font-size:12px;color:#666;text-decoration:none;border-bottom:2px solid transparent">Tasks &amp; Hideout</a>
     <a href="/sell" style="display:flex;align-items:center;padding:0 16px;font-size:12px;color:#666;text-decoration:none;border-bottom:2px solid transparent">Sell Advisor</a>
+    <a href="/live" style="display:flex;align-items:center;padding:0 16px;font-size:12px;color:#666;text-decoration:none;border-bottom:2px solid transparent">Live</a>
+    <a href="/settings" style="display:flex;align-items:center;padding:0 16px;font-size:12px;color:#666;text-decoration:none;border-bottom:2px solid transparent">Settings</a>
   </nav>
   <div class="spacer"></div>
   <label style="font-size:11px;color:#666;margin-right:4px">Prestige</label>
@@ -785,9 +787,7 @@ function startScanProgress(statusEl) {
     try {
       const s = await api('GET', '/api/scan-status');
       if (!s.running) return;
-      if (s.phase === 'match' && s.total) {
-        statusEl.textContent = `Matching cells ${s.done}/${s.total}…`;
-      } else if (s.phase) {
+      if (s.phase) {
         statusEl.textContent = `Scanning — ${s.phase}…`;
       }
     } catch (_) {}
@@ -798,6 +798,7 @@ function stopScanProgress() {
 }
 
 function showScanWarnings(res) {
+  if (res.grid_failed) return;   // grid failure raises its own persistent toast
   if (res.warnings && res.warnings.length) {
     toast('⚠ ' + res.warnings[0], 4000);
   }
@@ -1094,6 +1095,19 @@ function applyScanResult(res) {
   document.getElementById('stash-image-wrap').style.display = 'inline-block';
   const img = document.getElementById('stash-image');
   img.src = 'data:image/png;base64,' + res.image;
+  if (res.grid_failed) {
+    // The captured (un-annotated) frame is still shown so the user can see
+    // what was grabbed — but no detections are trustworthy, so surface the
+    // failure instead of a misleading "Found 0 items".
+    const msg = (res.warnings && res.warnings[0])
+      || 'Stash grid not detected — check the capture region covers the stash, or recalibrate.';
+    document.getElementById('ocr-status').textContent = msg;
+    toast('⚠ ' + msg, 8000);
+    renderDetectionsBar([]);
+    showConfirmBar([]);
+    if (res.ts) lastScanTs = res.ts;
+    return;
+  }
   const acquired = res.detections.filter(d => d.acquired).length;
   const needed = res.detections.filter(d => !d.acquired).length;
   document.getElementById('ocr-status').textContent =
@@ -1114,7 +1128,7 @@ async function pollHotkey() {
       } else {
         applyScanResult(res);
         showScanWarnings(res);
-        toast('✓ Hotkey scan complete');
+        if (!res.grid_failed) toast('✓ Hotkey scan complete');
       }
     }
   } catch (_) {}

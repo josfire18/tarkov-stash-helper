@@ -1,0 +1,172 @@
+{
+ "data": {
+  "5d484fcd654e7668ec2ec322": {
+   "id": "5d484fcd654e7668ec2ec322",
+   "name": "hideout_area_7_name",
+   "normalizedName": "medstation",
+   "levels": [
+    {
+     "id": "5d484fcd654e7668ec2ec322-1",
+     "level": 1,
+     "itemRequirements": [
+      {
+       "id": "5d484fcd654e7668ec2ec322-1-0",
+       "item": "5449016a4bdc2d6f028b456f",
+       "count": 50000,
+       "attributes": {
+        "foundInRaid": false
+       }
+      },
+      {
+       "id": "5d484fcd654e7668ec2ec322-1-1",
+       "item": "5d1b3f2d86f774253763b735",
+       "count": 1,
+       "attributes": {
+        "foundInRaid": false
+       }
+      },
+      {
+       "id": "5d484fcd654e7668ec2ec322-1-2",
+       "item": "5d1b3a5d86f774252167ba22",
+       "count": 1,
+       "attributes": {
+        "foundInRaid": false
+       }
+      },
+      {
+       "id": "5d484fcd654e7668ec2ec322-1-3",
+       "item": "544fb25a4bdc2dfb738b4567",
+       "count": 2,
+       "attributes": {
+        "foundInRaid": false
+       }
+      },
+      {
+       "id": "5d484fcd654e7668ec2ec322-1-4",
+       "item": "62a0a043cf4a99369e2624a5",
+       "count": 1,
+       "attributes": {
+        "foundInRaid": false
+       }
+      }
+     ]
+    },
+    {
+     "id": "5d484fcd654e7668ec2ec322-2",
+     "level": 2,
+     "itemRequirements": [
+      {
+       "id": "5d484fcd654e7668ec2ec322-2-1",
+       "item": "5449016a4bdc2d6f028b456f",
+       "count": 150000,
+       "attributes": {
+        "foundInRaid": false
+       }
+      },
+      {
+       "id": "5d484fcd654e7668ec2ec322-2-3",
+       "item": "5b4335ba86f7744d2837a264",
+       "count": 2,
+       "attributes": {
+        "foundInRaid": false
+       }
+      },
+      {
+       "id": "5d484fcd654e7668ec2ec322-2-4",
+       "item": "59e3606886f77417674759a5",
+       "count": 6,
+       "attributes": {
+        "foundInRaid": false
+       }
+      },
+      {
+       "id": "5d484fcd654e7668ec2ec322-2-6",
+       "item": "5e831507ea0a7c419c2f9bd9",
+       "count": 10,
+       "attributes": {
+        "foundInRaid": false
+       }
+      },
+      {
+       "id": "5d484fcd654e7668ec2ec322-2-7",
+       "item": "619cc01e0a7c3a1a2731940c",
+       "count": 3,
+       "attributes": {
+        "foundInRaid": false
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "5d494a0e5b56502f18c98a02": {
+   "id": "5d494a0e5b56502f18c98a02",
+   "name": "hideout_area_13_name",
+   "normalizedName": "library",
+   "levels": [
+    {
+     "id": "5d494a0e5b56502f18c98a02-1",
+     "level": 1,
+     "itemRequirements": [
+      {
+       "id": "5d494a0e5b56502f18c98a02-1-1",
+       "item": "5449016a4bdc2d6f028b456f",
+       "count": 400000,
+       "attributes": {
+        "foundInRaid": false
+       }
+      },
+      {
+       "id": "5d494a0e5b56502f18c98a02-1-3",
+       "item": "573478bc24597738002c6175",
+       "count": 1,
+       "attributes": {
+        "foundInRaid": true
+       }
+      },
+      {
+       "id": "5d494a0e5b56502f18c98a02-1-4",
+       "item": "573474f924597738002c6174",
+       "count": 2,
+       "attributes": {
+        "foundInRaid": true
+       }
+      },
+      {
+       "id": "5d494a0e5b56502f18c98a02-1-5",
+       "item": "590c639286f774151567fa95",
+       "count": 8,
+       "attributes": {
+        "foundInRaid": false
+       }
+      },
+      {
+       "id": "5d494a0e5b56502f18c98a02-1-6",
+       "item": "590c645c86f77412b01304d9",
+       "count": 5,
+       "attributes": {
+        "foundInRaid": false
+       }
+      },
+      {
+       "id": "5d494a0e5b56502f18c98a02-1-7",
+       "item": "590c651286f7741e566b6461",
+       "count": 5,
+       "attributes": {
+        "foundInRaid": false
+       }
+      },
+      {
+       "id": "5d494a0e5b56502f18c98a02-1-8",
+       "item": "62a09e73af34e73a266d932a",
+       "count": 1,
+       "attributes": {
+        "foundInRaid": true
+       }
+      }
+     ]
+    }
+   ]
+  }
+ }
+}

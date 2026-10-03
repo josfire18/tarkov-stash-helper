@@ -1,0 +1,80 @@
+{
+ "data": {
+  "tasks": {
+   "657315ddab5a49b71f098853": {
+    "id": "657315ddab5a49b71f098853",
+    "name": "657315ddab5a49b71f098853 name",
+    "trader": "54cb57776803fa99248b456e",
+    "minPlayerLevel": 1,
+    "kappaRequired": false,
+    "normalizedName": "first-in-line",
+    "objectives": [
+     {
+      "id": "65732ac3c67dcd96adffa3c7",
+      "type": "visit",
+      "optional": false
+     },
+     {
+      "id": "65817bf31404f3565aef9fec",
+      "type": "giveItem",
+      "count": 3,
+      "optional": false,
+      "foundInRaid": true,
+      "items": [
+       "590c695186f7741e566b64a2",
+       "5751a89d24597722aa0e8db0",
+       "5af0548586f7743a532b7e99"
+      ]
+     }
+    ]
+   },
+   "5979f9ba86f7740f6c3fe9f2": {
+    "id": "5979f9ba86f7740f6c3fe9f2",
+    "name": "5979f9ba86f7740f6c3fe9f2 name",
+    "trader": "58330581ace78e27b8b10cee",
+    "minPlayerLevel": 0,
+    "kappaRequired": true,
+    "normalizedName": "chemical-part-1",
+    "objectives": [
+     {
+      "id": "5979fc2686f77426d702a0f2",
+      "type": "findQuestItem",
+      "count": 1,
+      "optional": false
+     },
+     {
+      "id": "5a3fbbfd86f77459d52a16a8",
+      "type": "visit",
+      "optional": true
+     },
+     {
+      "id": "5979fc5386f77426d702a0f3",
+      "type": "findItem",
+      "count": 1,
+      "optional": false,
+      "foundInRaid": false,
+      "items": [
+       "5780cfa52459777dfb276eb1"
+      ]
+     },
+     {
+      "id": "5979fc7e86f77426d702a0f4",
+      "type": "giveQuestItem",
+      "count": 1,
+      "optional": false
+     },
+     {
+      "id": "5979fc9286f77426d702a0f5",
+      "type": "giveItem",
+      "count": 1,
+      "optional": false,
+      "foundInRaid": false,
+      "items": [
+       "5780cfa52459777dfb276eb1"
+      ]
+     }
+    ]
+   }
+  }
+ }
+}

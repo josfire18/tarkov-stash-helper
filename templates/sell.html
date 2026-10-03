@@ -136,6 +136,12 @@
   }
   .region-chip.unset { color: #e0a030; background: #2a1e00; border-color: #5a3a00; }
 
+  /* ── Auto-scan toggle + status ── */
+  .auto-toggle { display: flex; align-items: center; gap: 5px; font-size: 12px; color: #c8c0b0; cursor: pointer; flex-shrink: 0; }
+  .auto-status { font-size: 11px; color: #6a9a4a; flex-shrink: 0; white-space: nowrap; }
+  .auto-status.warn { color: #e0a030; }
+  .auto-status.off { color: #555; }
+
   /* ── Click-to-highlight ring ── */
   #highlight-ring {
     position: absolute;
@@ -255,6 +261,12 @@
   .trader-name     { color: #c4a040; }
   .reason          { font-size: 10px; color: #4a4a4a; margin-top: 2px; }
   .fir-warn        { color: #e8a33d; font-weight: 600; }
+  .list-at         { color: #7acc40; font-size: 15px; font-weight: 700; }
+  .gain            { color: #7acc40; font-size: 10px; }
+  .rec-queue { background: #1a2418; border: 1px dashed #4a6a3a; color: #8aa07a; }
+  .item-num.queue  { background: #4a6a4a; }
+  .sec-total       { float: right; font-weight: 600; letter-spacing: 0; text-transform: none; }
+  .grand-total     { color: #e0d8c8; font-weight: 700; }
 
   /* ── Summary bar ── */
   .summary-bar {
@@ -339,6 +351,8 @@
     <a class="nav-tab" href="/">Keep List</a>
     <a class="nav-tab" href="/tasks">Tasks &amp; Hideout</a>
     <a class="nav-tab active" href="/sell">Sell Advisor</a>
+    <a class="nav-tab" href="/live">Live</a>
+    <a class="nav-tab" href="/settings">Settings</a>
   </nav>
   <div class="spacer"></div>
   <div class="price-status" style="margin-right:12px">
@@ -362,6 +376,10 @@
     <div class="screenshot-toolbar">
       <button id="btn-scan" class="primary" disabled title="Set stash region first">&#x1F4F7; Scan Stash</button>
       <span id="region-chip" class="region-chip unset">Region: …</span>
+      <label id="auto-wrap" class="auto-toggle" title="Watch the game passively and scan the stash by itself when it settles (no region or hotkey needed)">
+        <input type="checkbox" id="auto-toggle"> Auto
+      </label>
+      <span id="auto-status" class="auto-status"></span>
       <span id="scan-status" title="The scan hotkey works globally (even with the game focused). The stash region is captured from its saved position — no need to alt-tab.">Ready — click Scan Stash or press the scan hotkey</span>
     </div>
     <div class="screenshot-container">
@@ -469,28 +487,43 @@ function updateScanButton() {
 // ---------------------------------------------------------------------------
 // Price cache status
 // ---------------------------------------------------------------------------
+function fmtAge(min) {
+  if (min < 1) return 'just now';
+  return min < 60 ? `${Math.round(min)}m ago` : `${Math.round(min / 60)}h ago`;
+}
+const SOURCE_LABEL = {'json.tarkov.dev': 'tarkov.dev JSON', 'graphql': 'tarkov.dev GraphQL (fallback)'};
+
 async function checkPriceStatus() {
-  const s = await api('GET', '/api/prices/status');
+  let s;
+  try { s = await api('GET', '/api/prices/status'); } catch (e) { return; }
   const dot   = document.getElementById('price-dot');
   const label = document.getElementById('price-label');
+  const src = SOURCE_LABEL[s.source] || s.source || '';
+  const extra = s.catalog_building ? ' · updating item catalog…' : (s.catalog_pending ? ` · ${s.catalog_pending} new items pending` : '');
+  const tip = [s.cached ? `Source: ${src}. Checked every ${s.refresh_minutes} min; last change written ${fmtAge(s.updated_minutes)}.` : '',
+               s.tasks && s.tasks.cached ? `Tasks & hideout: ${s.tasks.count} tasks, checked ${fmtAge(s.tasks.age_minutes)} (${SOURCE_LABEL[s.tasks.source] || s.tasks.source}).` : '',
+               s.error ? `Last refresh failed: ${s.error}` : ''].filter(Boolean).join('
+');
+  label.parentElement.title = tip;
   if (!s.cached) {
     dot.className   = 'price-dot absent';
-    label.textContent = 'No price data — click Refresh';
-  } else if (s.age_minutes > 30) {
+    label.textContent = s.error ? 'No price data (refresh failed) - click Refresh' : 'No price data - click Refresh';
+  } else if (s.stale || s.error) {
     dot.className   = 'price-dot stale';
-    label.textContent = `Prices ${Math.round(s.age_minutes)}m old (stale)`;
+    label.textContent = `Prices ${fmtAge(s.age_minutes)} (${s.stale ? 'stale' : 'last refresh failed'}) · ${s.count.toLocaleString()} items${extra}`;
   } else {
     dot.className   = 'price-dot fresh';
-    label.textContent = `Prices updated ${Math.round(s.age_minutes)}m ago · ${s.count.toLocaleString()} items`;
+    label.textContent = `Prices checked ${fmtAge(s.age_minutes)} · ${s.count.toLocaleString()} items · ${src}${extra}`;
   }
 }
+setInterval(checkPriceStatus, 60000);   // the server refreshes in the background; keep the label honest
 
 document.getElementById('btn-refresh-prices').addEventListener('click', async () => {
   const btn = document.getElementById('btn-refresh-prices');
   btn.disabled = true; btn.textContent = 'Fetching…';
   try {
     const r = await api('POST', '/api/prices/refresh');
-    toast(r.ok ? `✓ Prices refreshed — ${r.count.toLocaleString()} items` : `Error: ${r.error}`);
+    toast(r.ok ? (r.status === 'unchanged' ? `✓ Prices already up to date — ${r.count.toLocaleString()} items` : `✓ Prices refreshed — ${r.count.toLocaleString()} items` + (r.new_items ? `, ${r.new_items} new` : '')) : `Error: ${r.error}`);
   } catch(e) { toast('Failed: ' + e.message); }
   btn.disabled = false; btn.textContent = 'Refresh Prices';
   checkPriceStatus();
@@ -520,7 +553,9 @@ async function updateModelStatus() {
     if (ms.running) {
       const pct = ms.total ? Math.round(100 * ms.done_count / ms.total) : 0;
       el.style.color = '#8ab4f8';
-      el.textContent = `Building icon DB… ${ms.done_count}/${ms.total} (${pct}%)`;
+      el.textContent = ms.phase === 'catalog'
+        ? 'Building item catalog… (about a minute)'
+        : `Downloading item images… ${ms.done_count}/${ms.total} (${pct}%)`;
       startStatusPoll();
       indexReady = false;
     } else if (ms.error) {
@@ -530,12 +565,12 @@ async function updateModelStatus() {
       stopStatusPoll();
     } else if (ms.ready) {
       el.style.color = '#4ade80';
-      el.textContent = `✓ Icon DB ready — ${ms.item_count.toLocaleString()} items`;
+      el.textContent = `✓ Item catalog ready — ${ms.item_count.toLocaleString()} items`;
       indexReady = true;
       stopStatusPoll();
     } else {
       el.style.color = '#f59e0b';
-      el.textContent = 'No icon DB — click Build Icon DB';
+      el.textContent = 'No item catalog — click Build Icon DB';
       indexReady = false;
       stopStatusPoll();
     }
@@ -550,7 +585,7 @@ document.getElementById('btn-build-index').addEventListener('click', async () =>
   try {
     const r = await api('POST', '/api/icons/build-index');
     if (!r.ok) { toast(r.message || 'Failed'); btn.disabled = false; return; }
-    toast('Downloading & indexing icons… check status bar.');
+    toast('Downloading item images & building the catalog… check status bar.');
     startStatusPoll();
   } catch(e) {
     toast('Failed: ' + e.message);
@@ -785,22 +820,31 @@ function buildResultRow(r) {
   row.className = 'result-row';
 
   let badgeClass, badgeText, priceLine;
+  const stackNote = r.keep_n ? ` <span class="fir-warn">keep ${r.keep_n} of this stack</span>` : '';
+  const currency = r.trader_currency && r.trader_currency !== 'RUB' ? ` (paid in ${r.trader_currency})` : '';
   if (r.recommend === 'keep') {
     badgeClass = 'rec-keep'; badgeText = 'KEEP';
-    priceLine  = `<span style="color:#3a9ab4">${r.reason || 'On keep list'} — do not sell</span>`;
+    priceLine  = `<span style="color:#3a9ab4">${r.reason || 'On keep list'}</span>`;
   } else if (r.recommend === 'flea') {
-    badgeClass = 'rec-flea'; badgeText = 'FLEA';
+    badgeClass = r.flea_queue ? 'rec-queue' : 'rec-flea';
+    badgeText  = r.flea_queue ? 'QUEUE' : 'FLEA';
     priceLine  = `
-      List at <span class="price-highlight">${fmt(r.flea_list)}</span>
-      <span class="price-fee">(net ~${fmt(r.flea_net)} after fees)</span>
-      &nbsp;·&nbsp; Trader: ${fmt(r.trader_price)} via <span class="trader-name">${r.trader_name || '—'}</span>`;
+      List at <span class="list-at">${fmt(r.flea_list)}</span>
+      <span class="price-fee">net ${fmt(r.flea_net)} after ${fmt(r.flea_fee)} fee</span>
+      ${r.gain != null && r.trader_price ? `<span class="gain">${r.gain >= 0 ? '+' : ''}${fmt(r.gain)} vs trader</span>` : ''}
+      <span>Trader: ${fmt(r.trader_price)} via <span class="trader-name">${r.trader_name || '—'}</span></span>`;
   } else {
     badgeClass = 'rec-trader'; badgeText = 'TRADER';
     priceLine  = `
       Sell to <span class="trader-name">${r.trader_name || '—'}</span>
-      for <span class="price-highlight">${fmt(r.trader_price)}</span>
+      for <span class="price-highlight">${fmt(r.trader_price)}</span>${currency}
       ${r.flea_list ? `&nbsp;·&nbsp; Flea: ${fmt(r.flea_list)}` : ''}`;
   }
+  const queueNote = r.flea_queue
+    ? `<span class="fir-warn">flea queue - list when one of your ${r.flea_slots} offers frees up</span>` : '';
+  const fleaNote = r.recommend === 'flea' && r.fir === null
+    ? `<span class="fir-warn">⚠ FiR unclear - check the ✓ before listing</span>` : '';
+  const priceNote = r.price_note ? `<span class="fir-warn">${r.price_note}</span>` : '';
 
   // A KEEP row should never carry non_fir_note any more (the backend falls
   // it through to a normal sell rec instead) — this only ever fires on a
@@ -809,17 +853,21 @@ function buildResultRow(r) {
     ? `<span class="fir-warn">⚠ not FIR — can't be handed in</span>`
     : '';
 
-  const numClass = r.recommend === 'keep' ? 'keep' : r.recommend;
+  const numClass = r.recommend === 'keep' ? 'keep' : (r.flea_queue ? 'queue' : r.recommend);
+  const qty = r.count > 1
+    ? ` <span class="qty">×${r.count}</span>${r.total ? ` <span class="price-fee">= ${fmt(r.total)}</span>` : ''}`
+    : '';
+  const unsure = r.uncertain ? ` <span class="fir-warn">check</span>` : '';
   row.innerHTML = `
     <div class="item-num ${numClass}">${r.num}</div>
     <div>
-      <div class="item-name">${r.matched_name}</div>
+      <div class="item-name">${r.matched_name}${qty}${unsure}</div>
       <div class="match-text">${r.score}% match</div>
     </div>
     <div class="rec-badge ${badgeClass}">${badgeText}</div>
     <div></div>
     <div class="price-line" style="grid-column:2/4">${priceLine}</div>
-    <div class="reason">${firHint} ${r.reason || ''}</div>`;
+    <div class="reason">${firHint} ${queueNote} ${fleaNote} ${priceNote} ${stackNote} ${r.recommend === 'keep' ? '' : (r.reason || '')}</div>`;
 
   // Tint the item-num chip and rec-badge with the trader's accent colour so
   // the panel visually batches by trader the same way the annotated
@@ -870,9 +918,11 @@ function renderResults(results) {
     return;
   }
 
-  // Bucket into per-trader groups, a flea group, and a keep group.
+  // Bucket into per-trader groups, a flea group (offers that fit the player's
+  // slots), the flea queue (beyond the slots), and a keep group.
   const traderGroups = new Map();   // trader name -> items[]
   const fleaItems = [];
+  const queueItems = [];
   const keepItems = [];
   for (const r of filtered) {
     if (r.recommend === 'trader') {
@@ -880,61 +930,66 @@ function renderResults(results) {
       if (!traderGroups.has(key)) traderGroups.set(key, []);
       traderGroups.get(key).push(r);
     } else if (r.recommend === 'flea') {
-      fleaItems.push(r);
+      (r.flea_queue ? queueItems : fleaItems).push(r);
     } else {
       keepItems.push(r);
     }
   }
 
-  // Trader sections ordered by each group's total trader value, descending;
-  // rows within a section ordered by trader_price, descending.
-  const traderSections = [...traderGroups.entries()]
-    .map(([name, items]) => {
-      items.sort((a, b) => (b.trader_price || 0) - (a.trader_price || 0));
-      const total = items.reduce((s, r) => s + (r.trader_price || 0), 0);
-      return { name, items, total };
-    })
-    .sort((a, b) => b.total - a.total);
-
-  fleaItems.sort((a, b) => (b.flea_net || 0) - (a.flea_net || 0));
+  // The server already ordered results for selling (traders in in-game tab
+  // order, then flea offers by margin, then the queue) and numbered the image
+  // badges to match, so keep that order here - re-sorting would desync list and badges.
+  const sum = items => items.reduce((t, r) => t + (r.total || 0), 0);
+  const traderSections = [...traderGroups.entries()].map(([name, items]) => ({
+    name, items, total: sum(items),
+  }));
 
   scroll.innerHTML = '';
+  const addHeader = (html, color) => {
+    const hdr = document.createElement('div');
+    hdr.className = 'section-header';
+    if (color) hdr.style.color = color;
+    hdr.innerHTML = html;
+    scroll.appendChild(hdr);
+  };
 
   for (const sec of traderSections) {
     const color = TRADER_COLORS[sec.name] || DEFAULT_TRADER_COLOR;
-    const hdr = document.createElement('div');
-    hdr.className = 'section-header';
-    hdr.style.color = color;
-    hdr.textContent = `SELL TO ${sec.name.toUpperCase()}`;
-    scroll.appendChild(hdr);
+    addHeader(`SELL TO ${sec.name.toUpperCase()} · ${sec.items.length} item${sec.items.length === 1 ? '' : 's'}`
+      + `<span class="sec-total">${fmt(sec.total)}</span>`, color);
     for (const r of sec.items) scroll.appendChild(buildResultRow(r));
   }
 
   if (fleaItems.length) {
-    const hdr = document.createElement('div');
-    hdr.className = 'section-header';
-    hdr.textContent = 'SELL ON FLEA';
-    scroll.appendChild(hdr);
+    const slots = fleaItems[0].flea_slots;
+    addHeader(`LIST ON FLEA · ${fleaItems.length}${slots != null ? ' of ' + slots : ''} offers`
+      + `<span class="sec-total">${fmt(sum(fleaItems))} net</span>`);
     for (const r of fleaItems) scroll.appendChild(buildResultRow(r));
   }
 
+  if (queueItems.length) {
+    addHeader(`FLEA QUEUE · list when a slot frees · ${queueItems.length}`
+      + `<span class="sec-total">${fmt(sum(queueItems))} net</span>`, '#8aa07a');
+    for (const r of queueItems) scroll.appendChild(buildResultRow(r));
+  }
+
   if (keepItems.length) {
-    const hdr = document.createElement('div');
-    hdr.className = 'section-header';
-    hdr.textContent = 'KEEP';
-    scroll.appendChild(hdr);
+    addHeader(`KEEP · ${keepItems.reduce((t, r) => t + (r.count || 1), 0)} items`, '#4ad4f0');
     for (const r of keepItems) scroll.appendChild(buildResultRow(r));
   }
 
-  const traderCount = filtered.length - fleaItems.length - keepItems.length;
+  const sellRows = filtered.length - keepItems.length;
   document.getElementById('result-count').textContent = `${filtered.length} items`;
   const summary = document.getElementById('summary-bar');
-  const bits = traderSections.map(s =>
-    `<span style="color:${TRADER_COLORS[s.name] || DEFAULT_TRADER_COLOR}">&#x25CF; ${s.name} &times;${s.items.length}</span>`);
-  if (fleaItems.length) bits.push(`<span class="s-flea">&#x25CF; ${fleaItems.length} flea</span>`);
+  const traderTotal = traderSections.reduce((t, s) => t + s.total, 0);
+  const fleaTotal = sum(fleaItems);
+  const bits = [`<span class="grand-total">Sell now ${fmt(traderTotal + fleaTotal)}</span>`,
+                `<span class="s-trader">traders ${fmt(traderTotal)}</span>`];
+  if (fleaItems.length) bits.push(`<span class="s-flea">${fleaItems.length} flea offers ${fmt(fleaTotal)}</span>`);
+  if (queueItems.length) bits.push(`<span style="color:#8aa07a">queue ${fmt(sum(queueItems))}</span>`);
   if (keepItems.length) bits.push(`<span style="color:#666">&#x25CF; ${keepItems.length} keep</span>`);
-  bits.push(`<span style="color:#444">|</span>`);
-  bits.push(`<span>${fleaItems.length + traderCount} sellable</span>`);
+  bits.push(`<span>${sellRows} sellable</span>`);
+  summary.style.flexWrap = 'wrap';
   summary.innerHTML = bits.join('');
 }
 
@@ -951,6 +1006,18 @@ function applyScan(res) {
   document.getElementById('stash-image-wrap').style.display = 'inline-block';
   const img = document.getElementById('stash-image');
   img.src = 'data:image/png;base64,' + res.image;
+  if (res.grid_failed) {
+    // Captured frame is shown un-annotated; no result is trustworthy, so
+    // surface the failure rather than "0 items found".
+    const msg = (res.warnings && res.warnings[0])
+      || 'Stash grid not detected — check the capture region covers the stash, or recalibrate.';
+    lastGrid = null;
+    allResults = [];
+    renderResults(allResults);
+    document.getElementById('scan-status').textContent = msg;
+    toast('⚠ ' + msg, 8000);
+    return;
+  }
   lastGrid = res.grid || null;
   allResults = res.results || [];
   renderResults(allResults);
@@ -971,9 +1038,7 @@ function startScanProgress() {
     try {
       const s = await api('GET', '/api/scan-status');
       if (!s.running) return;
-      if (s.phase === 'match' && s.total) {
-        status.textContent = `Matching cells ${s.done}/${s.total}…`;
-      } else if (s.phase) {
+      if (s.phase) {
         status.textContent = `Scanning — ${s.phase}…`;
       }
     } catch(_) {}
@@ -994,7 +1059,7 @@ async function runScan() {
     const res = await api('POST', '/api/sell-scan');
     stopScanProgress();
     applyScan(res);
-    if (res.warnings && res.warnings.length) toast('⚠ ' + res.warnings[0], 4000);
+    if (!res.grid_failed && res.warnings && res.warnings.length) toast('⚠ ' + res.warnings[0], 4000);
   } catch(e) {
     stopScanProgress();
     document.getElementById('scan-status').textContent = 'Error: ' + e.message;
@@ -1005,6 +1070,53 @@ async function runScan() {
 }
 
 document.getElementById('btn-scan').addEventListener('click', runScan);
+
+// ---------------------------------------------------------------------------
+// Auto-scan: server-side watcher (autoscan/) scans the settled stash by itself;
+// this polls its status and shows each new result like a manual scan.
+// ---------------------------------------------------------------------------
+let autoSeq = 0;
+let autoLastTs = 0;
+let autoBusyFetch = false;
+const AUTO_WARN = ['no_game', 'minimized', 'covered', 'blank', 'error', 'failed', 'raid_inventory'];
+
+function autoStatusText(st) {
+  if (!st.enabled) return 'Auto off';
+  if (st.state === 'scanned' && st.last_scan_ts) {
+    const age = Math.max(0, Math.round(Date.now() / 1000 - st.last_scan_ts));
+    return `Auto: last scan ${age} s ago`;
+  }
+  const extra = (st.state === 'error' || st.state === 'failed') && st.detail ? ` (${st.detail})` : '';
+  return 'Auto: ' + (st.message || st.state).replace(/\.\.\.$/, '…') + extra;
+}
+
+async function pollAuto() {
+  try {
+    const st = await api('GET', '/api/autoscan/status');
+    const tgl = document.getElementById('auto-toggle');
+    if (document.activeElement !== tgl) tgl.checked = !!st.enabled;
+    const el = document.getElementById('auto-status');
+    el.textContent = autoStatusText(st);
+    el.className = 'auto-status' + (!st.enabled ? ' off' : (AUTO_WARN.includes(st.state) ? ' warn' : ''));
+    el.title = st.game ? `Game ${st.game.size[0]}x${st.game.size[1]} on ${st.game.monitor}; capture: ${st.backend}` : '';
+    if (st.seq > autoSeq && !autoBusyFetch) {
+      autoBusyFetch = true;
+      const res = await api('GET', '/api/autoscan/result?since=' + autoSeq);
+      autoBusyFetch = false;
+      if (res.ready) {
+        autoSeq = res.seq;
+        applyScan(res);
+        document.getElementById('scan-status').textContent += ' (auto)';
+      }
+    }
+  } catch (_) { autoBusyFetch = false; }
+}
+document.getElementById('auto-toggle').addEventListener('change', async e => {
+  await api('POST', '/api/autoscan/toggle', { enabled: e.target.checked });
+  pollAuto();
+});
+setInterval(pollAuto, 1000);
+pollAuto();
 
 // ---------------------------------------------------------------------------
 // Search

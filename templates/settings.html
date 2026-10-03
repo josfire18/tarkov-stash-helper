@@ -1,0 +1,988 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Settings — Tarkov Stash Helper</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='4' r='2.5' fill='none' stroke='%23c4a040' stroke-width='1.5'/%3E%3Crect x='4' y='7' width='24' height='22' rx='4' ry='4' fill='%230d0f10' stroke='%23c4a040' stroke-width='1.5'/%3E%3Cline x1='9' y1='14' x2='23' y2='14' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3Cline x1='9' y1='18' x2='23' y2='18' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3Cline x1='9' y1='22' x2='19' y2='22' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0d0f10; --panel: #131618; --panel-2: #161a1b; --line: #1e1e1e; --line-2: #2a2a2a;
+    --text: #c8c0b0; --strong: #e0d8c8; --dim: #8a8478; --faint: #555;
+    --gold: #c4a040; --green: #8fcc5a; --amber: #e0a030; --red: #e07070; --blue: #5aaae0;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', sans-serif;
+    font-size: 13px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── Nav / Header (same as the other pages) ── */
+  header {
+    background: #161a1b;
+    border-bottom: 1px solid #2a2a2a;
+    padding: 0 16px;
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    flex-shrink: 0;
+    height: 42px;
+    min-width: 0;
+  }
+  .nav-logo {
+    color: var(--gold); font-size: 14px; font-weight: 700;
+    letter-spacing: 1px; text-transform: uppercase;
+    display: flex; align-items: center; padding-right: 20px;
+    border-right: 1px solid #2a2a2a; text-decoration: none; flex-shrink: 0;
+  }
+  .nav-tabs { display: flex; align-items: stretch; padding: 0 12px; overflow-x: auto; min-width: 0; scrollbar-width: none; }
+  .nav-tabs::-webkit-scrollbar { display: none; }
+  .nav-tab {
+    display: flex; align-items: center; padding: 0 16px; font-size: 12px; white-space: nowrap;
+    color: #666; text-decoration: none; border-bottom: 2px solid transparent;
+    transition: color .15s, border-color .15s;
+  }
+  .nav-tab:hover { color: var(--text); }
+  .nav-tab.active { color: var(--gold); border-bottom-color: var(--gold); }
+
+  /* ── Controls ── */
+  button {
+    background: #252a2b; color: var(--text); border: 1px solid #3a3a3a;
+    padding: 6px 14px; cursor: pointer; font-size: 12px; border-radius: 3px;
+    transition: background .15s, border-color .15s; white-space: nowrap; font-family: inherit;
+  }
+  button:hover { background: #2e3335; border-color: #555; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.primary { background: #2a3a1e; border-color: #4a7a2a; color: var(--green); }
+  button.primary:hover { background: #334a22; }
+  button.link { background: none; border: none; padding: 2px 4px; color: var(--faint); font-size: 11px;
+                text-transform: none; letter-spacing: 0; font-weight: 400; }
+  button.link:hover { background: none; color: var(--text); text-decoration: underline; }
+  :focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+
+  input[type=text], input[type=number], select {
+    background: var(--bg); border: 1px solid var(--line-2); color: var(--text);
+    padding: 6px 10px; font-size: 12px; border-radius: 3px; font-family: inherit; max-width: 100%;
+  }
+  input[type=text]:focus, input[type=number]:focus, select:focus { outline: none; border-color: var(--gold); }
+  input[type=number] { width: 96px; }
+  select { cursor: pointer; }
+  input[readonly] { cursor: pointer; }
+
+  /* toggle switch */
+  .switch { position: relative; display: inline-block; width: 38px; height: 20px; flex: none; }
+  .switch input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; margin: 0; cursor: pointer; }
+  .switch .track { position: absolute; inset: 0; background: #252a2b; border: 1px solid #3a3a3a;
+                   border-radius: 11px; transition: background .15s, border-color .15s; pointer-events: none; }
+  .switch .track::after { content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px;
+                          border-radius: 50%; background: #777; transition: transform .15s, background .15s; }
+  .switch input:checked + .track { background: #2a3a1e; border-color: #4a7a2a; }
+  .switch input:checked + .track::after { transform: translateX(18px); background: var(--green); }
+  .switch input:focus-visible + .track { outline: 2px solid var(--gold); outline-offset: 2px; }
+
+  /* ── Page ── */
+  .main { flex: 1; overflow-y: auto; overflow-x: hidden; scroll-behavior: smooth; }
+  .main::-webkit-scrollbar { width: 6px; }
+  .main::-webkit-scrollbar-track { background: var(--bg); }
+  .main::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 3px; }
+
+  .jump {
+    position: sticky; top: 0; z-index: 5; background: var(--bg); border-bottom: 1px solid var(--line);
+    display: flex; gap: 6px; padding: 9px 16px; overflow-x: auto; scrollbar-width: none;
+  }
+  .jump::-webkit-scrollbar { display: none; }
+  .jump a {
+    font-size: 11px; color: #9a9284; text-decoration: none; white-space: nowrap; cursor: pointer;
+    padding: 4px 11px; border: 1px solid var(--line-2); border-radius: 12px; background: var(--panel);
+  }
+  .jump a:hover { color: var(--gold); border-color: #5a4a20; }
+
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 16px 56px; }
+  .page-intro { margin: 16px 0 0; font-size: 12px; color: var(--dim); line-height: 1.5; }
+
+  .section { margin-top: 24px; scroll-margin-top: 54px; }
+  .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+  .section-head h2 {
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.5px; color: var(--gold);
+  }
+  .section-intro { font-size: 11.5px; color: var(--dim); margin: -3px 0 9px; line-height: 1.5; }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; }
+  .card + .card { margin-top: 10px; }
+  .card.hero { border-left: 3px solid var(--gold); background: #15181a; }
+
+  .row {
+    display: flex; align-items: center; justify-content: space-between; gap: 18px;
+    padding: 12px 14px; border-top: 1px solid #1a1d1e; transition: opacity .15s;
+  }
+  .row:first-child { border-top: 0; }
+  .row.dim { opacity: .5; }
+  .row-text { flex: 1 1 260px; min-width: 0; }
+  .row-label { display: block; font-size: 13px; font-weight: 500; color: var(--strong); }
+  .row-help { font-size: 11.5px; color: var(--dim); margin-top: 3px; line-height: 1.45; }
+  .row-ctl { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; max-width: 100%; }
+  .row-ctl .unit { font-size: 11px; color: var(--faint); }
+  .row-ctl button { min-width: 104px; }
+  .row.is-switch { flex-wrap: nowrap; }
+  .row.wide { flex-direction: column; align-items: stretch; gap: 10px; }
+  .row.wide .row-ctl { flex: none; display: block; }
+  .row.is-text .row-ctl { flex: 1 1 280px; }
+  .row.is-text .row-ctl input { width: 100%; }
+
+  .checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 6px 14px; }
+  .check { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text); cursor: pointer; padding: 3px 0; }
+  .check input { width: 15px; height: 15px; accent-color: #4a9a2a; cursor: pointer; flex: none; }
+
+  .note { margin: 0 14px 12px; padding: 7px 11px; border-radius: 3px; font-size: 12px;
+          background: #0e1c20; border: 1px solid #1a4a5a; color: #6ad4ee; }
+  .note[hidden] { display: none; }
+
+  /* statuses */
+  .status-block { padding: 12px 14px; border-top: 1px solid #1a1d1e; }
+  .status-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+  .status-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.2px; color: #6a6055; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 11px; padding: 3px 10px;
+    border-radius: 11px; background: var(--bg); border: 1px solid var(--line-2); color: #9a9284; max-width: 100%;
+  }
+  .chip::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: #3a3a3a; flex: none; }
+  .chip.ok::before   { background: #4a9a2a; }
+  .chip.warn::before { background: #c4902a; }
+  .chip.bad::before  { background: #b03a3a; }
+  .chip.warn { color: var(--amber); }
+  .chip.bad  { color: var(--red); }
+  .kv { display: grid; grid-template-columns: minmax(110px, max-content) 1fr; gap: 4px 14px; font-size: 12px; }
+  .kv dt { color: var(--dim); }
+  .kv dd { color: var(--text); overflow-wrap: anywhere; min-width: 0; }
+  .kv dd.bad { color: var(--red); }
+  .muted { color: var(--faint); font-size: 11.5px; }
+  .line { font-size: 11.5px; margin-top: 6px; color: var(--dim); min-height: 15px; overflow-wrap: anywhere; }
+  .line.ok { color: #6a9a4a; }
+  .line.warn { color: var(--amber); }
+  .line.bad { color: var(--red); }
+  .line a { color: var(--blue); }
+
+  code { background: var(--bg); padding: 1px 6px; border-radius: 2px; font-size: 11.5px; }
+
+  /* ── Toast ── */
+  #toast {
+    position: fixed; bottom: 24px; right: 24px; max-width: calc(100vw - 48px);
+    background: #161a1b; border: 1px solid #3a3a3a; padding: 8px 14px; border-radius: 4px;
+    font-size: 12px; opacity: 0; transition: opacity .3s; z-index: 2000; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+  #toast.ok { border-color: #3a6a22; color: var(--green); }
+  #toast.bad { border-color: #7a2a2a; color: var(--red); }
+
+  .loading { padding: 40px 0; text-align: center; color: #444; }
+  .fail { margin-top: 24px; padding: 14px; border: 1px solid #5a2a2a; background: #1e1010; color: var(--red);
+          border-radius: 4px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+
+  /* ── Narrow windows ── */
+  @media (max-width: 600px) {
+    header { padding: 0 8px; }
+    .nav-logo { padding-right: 10px; font-size: 13px; }
+    .nav-tabs { padding: 0 4px; }
+    .nav-tab { padding: 0 11px; }
+    .wrap { padding: 0 10px 48px; }
+    .jump { padding: 8px 10px; }
+    .row { flex-direction: column; align-items: stretch; gap: 9px; padding: 11px 12px; }
+    .row.is-switch { flex-direction: row; align-items: center; }
+    .row-text { flex-basis: auto; }
+    .row-ctl { flex-wrap: wrap; }
+    .row.is-text .row-ctl { flex-basis: auto; }
+    .row-ctl select, .row-ctl input[type=text] { flex: 1 1 100%; width: 100%; }
+    .kv { grid-template-columns: 1fr; gap: 0; }
+    .kv dt { margin-top: 6px; }
+    .note { margin: 0 12px 11px; }
+    #toast { left: 12px; right: 12px; bottom: 12px; max-width: none; text-align: center; }
+  }
+  @media (prefers-reduced-motion: reduce) { .main { scroll-behavior: auto; } * { transition: none !important; } }
+</style>
+</head>
+<body>
+
+<header>
+  <a class="nav-logo" href="/">&#x2302; Tarkov</a>
+  <nav class="nav-tabs">
+    <a class="nav-tab" href="/">Keep List</a>
+    <a class="nav-tab" href="/tasks">Tasks &amp; Hideout</a>
+    <a class="nav-tab" href="/sell">Sell Advisor</a>
+    <a class="nav-tab" href="/live">Live</a>
+    <a class="nav-tab active" href="/settings">Settings</a>
+  </nav>
+</header>
+
+<div class="main" id="main">
+  <div class="jump" id="jump" aria-label="Jump to a section"></div>
+  <div class="wrap">
+    <p class="page-intro">Everything saves the moment you change it. Nothing here needs editing files by hand.</p>
+    <div id="page"><div class="loading">Loading settings…</div></div>
+  </div>
+</div>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+'use strict';
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === 'class') e.className = v;
+    else if (k === 'text') e.textContent = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v === true ? '' : v);
+  }
+  for (const kid of kids.flat()) if (kid !== null && kid !== undefined && kid !== false) e.append(kid);
+  return e;
+}
+
+// JSON over fetch.  Never throws on an HTTP error status (callers look at .ok / .status);
+// a dead server or a network failure still throws.
+async function http(method, url, body, extra) {
+  const opts = Object.assign({ method, cache: 'no-store', headers: { 'Content-Type': 'application/json' } }, extra || {});
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const r = await fetch(url, opts);
+  let data = null;
+  try { data = await r.json(); } catch (_) { /* not JSON (e.g. a 404 page) */ }
+  return { ok: r.ok, status: r.status, data };
+}
+
+let toastTimer = null;
+function toast(msg, kind, ms) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'show ' + (kind || '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = ''; }, ms || 1600);
+}
+
+function fmtAge(min) {
+  if (min === null || min === undefined) return 'never';
+  if (min < 1) return 'just now';
+  if (min < 90) return `${Math.round(min)} min ago`;
+  const h = min / 60;
+  if (h < 48) return `${h.toFixed(h < 10 ? 1 : 0)} h ago`;
+  return `${Math.round(h / 24)} days ago`;
+}
+const fmtEpoch = ts => fmtAge(Math.max(0, (Date.now() / 1000 - (ts > 1e12 ? ts / 1000 : ts)) / 60));
+const fmtNum = n => Number(n).toLocaleString();
+const sourceLabel = s => s === 'json.tarkov.dev' ? 'tarkov.dev' : (s === 'graphql' ? 'tarkov.dev (backup source)' : (s || 'unknown source'));
+
+function prettyHotkey(pynputStr) {
+  if (!pynputStr) return '';
+  return pynputStr.split('+')
+    .map(p => p.replace(/[<>]/g, ''))
+    .map(p => p.length === 1 ? p.toUpperCase() : p.charAt(0).toUpperCase() + p.slice(1))
+    .join(' + ');
+}
+
+function chip(text, kind) { return el('span', { class: 'chip ' + (kind || ''), text }); }
+
+// ---------------------------------------------------------------------------
+// Settings state + auto-save (debounced; only the changed keys are sent, the server merges them)
+// ---------------------------------------------------------------------------
+let state = {};          // what the page shows: stored values over the defaults
+let defaults = {};
+let pending = {};        // changed keys not yet sent
+let saveTimer = null;
+let saveChain = Promise.resolve();
+const rows = [];         // every settings row: {keys, sync(state), dimWhen, el}
+
+function change(patch) {
+  Object.assign(state, patch);
+  Object.assign(pending, patch);
+  applyDerived();
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flush, 350);
+}
+
+function flush() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  const batch = pending;
+  pending = {};
+  if (Object.keys(batch).length) saveChain = saveChain.then(() => send(batch));
+  return saveChain;
+}
+
+async function send(batch) {
+  const keys = Object.keys(batch);
+  try {
+    const res = await http('POST', '/api/settings', batch);
+    if (!res.ok || !res.data || !res.data.ok) {
+      throw new Error((res.data && res.data.error) || `the app answered HTTP ${res.status}`);
+    }
+    for (const k of keys) if (!(k in pending)) state[k] = res.data.settings[k];   // adopt the server's clean value
+    syncRows(keys);
+    applyDerived();
+    toast('✓ Saved', 'ok');
+  } catch (e) {
+    toast('Couldn’t save: ' + e.message, 'bad', 5000);
+    await reload(keys);                                                          // show what is really stored
+  }
+}
+
+async function reload(keys) {
+  try {
+    const res = await http('GET', '/api/settings?full=1');
+    if (!res.ok || !res.data || !res.data.settings) return;
+    defaults = res.data.defaults;
+    for (const k of (keys || Object.keys(res.data.settings))) if (!(k in pending)) state[k] = res.data.settings[k];
+    syncRows(keys);
+    applyDerived();
+  } catch (_) { /* offline: keep what is shown */ }
+}
+
+// Save what is still waiting if the page is closed or left within the debounce window.
+window.addEventListener('pagehide', () => {
+  if (!Object.keys(pending).length) return;
+  try {
+    fetch('/api/settings', { method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json' },
+                             body: JSON.stringify(pending) });
+  } catch (_) { /* nothing more to do */ }
+  pending = {};
+});
+
+// ---------------------------------------------------------------------------
+// The settings, as data: every option has a one-line explanation from a player's point of view
+// ---------------------------------------------------------------------------
+const TRADERS = ['Prapor', 'Therapist', 'Fence', 'Skier', 'Peacekeeper', 'Mechanic', 'Ragman', 'Jaeger', 'Ref', 'Lightkeeper'];
+const skipsRef = s => (s.skip_traders || []).some(n => String(n).toLowerCase() === 'ref');
+const range = (lo, hi) => Array.from({ length: hi - lo + 1 }, (_, i) => ({ value: lo + i, label: String(lo + i) }));
+
+const SECTIONS = [
+  { id: 'app', title: 'App & launch', intro: 'How the helper starts and when its window shows up.',
+    rows: [
+      { key: 'start_with_windows', type: 'switch', label: 'Start with Windows',
+        help: 'Start a tiny watcher with Windows that opens this app when Tarkov launches.' },
+      { key: 'follow_tarkov', type: 'switch', label: 'Follow Tarkov',
+        help: 'Open with Tarkov, close when Tarkov exits.' },
+      { key: 'show_window_on_game_start', type: 'switch', label: 'Show the window when Tarkov starts',
+        help: 'Bring this window up when the game launches instead of leaving it in the system tray.' },
+    ],
+    build: buildLifecycleStatus },
+
+  { id: 'progress', title: 'Your progress', intro: 'Tell the helper who you are in Tarkov so it only asks you for what you still need.',
+    rows: [
+      { key: 'auto_task_progress', type: 'switch', label: 'Track tasks from Tarkov’s logs',
+        help: 'Read completed/failed tasks from Tarkov’s log files automatically.' },
+      { key: 'game_mode', type: 'select', label: 'Game mode',
+        options: [{ value: 'auto', label: 'Auto-detect' }, { value: 'pvp', label: 'PvP' }, { value: 'pve', label: 'PvE' }, { value: 'season', label: 'Seasonal PvP' }],
+        help: 'Which profile’s progress to follow; leave it on Auto unless you play both and it picks the wrong one.' },
+      { key: 'faction', type: 'select', label: 'Faction',
+        options: [{ value: 'auto', label: 'Auto-detect' }, { value: 'BEAR', label: 'BEAR' }, { value: 'USEC', label: 'USEC' }],
+        help: 'Your PMC faction – a few tasks and rewards differ between BEAR and USEC.' },
+      { key: 'eft_install_dir', type: 'text', label: 'Tarkov folder', placeholder: 'Auto-detect',
+        help: 'Where Tarkov is installed (the folder with EscapeFromTarkov.exe); leave it empty to find it automatically.' },
+      { key: 'prestige', type: 'select', label: 'Prestige level', noReset: true,
+        options: [{ value: 0, label: 'None' }, ...range(1, 6)],
+        help: 'Your current prestige – it decides which hand-in items must be Found in Raid. Use “New prestige” on the Keep List page to reset your progress.' },
+      { key: 'kappa_only_tasks', type: 'switch', label: 'Only count Kappa tasks',
+        help: 'Only keep items for the Collector’s own quest chain (about 13 quests since 1.0). Off keeps items for every quest you have not finished — recommended.' },
+    ],
+    build: buildProgressStatus },
+
+  { id: 'scanning', title: 'Scanning', intro: 'How the helper reads your stash.',
+    rows: [
+      { key: 'auto_scan', type: 'switch', label: 'Auto-scan the stash',
+        help: 'Watch the game quietly and scan your stash by itself when you open it – no hotkey needed.' },
+      { key: 'auto_scan_in_raid', type: 'switch', label: 'Also scan during a raid',
+        dimWhen: s => !s.auto_scan,
+        help: 'Also scan when you open your inventory in a raid; off by default so the helper stays idle while you play.' },
+      { key: 'hotkey', type: 'hotkey', label: 'Scan hotkey',
+        help: 'Press this in-game to scan right away. Use Ctrl/Alt/Shift plus a key – bare function keys clash with Tarkov.' },
+      { key: 'scan_countdown', type: 'number', label: 'Scan button countdown', min: 0, max: 10, unit: 'seconds',
+        help: 'Seconds to wait after you click Scan, so you can switch back to the game (0 = scan instantly).' },
+      { key: 'debug_dumps', type: 'switch', label: 'Keep debug captures',
+        help: 'Save the screenshots and results of the last few scans to the data/debug folder – handy for a bug report.' },
+    ],
+    build: buildScanStatus },
+
+  { id: 'live', title: 'Live viewer & in raid', intro: 'The Live page reads inventory grids as they appear on screen, in the hideout and in raid.',
+    rows: [
+      { key: 'live_viewer', type: 'switch', label: 'Live viewer',
+        help: 'Identify inventory grids on the fly and show them on the Live page.' },
+      { key: 'live_in_raid', type: 'switch', label: 'Also work in raid',
+        dimWhen: s => !s.live_viewer,
+        help: 'Also work in raid: show what’s worth grabbing and what to drop.' },
+      { key: 'live_top_n', type: 'number', label: 'Items to highlight', min: 1, max: 20,
+        dimWhen: s => !s.live_viewer,
+        help: 'How many “worth grabbing” items to highlight.' },
+      { key: 'live_min_value_per_slot', type: 'number', label: 'Ignore cheap loot', min: 0, max: 10000000, step: 1000,
+        unit: 'roubles per slot', dimWhen: s => !s.live_viewer,
+        help: 'Ignore loot worth less than this per slot.' },
+    ] },
+
+  { id: 'selling', title: 'Selling', intro: 'How the Sell Advisor decides between the flea market and the traders.',
+    cards: [
+      { hero: true, rows: [
+        { key: 'ignore_task_items', type: 'switch', label: 'Ignore task & Kappa items',
+          help: 'Never hold items back for quests or the Collector; just pick flea vs trader.' },
+        { key: 'ignore_hideout_items', type: 'switch', label: 'Ignore hideout items',
+          help: 'Never hold items back for hideout upgrades.' },
+      ], build: buildMoneyNote },
+      { rows: [
+        { key: 'flea_requires_fir', type: 'select', label: 'Found-in-Raid rule on the flea',
+          options: [{ value: null, label: 'Follow the game’s rule (recommended)' },
+                    { value: true, label: 'Required – only FIR items can be listed' },
+                    { value: false, label: 'Not required' }],
+          help: 'Whether the flea market only takes Found-in-Raid items; leave it on “follow” unless Battlestate lifts the rule for an event.' },
+        { key: 'flea_offer_slots', type: 'number', label: 'Flea offer slots', min: 0, max: 20,
+          help: 'How many offers you can have on the flea at once – your flea rating decides (the Sell page shows it as Offers x/y).' },
+        { key: 'flea_overflow', type: 'select', label: 'When your slots are full',
+          options: [{ value: 'queue', label: 'Queue them for when a slot frees up' }, { value: 'trader', label: 'Sell them to a trader now' }],
+          help: 'What to do with flea picks that don’t fit in your free offer slots.' },
+        { key: 'flea_min_gain', type: 'number', label: 'Minimum flea profit', min: 0, max: 10000000, step: 1000, unit: 'roubles',
+          help: 'Only suggest the flea when it beats the best trader by at least this much per offer – an offer takes a slot and sells later.' },
+        { key: 'intel_center_level', type: 'select', label: 'Intelligence Center level',
+          options: [{ value: null, label: 'Auto (from Tasks & Hideout)' }, { value: 0, label: 'Not built' }, ...range(1, 3)],
+          help: 'Level 3 makes flea fees 30% cheaper; Auto uses what you ticked on the Tasks & Hideout page.' },
+        { key: 'hideout_management_level', type: 'number', label: 'Hideout Management skill', min: 0, max: 51,
+          help: 'Your skill level (0–51); every level adds a little more fee discount once the Intelligence Center is level 3.' },
+      ] },
+      { rows: [
+        { id: 'traders', keys: ['skip_traders'], type: 'checks', label: 'Traders to sell to', wide: true,
+          help: 'Untick any trader you never use and the advisor stops sending items there. Ref pays in GP coins, not roubles, so it starts unticked.' },
+        { id: 'ref_level', keys: ['trader_levels', 'skip_traders'], type: 'select', label: 'Ref loyalty level',
+          options: range(1, 4), dimWhen: skipsRef,
+          get: s => (s.trader_levels || {}).Ref || 1,
+          put: (v, s) => ({ trader_levels: Object.assign({}, s.trader_levels || {}, { Ref: v }) }),
+          help: 'Only matters if you tick Ref above – Ref pays more as your loyalty level goes up.' },
+      ] },
+    ] },
+
+  { id: 'data', title: 'Data', intro: 'Prices, tasks and item pictures come from tarkov.dev and refresh by themselves; use these if you want it now.',
+    rows: [
+      { id: 'd-prices', type: 'action', label: 'Refresh prices', button: 'Refresh now', line: 'prices',
+        help: 'Fetch the latest flea and trader prices from tarkov.dev.', run: refreshPrices },
+      { id: 'd-tasks', type: 'action', label: 'Refresh tasks & hideout', button: 'Refresh now', line: 'tasks',
+        help: 'Fetch the latest task and hideout requirements from tarkov.dev.', run: refreshTasks },
+      { id: 'd-kappa', type: 'action', label: 'Sync the Kappa list', button: 'Sync now', line: 'kappa',
+        help: 'Update the Collector (Kappa) hand-in list from the wiki.', run: syncKappa },
+      { id: 'd-catalog', type: 'action', label: 'Rebuild the item catalog', button: 'Rebuild', line: 'catalog',
+        help: 'Download any missing item pictures and rebuild the catalog scans match against – takes a few minutes; only needed if scans keep missing new items.',
+        run: rebuildCatalog },
+    ] },
+
+  { id: 'about', title: 'About & updates', intro: null, rows: [], build: buildAbout },
+];
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+const ui = { lines: {}, lifecycle: null, progress: null, scan: null, moneyNote: null, catalogBtn: null, about: null };
+
+function buildRow(row) {
+  const id = 'f-' + (row.key || row.id);
+  const keys = row.keys || [row.key];
+  const get = row.get || (s => s[row.key]);
+  const put = row.put || (v => ({ [row.key]: v }));
+  const ctl = el('div', { class: 'row-ctl' });
+  const help = el('p', { class: 'row-help', id: id + '-h', text: row.help });
+  const text = el('div', { class: 'row-text' }, el('label', { class: 'row-label', for: id, text: row.label }), help);
+  const node = el('div', { class: 'row' + (row.type === 'switch' ? ' is-switch' : '') + (row.wide ? ' wide' : '') +
+                           (row.type === 'text' ? ' is-text' : ''), 'data-key': keys.join(' ') }, text, ctl);
+  const entry = { keys, el: node, dimWhen: row.dimWhen, sync: () => {} };
+
+  if (row.type === 'switch') {
+    const input = el('input', { type: 'checkbox', role: 'switch', id, 'aria-describedby': id + '-h' });
+    input.addEventListener('change', () => change(put(input.checked, state)));
+    ctl.append(el('span', { class: 'switch' }, input, el('span', { class: 'track' })));
+    entry.sync = s => { input.checked = !!get(s); };
+
+  } else if (row.type === 'select') {
+    const select = el('select', { id, 'aria-describedby': id + '-h' },
+      row.options.map((o, i) => el('option', { value: String(i), text: o.label })));
+    const other = el('option', { value: 'other', hidden: true });         // a stored value the list does not know
+    select.append(other);
+    select.addEventListener('change', () => {
+      const opt = row.options[Number(select.value)];
+      if (opt) change(put(opt.value, state)); else entry.sync(state);
+    });
+    ctl.append(select);
+    entry.sync = s => {
+      const v = get(s);
+      const i = row.options.findIndex(o => o.value === v);
+      if (i >= 0) { select.value = String(i); other.hidden = true; }
+      else { other.textContent = 'Other: ' + v; other.hidden = false; select.value = 'other'; }
+    };
+
+  } else if (row.type === 'number') {
+    const input = el('input', { type: 'number', id, min: row.min, max: row.max, step: row.step || 1,
+                                inputmode: 'numeric', 'aria-describedby': id + '-h' });
+    input.addEventListener('change', () => {
+      const raw = input.value.trim();
+      const v = Number(raw);
+      if (raw === '' || !Number.isFinite(v)) { entry.sync(state); return; }
+      const clean = Math.min(row.max, Math.max(row.min, Math.round(v)));
+      input.value = clean;
+      change(put(clean, state));
+    });
+    ctl.append(input);
+    if (row.unit) ctl.append(el('span', { class: 'unit', text: row.unit }));
+    entry.sync = s => { input.value = get(s) ?? ''; };
+
+  } else if (row.type === 'text') {
+    const input = el('input', { type: 'text', id, placeholder: row.placeholder, spellcheck: 'false',
+                                autocomplete: 'off', 'aria-describedby': id + '-h' });
+    input.addEventListener('change', () => change(put(input.value.trim() || null, state)));
+    ctl.append(input);
+    entry.sync = s => { input.value = get(s) || ''; };
+
+  } else if (row.type === 'hotkey') {
+    const input = el('input', { type: 'text', id, readonly: true, placeholder: 'Click, then press keys',
+                                'aria-describedby': id + '-h' });
+    const showCurrent = () => { input.value = prettyHotkey(state.hotkey); input.placeholder = 'Click, then press keys'; };
+    input.addEventListener('focus', () => { input.value = ''; input.placeholder = 'Press your combo now…'; });
+    input.addEventListener('blur', showCurrent);
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Tab') return;                                         // keyboard users can still move on
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === 'Escape') { input.blur(); return; }
+      if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return;     // wait for the real key
+      const mods = [];
+      if (e.ctrlKey) mods.push('<ctrl>');
+      if (e.altKey) mods.push('<alt>');
+      if (e.shiftKey) mods.push('<shift>');
+      let key = e.key.toLowerCase();
+      const named = { ' ': 'space', escape: 'esc', arrowup: 'up', arrowdown: 'down', arrowleft: 'left',
+                      arrowright: 'right', pageup: 'page_up', pagedown: 'page_down' };
+      if (named[key]) key = `<${named[key]}>`;
+      else if (/^f\d{1,2}$/.test(key) || key.length > 1) key = `<${key}>`;
+      if (!mods.length && key.length === 1) { toast('Use Ctrl, Alt or Shift together with a letter key.', 'bad', 3500); return; }
+      input.value = prettyHotkey([...mods, key].join('+'));
+      change(put([...mods, key].join('+'), state));
+      input.blur();
+    });
+    ctl.append(input);
+    entry.sync = () => { if (document.activeElement !== input) showCurrent(); };
+
+  } else if (row.type === 'checks') {                                      // traders: ticked = the advisor may use it
+    const boxes = TRADERS.map(name => {
+      const input = el('input', { type: 'checkbox', 'data-name': name });
+      input.addEventListener('change', () => {
+        const skip = (state.skip_traders || []).filter(n => String(n).toLowerCase() !== name.toLowerCase());
+        if (!input.checked) skip.push(name);
+        change({ skip_traders: skip });
+      });
+      return { name, input, label: el('label', { class: 'check' }, input, name) };
+    });
+    ctl.append(el('div', { class: 'checks', role: 'group', 'aria-describedby': id + '-h' }, boxes.map(b => b.label)));
+    entry.sync = s => {
+      const skip = (s.skip_traders || []).map(n => String(n).toLowerCase());
+      for (const b of boxes) b.input.checked = !skip.includes(b.name.toLowerCase());
+    };
+    node.querySelector('label.row-label').removeAttribute('for');
+
+  } else if (row.type === 'action') {
+    const btn = el('button', { id, type: 'button', text: row.button });
+    const line = el('div', { class: 'line', 'aria-live': 'polite' });
+    ui.lines[row.line] = line;
+    text.append(line);
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      setLine(line, 'Working…', '');
+      try {
+        const out = await row.run(line);
+        setLine(line, out.text, out.kind || 'ok');
+        if (out.toast !== false) toast(out.kind === 'warn' ? out.text : '✓ ' + out.text, out.kind === 'warn' ? '' : 'ok', 2400);
+      } catch (e) {
+        setLine(line, e.message, 'bad');
+      }
+      if (row.line !== 'catalog') btn.disabled = false;
+      pollData();
+    });
+    ctl.append(btn);
+    if (row.line === 'catalog') ui.catalogBtn = btn;
+  }
+
+  rows.push(entry);
+  return node;
+}
+
+function setLine(line, text, kind) { line.textContent = text || ''; line.className = 'line ' + (kind || ''); }
+
+function buildSection(sec) {
+  const head = el('div', { class: 'section-head' }, el('h2', { id: 'h-' + sec.id, text: sec.title }));
+  const keys = [];
+  const cards = sec.cards || [{ rows: sec.rows, build: sec.build }];
+  const body = cards.map(c => {
+    const card = el('div', { class: 'card' + (c.hero ? ' hero' : '') });
+    for (const r of c.rows || []) { card.append(buildRow(r)); if (!r.noReset) keys.push(...(r.keys || [r.key]).filter(Boolean)); }
+    if (c.build) c.build(card);
+    return card;
+  });
+  if (sec.build && sec.cards) sec.build(body[body.length - 1]);
+  if (keys.length) {
+    head.append(el('button', { class: 'link', type: 'button', text: 'Reset to defaults',
+      title: 'Put this section’s options back to how a fresh install has them',
+      onclick: () => {
+        if (!confirm(`Reset the “${sec.title}” options to their defaults?`)) return;
+        const patch = {};
+        for (const k of keys) patch[k] = JSON.parse(JSON.stringify(defaults[k] ?? null));
+        change(patch);
+        syncRows(keys);
+      } }));
+  }
+  return el('section', { class: 'section', id: 'sec-' + sec.id, 'aria-labelledby': 'h-' + sec.id },
+            head, sec.intro ? el('p', { class: 'section-intro', text: sec.intro }) : null, body);
+}
+
+function syncRows(keys) {
+  for (const r of rows) if (!keys || r.keys.some(k => keys.includes(k))) r.sync(state);
+}
+
+function applyDerived() {
+  for (const r of rows) r.el.classList.toggle('dim', !!(r.dimWhen && r.dimWhen(state)));
+  if (ui.moneyNote) ui.moneyNote.hidden = !(state.ignore_task_items && state.ignore_hideout_items);
+}
+
+// ---------------------------------------------------------------------------
+// Status blocks (each one degrades to "unavailable" when its endpoint is not there)
+// ---------------------------------------------------------------------------
+function statusBlock(title, extraHead) {
+  const body = el('div', { class: 'chips' });
+  const block = el('div', { class: 'status-block' },
+    el('div', { class: 'status-head' }, el('span', { class: 'status-title', text: title }), extraHead || null), body);
+  return { block, body };
+}
+
+function buildLifecycleStatus(card) {
+  const s = statusBlock('Launch status');
+  ui.lifecycle = s.body;
+  s.body.append(chip('Checking…'));
+  card.append(s.block);
+}
+
+function buildProgressStatus(card) {
+  const btn = el('button', { type: 'button', class: 'primary', text: 'Rescan logs now',
+    title: 'Read Tarkov’s log files again right now' });
+  const line = el('div', { class: 'line', 'aria-live': 'polite' });
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    setLine(line, 'Scanning the logs…', '');
+    try {
+      const res = await http('POST', '/api/task-progress/rescan');
+      if (res.status === 404) setLine(line, 'Not available in this version.', 'warn');
+      else if (!res.ok || (res.data && res.data.ok === false)) setLine(line, (res.data && (res.data.error || res.data.message)) || `Rescan failed (HTTP ${res.status}).`, 'bad');
+      else { setLine(line, (res.data && res.data.message) || 'Logs rescanned.', 'ok'); toast('✓ Logs rescanned', 'ok', 2000); }
+    } catch (e) { setLine(line, 'Rescan failed: ' + e.message, 'bad'); }
+    btn.disabled = false;
+    pollStatuses();
+  });
+  const s = statusBlock('Log reading status', btn);
+  ui.progress = el('dl', { class: 'kv' });
+  s.block.append(ui.progress, line);
+  s.body.remove();
+  card.append(s.block);
+}
+
+function buildScanStatus(card) {
+  const s = statusBlock('Auto-scan status');
+  ui.scan = s.body;
+  s.body.append(chip('Checking…'));
+  card.append(s.block);
+}
+
+function buildMoneyNote(card) {
+  ui.moneyNote = el('div', { class: 'note', hidden: true, text: 'Pure money mode: every item is routed to flea or trader.' });
+  card.append(ui.moneyNote);
+}
+
+async function pollLifecycle() {
+  const box = ui.lifecycle;
+  if (!box) return;
+  let out;
+  try {
+    const res = await http('GET', '/api/lifecycle/status');
+    const d = res.data;
+    if (!res.ok || !d || typeof d !== 'object') throw new Error('unavailable');
+    out = [];
+    if (typeof d.registered === 'boolean') out.push(chip(d.registered ? 'Starts with Windows' : 'Not set to start with Windows', d.registered ? 'ok' : ''));
+    if (typeof d.watcher_running === 'boolean') out.push(chip(d.watcher_running ? 'Watcher running' : 'Watcher not running', d.watcher_running ? 'ok' : ''));
+    if (typeof d.game_running === 'boolean') out.push(chip(d.game_running ? 'Tarkov is running' : 'Tarkov is not running', d.game_running ? 'ok' : ''));
+    if (typeof d.started_with_tarkov === 'boolean') out.push(chip(d.started_with_tarkov ? 'Opened by Tarkov starting' : 'Opened by you', ''));
+    if (!out.length) out.push(chip('Nothing to report'));
+  } catch (_) {
+    out = [chip('Status unavailable', 'warn')];
+  }
+  box.replaceChildren(...out);
+}
+
+const humanKey = k => k.replace(/_/g, ' ').replace(/([a-z])([A-Z])/g, '$1 $2').replace(/^./, c => c.toUpperCase());
+
+function kvValue(k, v) {
+  if (v === null || v === undefined || v === '') return '–';
+  if (typeof v === 'boolean') return v ? 'yes' : 'no';
+  if (typeof v === 'number') return (v > 1e9 && v < 4e12) ? fmtEpoch(v) : fmtNum(v);
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) return `${v.length} item${v.length === 1 ? '' : 's'}`;
+  return null;                                                              // nested objects: not shown
+}
+
+async function pollProgress() {
+  const dl = ui.progress;
+  if (!dl) return;
+  let nodes = [];
+  try {
+    const res = await http('GET', '/api/task-progress/status');
+    const d = res.data;
+    if (!res.ok || !d || typeof d !== 'object') throw new Error('unavailable');
+    const row = (k, v, cls = '') => nodes.push(el('dt', { text: k }), el('dd', { class: cls, text: v }));
+    const modeName = { season: 'Seasonal PvP', pvp: 'PvP', pve: 'PvE' };
+    const l = d.log;
+    if (d.enabled === false) row('Status', 'Off – tick tasks by hand on the Tasks page', 'muted');
+    else if (l) {
+      row('Profile', (modeName[l.mode] || l.mode) + (l.faction ? ' · ' + l.faction : ''));
+      row('Quests', `${l.completed} completed · ${l.active} active · ${l.failed} failed`);
+      if (l.last_event_at) row('Last quest event', fmtAge((Date.now() / 1000 - l.last_event_at) / 60));
+      if (l.reset_at) row('Progress counted since', new Date(l.reset_at * 1000).toLocaleDateString()
+        + (l.reset_kind === 'prestige' ? ' (prestige)' : l.reset_kind === 'create' ? ' (new profile)' : ''));
+      row('Game folder', d.install_dir || '–');
+    } else row('Status', d.error ? 'Could not read the logs: ' + d.error : 'No logs found yet', 'bad');
+    if (!nodes.length) nodes = [el('dt', { text: 'Status' }), el('dd', { text: 'Nothing to report yet' })];
+  } catch (_) {
+    nodes = [el('dt', { text: 'Status' }), el('dd', { class: 'muted', text: 'Unavailable' })];
+  }
+  dl.replaceChildren(...nodes);
+}
+
+async function pollScan() {
+  const box = ui.scan;
+  if (!box) return;
+  let out;
+  try {
+    const res = await http('GET', '/api/autoscan/status');
+    const d = res.data;
+    if (!res.ok || !d) throw new Error('unavailable');
+    const kind = { disabled: '', error: 'bad', failed: 'bad', blank: 'bad', scanned: 'ok', scanning: 'ok', waiting: 'ok', settling: 'ok' }[d.state] ?? 'warn';
+    out = [chip(d.message || d.state || 'Unknown', kind)];
+    if (d.last_scan_age) out.push(chip('Last scan ' + fmtAge(d.last_scan_age / 60)));
+    if (d.detail && kind === 'bad') out.push(chip(String(d.detail), 'bad'));
+  } catch (_) {
+    out = [chip('Status unavailable', 'warn')];
+  }
+  box.replaceChildren(...out);
+}
+
+function pollStatuses() { return Promise.allSettled([pollLifecycle(), pollProgress(), pollScan()]); }
+
+// ---------------------------------------------------------------------------
+// Data section
+// ---------------------------------------------------------------------------
+function cacheLine(st, noun, every) {
+  if (!st || !st.cached) {
+    return { text: `No ${noun} yet.` + (st && st.error ? ' Last attempt failed: ' + st.error : ''), kind: st && st.error ? 'bad' : 'warn' };
+  }
+  const bits = [`Updated ${fmtAge(st.age_minutes)}`, `${fmtNum(st.count)} ${noun}`, sourceLabel(st.source)];
+  if (every) bits.push(`refreshes by itself every ${every}`);
+  let text = bits.join(' · ');
+  let kind = st.stale ? 'warn' : 'ok';
+  if (st.stale) text += ' · out of date';
+  if (st.error) { text += ` — last refresh failed: ${st.error}`; kind = 'warn'; }
+  return { text, kind };
+}
+
+let busyAction = false;
+async function pollData() {
+  try {
+    const res = await http('GET', '/api/prices/status');
+    if (!res.ok || !res.data) throw new Error('no status');
+    const st = res.data;
+    const p = cacheLine(st, 'items', `${st.refresh_minutes || 15} min`);
+    const t = cacheLine(st.tasks, 'tasks', 'few hours');
+    for (const [name, v] of [['prices', p], ['tasks', t]]) {
+      const line = ui.lines[name];
+      if (line && !line.dataset.busy && line.dataset.fresh !== '1') setLine(line, v.text, v.kind);
+    }
+    ui.pendingCatalog = st.catalog_pending || 0;
+  } catch (_) { /* leave whatever the lines say */ }
+  pollCatalog();
+}
+
+async function pollCatalog() {
+  const line = ui.lines.catalog, btn = ui.catalogBtn;
+  if (!line) return;
+  try {
+    const res = await http('GET', '/api/icons/matcher-status');
+    const d = res.data;
+    if (!res.ok || !d) throw new Error('no status');
+    const phases = { images: 'Downloading item pictures', catalog: 'Building the catalog (about half a minute)', engine: 'Loading the new catalog' };
+    if (d.running) {
+      const n = d.phase === 'images' && d.total ? ` ${fmtNum(d.done_count)} / ${fmtNum(d.total)}` : '';
+      setLine(line, (phases[d.phase] || 'Working') + n + '…', '');
+      if (btn) btn.disabled = true;
+      clearTimeout(pollCatalog.t);
+      pollCatalog.t = setTimeout(pollCatalog, 1500);
+      return;
+    }
+    if (btn) btn.disabled = false;
+    if (d.error) setLine(line, 'Last build failed: ' + d.error, 'bad');
+    else if (d.ready) {
+      const waiting = ui.pendingCatalog ? ` · ${ui.pendingCatalog} new item${ui.pendingCatalog === 1 ? '' : 's'} waiting to be added` : '';
+      setLine(line, `Catalog ready · ${fmtNum(d.item_count)} items${waiting}`, 'ok');
+    } else setLine(line, 'No catalog yet – press Rebuild once so scans can recognise items.', 'warn');
+  } catch (_) { /* leave the line */ }
+}
+
+async function actionRequest(url, failMsg) {
+  const res = await http('POST', url);
+  if (!res.ok || !res.data || res.data.ok === false) {
+    throw new Error(`${failMsg}: ${(res.data && (res.data.error || res.data.message)) || 'HTTP ' + res.status}`);
+  }
+  return res.data;
+}
+
+async function refreshPrices() {
+  const d = await actionRequest('/api/prices/refresh', 'Price refresh failed');
+  const fresh = d.status === 'unchanged' ? 'Already up to date' : 'Updated';
+  return { text: `${fresh} – ${fmtNum(d.count)} items from ${sourceLabel(d.source)}${d.new_items ? `, ${d.new_items} new` : ''}.` };
+}
+
+async function refreshTasks() {
+  const d = await actionRequest('/api/tasks/refresh', 'Task refresh failed');
+  return { text: `Updated – ${fmtNum(d.tasks)} tasks, ${fmtNum(d.stations)} hideout stations.` };
+}
+
+async function syncKappa() {
+  const d = await actionRequest('/api/kappa/refresh', 'Kappa sync failed');
+  const bits = [];
+  if ((d.added || []).length) bits.push(`${d.added.length} added`);
+  if ((d.removed || []).length) bits.push(`${d.removed.length} removed (no longer on the wiki)`);
+  return { text: 'Kappa list synced' + (bits.length ? ' – ' + bits.join(', ') : ' – already up to date') + '.' };
+}
+
+async function rebuildCatalog() {
+  const res = await http('POST', '/api/icons/build-index');
+  if (!res.ok || !res.data) throw new Error('Could not start the rebuild: HTTP ' + res.status);
+  pollCatalog();
+  const started = res.data.ok !== false;
+  return { text: started ? 'Started – this takes a few minutes and you can keep using the app.' : 'A build is already running.',
+           kind: started ? 'ok' : 'warn', toast: false };
+}
+
+// ---------------------------------------------------------------------------
+// About & updates
+// ---------------------------------------------------------------------------
+function buildAbout(card) {
+  const result = el('div', { class: 'line', 'aria-live': 'polite' });
+  const actions = el('div', { class: 'row-ctl' });
+  const checkBtn = el('button', { type: 'button', text: 'Check for updates' });
+  const versionLabel = el('span', { class: 'row-label', text: 'Tarkov Stash Helper' });
+  const tess = el('div', { class: 'line' });
+  ui.about = { versionLabel, tess };
+
+  async function check(force) {
+    checkBtn.disabled = true;
+    setLine(result, 'Checking…', '');
+    actions.replaceChildren(checkBtn);
+    try {
+      const res = await http('GET', '/api/update-check' + (force ? '?force=1' : ''));
+      const d = res.data;
+      if (!res.ok || !d) throw new Error('HTTP ' + res.status);
+      if (d.error) { setLine(result, 'Couldn’t check for updates: ' + d.error, 'warn'); }
+      else if (d.update_available) {
+        const v = String(d.latest).replace(/^v/, '');
+        result.className = 'line warn';
+        result.replaceChildren(`Version ${v} is available. `, d.notes_url ? el('a', { href: d.notes_url, target: '_blank', rel: 'noopener', text: 'Release notes' }) : '');
+        if (d.can_auto) {
+          const apply = el('button', { type: 'button', class: 'primary', text: 'Update & restart' });
+          apply.addEventListener('click', async () => {
+            if (!confirm('Download the update and restart the app now?')) return;
+            apply.disabled = true;
+            try {
+              const r = await http('POST', '/api/update-apply');
+              if (r.ok && r.data && r.data.ok) setLine(result, 'Downloading the update – the app will close and restart itself…', 'ok');
+              else { setLine(result, 'Update failed: ' + ((r.data && r.data.error) || 'HTTP ' + r.status), 'bad'); apply.disabled = false; }
+            } catch (e) { setLine(result, 'Update failed: ' + e.message, 'bad'); apply.disabled = false; }
+          });
+          actions.append(apply);
+        }
+      } else setLine(result, `You’re up to date (version ${d.current}).`, 'ok');
+    } catch (e) {
+      setLine(result, 'Couldn’t check for updates: ' + e.message, 'warn');
+    }
+    checkBtn.disabled = false;
+  }
+  checkBtn.addEventListener('click', () => check(true));
+  actions.append(checkBtn);
+
+  const head = el('div', { class: 'row' },
+    el('div', { class: 'row-text' }, versionLabel,
+      el('p', { class: 'row-help', text: 'Updates are downloaded from this project’s GitHub releases; nothing about your game or stash is sent.' }), result),
+    actions);
+  const info = el('div', { class: 'status-block' },
+    el('p', { class: 'row-help' }, 'Closing the window only minimises the helper to the system tray – right-click the tray icon to reopen or quit. Your settings live in ', el('code', { text: 'data/settings.json' }), ' next to the app.'),
+    tess);
+  card.append(head, info);
+  setTimeout(() => check(false), 600);
+}
+
+async function loadAbout() {
+  try {
+    const res = await http('GET', '/api/health');
+    const h = res.data || {};
+    if (h.app_version && ui.about) ui.about.versionLabel.textContent = `Tarkov Stash Helper v${h.app_version}`;
+    if (ui.about) {
+      if (h.tesseract) setLine(ui.about.tess, 'Tesseract OCR (reads item names): found.', 'ok');
+      else setLine(ui.about.tess, 'Tesseract OCR (reads item names) is missing – install it with: winget install UB-Mannheim.TesseractOCR', 'warn');
+    }
+  } catch (_) { /* the About box just keeps its defaults */ }
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+function jumpBar() {
+  const bar = document.getElementById('jump');
+  for (const sec of SECTIONS) {
+    bar.append(el('a', { href: '#sec-' + sec.id, text: sec.title, onclick: e => {
+      e.preventDefault();
+      document.getElementById('sec-' + sec.id).scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } }));
+  }
+}
+
+async function init() {
+  const page = document.getElementById('page');
+  jumpBar();
+  let res;
+  try {
+    res = await http('GET', '/api/settings?full=1');
+    if (!res.ok || !res.data || !res.data.settings) throw new Error('the app answered HTTP ' + res.status);
+  } catch (e) {
+    page.replaceChildren(el('div', { class: 'fail' }, 'Couldn’t load your settings: ' + e.message,
+      el('button', { type: 'button', text: 'Try again', onclick: () => location.reload() })));
+    return;
+  }
+  state = res.data.settings;
+  defaults = res.data.defaults;
+  page.replaceChildren(...SECTIONS.map(buildSection));
+  syncRows();
+  applyDerived();
+  pollStatuses();
+  pollData();
+  loadAbout();
+  setInterval(() => { if (!document.hidden) { pollStatuses(); pollData(); } }, 5000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { pollStatuses(); pollData(); } });
+}
+
+init();
+</script>
+</body>
+</html>

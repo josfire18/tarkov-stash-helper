@@ -1,5 +1,13 @@
 import os
 import sys
+
+if __name__ == '__main__' and '--watch' in sys.argv:
+    # Watcher mode (lifecycle.py): the few-MB process Windows starts at sign-in that launches the
+    # real app when Tarkov starts.  Dispatched HERE, before the numpy / cv2 / flask imports below,
+    # so it never loads them (also true of the packaged exe: a PyInstaller bundle imports lazily).
+    import lifecycle
+    sys.exit(lifecycle.watch_main(sys.argv[1:]))
+
 import shutil
 import json
 import base64
@@ -9,7 +17,6 @@ import time
 import subprocess
 from io import BytesIO
 
-import math
 import re
 import requests as http_requests
 
@@ -21,6 +28,14 @@ from rapidfuzz import process as rfuzz
 from pynput import keyboard
 import cv2
 import numpy as np
+
+import sellcalc
+import tarkovdata
+import lifecycle    # open/close with the game (stdlib + ctypes only)
+# The sell-advice economics live in sellcalc.py (pure functions); the historical
+# names stay importable from here (test_scan.py scores sell decisions via app.*).
+from sellcalc import (best_trader_price, calc_flea_fee, price_420, flea_block_reason,  # noqa: F401
+                      sell_recommendation, order_for_selling, TRADER_ORDER)
 
 APP_VERSION = '0.3.1'
 
@@ -48,11 +63,10 @@ PRICES_PATH    = os.path.join(DATA, 'prices_cache.json')
 KAPPA_WIKI_PATH  = os.path.join(DATA, 'kappa_wiki.json')   # cached Collector item names from the wiki
 PRESTIGE_WIKI_PATH = os.path.join(DATA, 'prestige_wiki.json')  # cached Prestige requirements from the wiki
 TASKS_CACHE_PATH = os.path.join(DATA, 'tasks_cache.json')  # cached tasks + hideout requirements (tarkov.dev)
+META_PATH        = os.path.join(DATA, 'tarkovdev_meta.json')  # ETags, last-check times, pending catalog work
 PROGRESS_PATH    = os.path.join(DATA, 'progress.json')     # user task/hideout completion + have-counts
-ICONS_DIR      = os.path.join(DATA, 'icons')          # legacy 64×64 iconLink thumbnails (UI only)
 TMPL_SRC_DIR   = os.path.join(DATA, 'tmpl_src')        # transparent per-slot base images (BGRA PNG)
 os.makedirs(DATA, exist_ok=True)
-os.makedirs(ICONS_DIR, exist_ok=True)
 os.makedirs(TMPL_SRC_DIR, exist_ok=True)
 
 # Tesseract-OCR is an external (non-pip) dependency the user must install
@@ -64,11 +78,14 @@ if not shutil.which(pytesseract.pytesseract.tesseract_cmd):
     if os.path.exists(_default_tesseract):
         pytesseract.pytesseract.tesseract_cmd = _default_tesseract
 
-PRICE_CACHE_TTL      = 1800  # seconds (30 min)
+PRICE_CACHE_TTL      = 1800  # seconds (30 min): older and a scan refreshes on demand (the refresher normally beats this)
+PRICE_REFRESH_INTERVAL = 900   # seconds (15 min): background refresh of items/prices (a 304 when nothing changed)
+TASKS_REFRESH_INTERVAL = 3 * 3600  # seconds (3 h): background refresh of tasks/hideout/traders
+RETRY_BACKOFF        = 300   # seconds: after a failed refresh, wait this long before trying again
 KAPPA_WIKI_TTL       = 86400 # seconds (24 h) — Collector list changes rarely
 PRESTIGE_WIKI_TTL    = 7 * 86400 # seconds (7 d) — Prestige requirements change only per major patch
 TASKS_CACHE_TTL      = 86400 # seconds (24 h) — task/hideout requirements change per patch
-FLEA_MIN_PROFIT      = 10000 # recommend flea only if net > trader by this much
+FLEA_MIN_PROFIT      = sellcalc.FLEA_MIN_GAIN  # recommend flea only if net > trader by this much (setting: flea_min_gain)
 TARKOV_API           = 'https://api.tarkov.dev/graphql'
 # Self-update: owner/repo are baked in here and NEVER taken from the client —
 # the download URL that ends up in _update_state always traces back to this
@@ -86,36 +103,7 @@ COLLECTOR_WIKI_API   = ('https://escapefromtarkov.fandom.com/api.php'
 # must be fetched through the MediaWiki API too, never the plain page URL.
 PRESTIGE_WIKI_API    = ('https://escapefromtarkov.fandom.com/api.php'
                         '?action=parse&page=Prestige&prop=text&format=json&formatversion=2')
-ICON_MATCH_THRESHOLD = 0.68  # cv2.TM_CCOEFF_NORMED score cutoff for icon matching
-CANONICAL_PER_SLOT   = 64    # px per 1×1 slot in the canonical-size template
-ICON_MATCH_MIN_SCORE = 0.40  # NCC threshold to accept an icon match
-LABEL_BLANK_PX       = 13    # top rows of each cell to overwrite with bg colour (removes item-name label)
-CORNER_BLANK_PX      = 18    # top-right (FiR ✓) and bottom-right (stack count) corner blanking
-FIR_BRIGHT           = 170   # grayscale floor for a pixel to count as part of the FiR ✓ mark
-FIR_MIN_PX           = 6     # below this many bright px, too little signal to call it FiR (indeterminate)
-FIR_MAX_FRAC         = 0.5   # above this fraction of the corner window lit up, probably not a clean ✓ (indeterminate)
-NCC_MARGIN_MIN       = 0.04  # require top-1 NCC to beat top-2 by this much (rejects ambiguous matches)
-ICON_DB_PATH         = os.path.join(DATA, 'icon_db.npz')
-DB_VERSION           = 6     # bump whenever the vector format changes; forces a rebuild
-_STASH_BG_BGR        = (38, 42, 44)  # Tarkov stash cell background colour (BGR) — used for blanked (masked-out) regions
-GRID_PITCH_1080P     = 63    # px per slot in-game @ 1080p reference (icon-cache geometry); captures may be ANY pitch
 
-# EFT rarity background tints (BGR), calibrated by diffing tarkov.dev grid-image
-# (background baked) against base-image (transparent alpha) over 6 items/colour.
-# Templates are alpha-composited onto these so anti-aliased icon edges match the
-# real tinted stash cell.  Keyed by the tarkov.dev `backgroundColor` field.
-EFT_BG_TINTS = {
-    'black':   (20, 19, 19),
-    'grey':    (30, 29, 28),
-    'default': (54, 54, 53),
-    'blue':    (45, 39, 29),
-    'violet':  (41, 29, 38),
-    'yellow':  (33, 48, 47),
-    'green':   (24, 34, 27),
-    'orange':  (24, 30, 37),
-    'red':     (29, 32, 49),
-}
-DEFAULT_TINT = (54, 54, 53)
 
 # Per-trader badge colours (RGB — PIL's ImageDraw, unlike the OpenCV/BGR
 # pipeline above, takes RGB(A) tuples) so the sell-scan screenshot's numbered
@@ -130,27 +118,32 @@ TRADER_COLORS_RGB = {
     'Mechanic':    (154, 205, 50),   # yellow-green
     'Ragman':      (216, 27, 96),    # magenta
     'Jaeger':      (34, 139, 34),    # forest green
+    'Ref':         (230, 190, 40),   # yellow
+    'Fence':       (120, 120, 120),  # grey
 }
-DEFAULT_TRADER_BADGE_RGB = (180, 120, 20)  # fallback (e.g. Fence) — the old uniform trader-gold
+DEFAULT_TRADER_BADGE_RGB = (180, 120, 20)  # fallback — the old uniform trader-gold
+FLEA_RGB = (30, 150, 30)
+FLEA_QUEUE_RGB = (95, 125, 95)   # flea picks beyond the offer slots: same family, visibly dimmer
 
-# The scanner only cares about items / parts / components — NOT ammo, full
-# weapons, weapon presets, or storage containers.  Templates for these tarkov.dev
-# `types` are never built, so they can't be matched or become distractors.
-# (Weapon *parts* — barrels, stocks, scopes, grips, suppressors — are type
-# 'mods' and are kept.)
-EXCLUDED_TYPES = {'ammo', 'ammoBox', 'gun', 'preset', 'container'}
-
-
-def is_target_item(item):
-    """True if the item is a match target (not ammo / gun / preset / container)."""
-    return not (set(item.get('types') or ()) & EXCLUDED_TYPES)
 
 PRICE_QUERY = '''{
   items {
-    id name shortName basePrice avg24hPrice low24hPrice iconLink width height
+    id name shortName basePrice avg24hPrice low24hPrice lastLowPrice iconLink width height
     backgroundColor gridImageLink baseImageLink types
-    sellFor { vendor { name } priceRUB }
+    sellFor { vendor { name } priceRUB price currency }
   }
+}'''
+
+# The flea market's live rules and what each trader pays, from the game's own
+# globals via tarkov.dev (schema checked 2026-10-01).  A separate, best-effort
+# query: if it fails the item prices still refresh and sellcalc's documented
+# constants apply.  Rates are fractions (0.05 = 5 %).
+RULES_QUERY = '''{
+  fleaMarket {
+    minPlayerLevel enabled sellOfferFeeRate sellRequirementFeeRate foundInRaidRequired
+    reputationLevels { offers offersSpecialEditions minRep maxRep }
+  }
+  traders { name currency { shortName } levels { level payRate } }
 }'''
 
 TASKS_QUERY = '''{
@@ -159,7 +152,7 @@ TASKS_QUERY = '''{
     trader { name }
     objectives {
       id type
-      ... on TaskObjectiveItem { count foundInRaid item { id name shortName } }
+      ... on TaskObjectiveItem { count foundInRaid item { id name shortName } items { id name shortName } }
     }
   }
   hideoutStations {
@@ -174,7 +167,7 @@ class ScanError(Exception):
 
 
 # Shared state for hotkey-triggered scans
-_last_scan = {'image': None, 'detections': [], 'ts': 0,
+_last_scan = {'image': None, 'detections': [], 'ts': 0, 'grid_failed': False,
               'error': None, 'warnings': [], 'checklist_matches': []}
 _scan_lock = threading.Lock()
 
@@ -213,8 +206,7 @@ def load_json(path, default_fn):
     return data
 
 def save_json(path, data):
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    tarkovdata.write_json_atomic(path, data, indent=2)     # temp file + os.replace: never half-written
 
 
 # ---------------------------------------------------------------------------
@@ -260,21 +252,189 @@ def _is_newer(remote, local):
 # Pricing helpers
 # ---------------------------------------------------------------------------
 
-def fetch_prices():
-    """Fetch all item prices from tarkov.dev and write to cache."""
+class PriceFetchError(Exception):
+    """tarkov.dev did not return item data (outage, rate limit, schema change)."""
+
+
+def _graphql_prices():
+    """Item prices from tarkov.dev's GraphQL API (the fallback source) as a cache dict.
+    Not written anywhere; raises PriceFetchError."""
     r = http_requests.post(TARKOV_API, json={'query': PRICE_QUERY}, timeout=30)
-    items = r.json()['data']['items']
-    cache = {'timestamp': time.time(), 'items': items}
-    save_json(PRICES_PATH, cache)
+    try:
+        body = r.json()
+    except ValueError:
+        raise PriceFetchError(f'tarkov.dev returned HTTP {r.status_code} with no JSON')
+    items = (body.get('data') or {}).get('items')
+    if not items:
+        errs = '; '.join(e.get('message', '?') if isinstance(e, dict) else str(e)
+                         for e in body.get('errors') or []) or 'no items'
+        raise PriceFetchError(f'tarkov.dev HTTP {r.status_code}: {errs}')
+    return {'timestamp': time.time(), 'source': 'graphql', 'items': items}
+
+
+def parse_sell_rules(data):
+    """The RULES_QUERY response's ``data`` as the compact blob sellcalc reads:
+    {'flea': {...fleaMarket...}, 'traders': {name: {'currency', 'pay_rates': {level: rate}}}}.
+    None when there is nothing usable."""
+    data = data or {}
+    flea = data.get('fleaMarket') or None
+    traders = {}
+    for t in data.get('traders') or []:
+        name = t.get('name')
+        rates = {lv['level']: lv['payRate'] for lv in t.get('levels') or []
+                 if lv.get('level') and lv.get('payRate')}
+        if name and rates:
+            traders[name] = {'currency': (t.get('currency') or {}).get('shortName'),
+                             'pay_rates': rates}
+    if not flea and not traders:
+        return None
+    return {'flea': flea, 'traders': traders}
+
+
+def fetch_sell_rules():
+    """Best-effort fetch of the flea fee rates / FiR rule / trader pay rates (GraphQL).
+    Never raises: an outage or a schema change leaves the documented constants
+    in force (sellcalc)."""
+    try:
+        r = http_requests.post(TARKOV_API, json={'query': RULES_QUERY}, timeout=20)
+        return parse_sell_rules((r.json() or {}).get('data'))
+    except Exception as e:
+        print(f'[prices] sell rules unavailable, using built-in constants: {e}')
+        return None
+
+
+# Refresh bookkeeping shared by the on-demand paths and the background refresher.
+_refresh_lock = threading.RLock()     # one refresh at a time (the refresher, a scan, the Refresh button)
+_refresh_state = {                    # in-memory status, merged into /api/prices/status
+    'prices': {'attempt': 0, 'error': None},
+    'tasks':  {'attempt': 0, 'error': None},
+}
+
+
+def _load_cache(path):
+    """A cache file's content, or None if it is missing/unreadable (never creates it)."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _load_meta():
+    return tarkovdata.load_meta(META_PATH)
+
+
+def _save_meta_quietly(meta):
+    try:
+        tarkovdata.save_meta(META_PATH, meta)
+    except OSError as e:
+        print(f'[refresh] could not save refresh bookkeeping: {e}')
+
+
+def _usable_prices(cache):
+    return cache if cache and cache.get('items') else None
+
+
+def fetch_prices_graphql(previous=None):
+    """Refresh the price cache from the GraphQL API alone (the fallback source).  Validated
+    like the JSON source, written atomically, returns the cache.  Raises PriceFetchError."""
+    cache = _graphql_prices()
+    previous = previous if previous is not None else _usable_prices(_load_cache(PRICES_PATH))
+    try:
+        tarkovdata.validate_items(cache['items'], (previous or {}).get('items'))
+    except tarkovdata.SourceError as e:
+        raise PriceFetchError(f'tarkov.dev GraphQL data refused: {e}')
+    rules = fetch_sell_rules() or (_load_cache(PRICES_PATH) or {}).get('rules')
+    if rules:
+        cache['rules'] = rules
+    tarkovdata.write_json_atomic(PRICES_PATH, cache)
     return cache
 
+
+def refresh_prices(force=False):
+    """Bring the price cache up to date.  Source order: json.tarkov.dev (conditional, cheap
+    when nothing changed), then the GraphQL API, then - as an error - the cache that is
+    already on disk (the callers' stale-cache fallback).  Never replaces a good cache with
+    a bad one.  Returns ``{'status', 'source', 'cache', 'new_ids'}``; a new item id on a
+    machine that already has a catalog queues the catalog update."""
+    with _refresh_lock:
+        previous = _usable_prices(_load_cache(PRICES_PATH))
+        meta = _load_meta()
+        _refresh_state['prices']['attempt'] = meta['attempted']['prices'] = time.time()
+        if force:
+            meta['etags'] = {}
+        try:
+            try:
+                res = tarkovdata.refresh_prices(PRICES_PATH, meta, previous)
+                res['source'] = tarkovdata.SOURCE_NAME
+            except Exception as json_err:      # network, bad payload, a converter bug: all fall back
+                print(f'[prices] json.tarkov.dev failed ({json_err}); trying the GraphQL API')
+                try:
+                    cache = fetch_prices_graphql(previous)
+                except (PriceFetchError, http_requests.RequestException) as gql_err:
+                    raise PriceFetchError(f'json.tarkov.dev: {json_err}; GraphQL: {gql_err}')
+                meta['checked']['prices'] = cache['timestamp']
+                meta['sources']['prices'] = 'graphql'
+                meta['etags'].pop('items', None)      # the cache is no longer the JSON data: never 304 against it
+                meta['etags'].pop('items_en', None)
+                old_ids = {i['id'] for i in (previous or {}).get('items', ())}
+                res = {'status': 'updated', 'source': 'graphql', 'cache': cache,
+                       'new_ids': [i['id'] for i in cache['items'] if i['id'] not in old_ids] if old_ids else []}
+        except PriceFetchError as e:
+            meta['errors']['prices'] = str(e)
+            _refresh_state['prices']['error'] = str(e)
+            _save_meta_quietly(meta)
+            raise
+        meta['errors'].pop('prices', None)
+        _refresh_state['prices']['error'] = None
+        if res['new_ids']:
+            meta['catalog_pending'] = sorted(set(meta['catalog_pending']) | set(res['new_ids']))
+        _save_meta_quietly(meta)
+    if res['new_ids']:
+        print(f"[prices] {len(res['new_ids'])} new items")
+        _queue_catalog_update()
+    return res
+
+
+def fetch_prices():
+    """Refresh the price cache now (see :func:`refresh_prices`) and return it."""
+    return refresh_prices()['cache']
+
+
+def _cache_age_seconds(cache, kind):
+    """Seconds since this cache was last confirmed current: written, or re-checked
+    (a 304 from json.tarkov.dev rewrites nothing)."""
+    ts = (cache or {}).get('timestamp', 0)
+    try:
+        ts = max(ts, _load_meta()['checked'].get(kind) or 0)
+    except Exception:
+        pass
+    return time.time() - ts
+
+
 def get_prices():
-    """Return cached prices, refreshing if stale."""
-    if os.path.exists(PRICES_PATH):
-        cache = load_json(PRICES_PATH, lambda: None)
-        if cache and time.time() - cache.get('timestamp', 0) < PRICE_CACHE_TTL:
-            return cache
-    return fetch_prices()
+    """Return cached prices, refreshing if stale.
+
+    The background refresher normally keeps the cache current, so this is cheap.  A failed
+    refresh (tarkov.dev outage) falls back to the last good cache, marked ``stale_error`` so
+    the UI can say how old the prices are - a temporary API problem must not stop a sell
+    scan - and is not retried for RETRY_BACKOFF seconds (a scan never waits on a dead
+    network twice in a row).
+    """
+    cache = _usable_prices(_load_cache(PRICES_PATH))
+    if cache and _cache_age_seconds(cache, 'prices') < PRICE_CACHE_TTL:
+        return cache
+    err = _refresh_state['prices']['error']
+    if cache and err and time.time() - _refresh_state['prices']['attempt'] < RETRY_BACKOFF:
+        return {**cache, 'stale_error': err}
+    try:
+        return fetch_prices()
+    except (PriceFetchError, http_requests.RequestException) as e:
+        if not cache:
+            raise
+        print(f'[prices] refresh failed, using cached prices: {e}')
+        return {**cache, 'stale_error': str(e)}
 
 def build_price_index(cache):
     """Build name/shortname lookup from cache."""
@@ -426,11 +586,14 @@ def map_keep_entries_to_ids(keep_list, price_idx):
     return mapped, unmapped
 
 # ---------------------------------------------------------------------------
-# Icon download + template matching helpers
+# Item catalog build (the "Build Icon DB" button on the Sell Advisor page)
+#
+# The identification engine (identify/) matches against a template catalog made from the
+# price list plus one tarkov.dev base image per item (every item - ammo, guns, presets and
+# containers included - because the engine identifies those too).  These helpers fetch the
+# images into data/tmpl_src/; identify.catalog.load_catalog then turns them into
+# data/identify_catalog_v2.npz.
 # ---------------------------------------------------------------------------
-
-def icon_cache_path(item_id):
-    return os.path.join(ICONS_DIR, f'{item_id}.png')
 
 _icon_session = None
 def _get_icon_session():
@@ -443,62 +606,6 @@ def _get_icon_session():
         _icon_session = s
     return _icon_session
 
-def download_icon(item_id, icon_url):
-    """Download icon PNG from tarkov.dev and cache it. Returns local path or None."""
-    path = icon_cache_path(item_id)
-    if os.path.exists(path) and os.path.getsize(path) > 0:
-        return path
-    try:
-        r = _get_icon_session().get(icon_url, timeout=10)
-        if r.status_code == 200:
-            with open(path, 'wb') as f:
-                f.write(r.content)
-            return path
-    except Exception:
-        pass
-    return None
-
-# match_icon() (whole-screenshot cv2.matchTemplate against 64×64 iconLink
-# thumbnails) was retired: it stretched aspect-wrong thumbnails and drifted
-# across the grid.  Keep-list highlighting now runs through the same masked-NCC
-# icon DB as the sell scanner (see /api/screenshot).
-
-
-# ---------------------------------------------------------------------------
-# Icon matching via canonical-resolution normalized cross-correlation (NCC).
-#
-# Strategy:
-#   1. At DB build time: composite every item icon on a dark stash-like bg,
-#      resize it to a CANONICAL size (CANONICAL_PER_SLOT × W, CANONICAL_PER_SLOT × H),
-#      convert to grayscale, and store the flattened uint8 vector.
-#   2. At scan time: crop each candidate cell block, resize to the same
-#      canonical size, flatten, and compute NCC against every template of
-#      that (W,H) size via a single batched dot product.
-#
-# Because every cell is resized independently, sub-pixel grid drift across
-# the screenshot does NOT accumulate — each cell is normalized to the same
-# reference frame as the database icons.
-# ---------------------------------------------------------------------------
-
-_UINT64 = np.uint64   # kept for backwards compat, unused by NCC
-
-def _composite_on_dark(icon_bgra, bg_rgb=(38, 42, 44)):
-    """Composite a BGRA icon onto a solid background colour (BGR tuple)."""
-    if icon_bgra.ndim == 2:
-        return cv2.cvtColor(icon_bgra, cv2.COLOR_GRAY2BGR)
-    if icon_bgra.shape[2] == 3:
-        return icon_bgra
-    rgb = icon_bgra[:, :, :3].astype(np.float32)
-    alpha = (icon_bgra[:, :, 3:4].astype(np.float32)) / 255.0
-    bg = np.full_like(rgb, bg_rgb, dtype=np.float32)
-    out = rgb * alpha + bg * (1.0 - alpha)
-    return out.astype(np.uint8)
-
-
-def tint_for(item):
-    """Return the EFT stash-cell background tint (BGR) for an item's rarity colour."""
-    return EFT_BG_TINTS.get(item.get('backgroundColor') or 'default', DEFAULT_TINT)
-
 
 def base_image_path(item_id):
     return os.path.join(TMPL_SRC_DIR, f'{item_id}.png')
@@ -506,11 +613,8 @@ def base_image_path(item_id):
 
 def download_base_image(item_id, url):
     """
-    Download a tarkov.dev base-image (transparent, per-slot resolution) and
-    cache it as a BGRA PNG.  Returns local path or None.
-
-    The base-image is the correct-geometry, real-alpha source that replaces the
-    fatal 64×64 iconLink thumbnail for template matching.
+    Download a tarkov.dev base image (transparent, per-slot resolution) and cache it as a
+    BGRA PNG in data/tmpl_src/.  Returns the local path, or None when it could not be fetched.
     """
     path = base_image_path(item_id)
     if os.path.exists(path) and os.path.getsize(path) > 0:
@@ -521,1283 +625,141 @@ def download_base_image(item_id, url):
         r = _get_icon_session().get(url, timeout=12)
         if r.status_code != 200:
             return None
-        arr = np.frombuffer(r.content, np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)   # decodes webp → BGRA
+        img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_UNCHANGED)   # webp -> BGRA
         if img is None or img.size == 0:
             return None
-        if img.ndim == 3 and img.shape[2] == 4:
-            cv2.imwrite(path, img)
-        else:
-            # No alpha (rare) — store as-is; mask falls back to saturation heuristic
-            cv2.imwrite(path, img)
+        tmp = path + '.tmp.png'          # write-then-rename: a killed build never leaves a half file
+        cv2.imwrite(tmp, img)
+        os.replace(tmp, path)
         return path
     except Exception:
         return None
 
-def _apply_label_blank(img_bgr, slot=None):
-    """
-    Overwrite Tarkov UI overlay regions with the stash background colour:
-      - top label strip          → erases the white item-name label
-      - top-right corner         → erases the Found-in-Raid ✓
-      - bottom-right corner      → erases the white stack-count digits
 
-    Game crops: removes UI artefacts the game overlays on the cell.
-    Icon templates: those regions are already transparent-composited to bg,
-                    so this is effectively a no-op (kept for symmetry).
-
-    `slot` is the px-per-slot of the image being blanked.  When given, the
-    blank regions scale as LABEL_BLANK_PX/CORNER_BLANK_PX fractions of the
-    canonical slot — so a 42px screen cell blanks the same *fraction* the
-    template masks blank at canonical resolution (floor'd, to stay inside the
-    mask-zeroed region).  When None (template-build path, ~63px sources), the
-    legacy fixed-pixel constants apply unchanged.
-
-    Overwriting (not cropping) preserves image dimensions so the downstream
-    resize step has no geometry distortion.
-    """
-    h, w = img_bgr.shape[:2]
-    out = img_bgr.copy()
-    if slot is None:
-        blank_px, corner_px = LABEL_BLANK_PX, CORNER_BLANK_PX
-    else:
-        blank_px  = int(LABEL_BLANK_PX  * slot / CANONICAL_PER_SLOT)
-        corner_px = int(CORNER_BLANK_PX * slot / CANONICAL_PER_SLOT)
-    n = min(blank_px, h // 4)
-    if n > 0:
-        out[:n, :] = _STASH_BG_BGR
-    c = min(corner_px, h // 3, w // 3)
-    if c > 0:
-        # top-right corner (FiR check mark)
-        out[:c, w - c:] = _STASH_BG_BGR
-        # bottom-right corner (stack-count digits)
-        out[h - c:, w - c:] = _STASH_BG_BGR
-    return out
+def download_missing_base_images(price_cache, progress_cb=None, workers=24):
+    """Fetch the base image of every item that does not have one yet, in parallel.
+    Returns (downloaded, failed).  progress_cb(done, total) counts only the missing ones."""
+    from concurrent.futures import ThreadPoolExecutor
+    todo = [it for it in price_cache.get('items', [])
+            if it.get('baseImageLink') and not os.path.exists(base_image_path(it['id']))]
+    done = ok = 0
+    if progress_cb:
+        progress_cb(0, len(todo))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for path in ex.map(lambda it: download_base_image(it['id'], it['baseImageLink']), todo):
+            done += 1
+            ok += bool(path)
+            if progress_cb and done % 25 == 0:
+                progress_cb(done, len(todo))
+    if progress_cb:
+        progress_cb(len(todo), len(todo))
+    return ok, len(todo) - ok
 
 
-def detect_fir(img_bgr, grid, col, row, W, H):
-    """
-    Read the Found-in-Raid ✓ out of the RAW frame (call this BEFORE any
-    _apply_label_blank crop-copy has blanked the corner — `img_bgr` here is
-    the full screenshot, not a per-cell copy, so the mark is still present).
-
-    The game draws a small white/bright checkmark in the top-right corner of
-    the item's FOOTPRINT (not each individual cell), so the sample window is
-    anchored off the footprint's right edge, scaled to the same 18px@63px-cell
-    ratio _apply_label_blank uses.
-
-    Three-valued return — True / False / None — and this is load-bearing:
-      True  = confidently FiR (a checkmark-shaped bright cluster was found).
-      False = confidently NOT FiR (corner is clean background).
-      None  = indeterminate (label overflow into the corner, off-image window,
-              or ambiguous pixel count). Callers must NEVER treat None as
-              "not FiR" — a caller that downgrades/unprotects an item on None
-              risks incorrectly letting a real FiR item be sold or excluding
-              it from a Kappa checklist it actually satisfies.
-    """
-    x2 = int(round(grid['origin_x'] + (col + W) * grid['cell_w']))
-    y1 = int(round(grid['origin_y'] + row * grid['cell_h']))
-    c = round(18 * grid['cell_w'] / 63)
-    if c < 1:
+def catalog_summary():
+    """What the Sell Advisor's status line shows: whether the engine's catalog file exists and
+    how many tarkov.dev items it covers (None when not built or unreadable)."""
+    from identify.config import CATALOG_PATH
+    if not os.path.exists(CATALOG_PATH):
         return None
-    sh, sw = img_bgr.shape[:2]
-    wx1, wy1 = max(0, x2 - c), max(0, y1)
-    wx2, wy2 = min(sw, x2), min(sh, y1 + c)
-    if wy2 - wy1 < 3 or wx2 - wx1 < 3:
-        return None
-    window = img_bgr[wy1:wy2, wx1:wx2]
-
-    gray = cv2.cvtColor(window, cv2.COLOR_BGR2GRAY)
-    hsv  = cv2.cvtColor(window, cv2.COLOR_BGR2HSV)
-    sat  = hsv[:, :, 1]
-    bright_mask = (gray > FIR_BRIGHT) & (sat < 60)
-
-    # If the bright mask touches the window's left edge, it's very likely the
-    # item's name label overflowing into the corner (long names run the full
-    # cell width) rather than the checkmark glyph — indeterminate, not False.
-    if bright_mask[:, 0].any():
+    try:
+        with np.load(CATALOG_PATH, allow_pickle=False) as z:     # lazy: only meta_json is read
+            return {'items': int(json.loads(str(z['meta_json'])).get('n_api', 0))}
+    except Exception as e:
+        print(f'[catalog] unreadable: {e}')
         return None
 
-    n = int(bright_mask.sum())
-    if n == 0:
+
+# ---------------------------------------------------------------------------
+# Identification: the identify/ package (grid -> segmentation -> template/DINO/OCR matching)
+# ---------------------------------------------------------------------------
+
+_v2_engine = [None, None]    # [settings key, Engine]
+
+
+def scan_with_v2(img_bgr, settings, warnings):
+    """
+    Run the identification engine (identify/ package) and adapt its output to what the
+    scan routes consume: raw detections as dicts (col,row,W,H,item_id,name,rotated,
+    score 0-100,fir,panel,px,py,pw,ph — plus uncertain/count), the panel list as grid dicts
+    (cell_w/cell_h/origin_x/origin_y/...), and whether the grid was found at all.
+    """
+    from identify.config import EngineSettings
+    from identify.pipeline import Engine
+    if not os.path.exists(PRICES_PATH) or next(os.scandir(TMPL_SRC_DIR), None) is None:
+        # clean install: the catalog is built from the price list + tarkov.dev base images
+        raise ScanError("The item database isn't built yet. Open the Sell Advisor page and click "
+                        "'Build Icon DB' first (needs internet; takes a few minutes the first time).")
+    es = EngineSettings.from_settings(settings)
+    if tesseract_path_override():
+        es.tesseract_cmd = tesseract_path_override()
+    key = repr(es)
+    if _v2_engine[0] != key:
+        _v2_engine[:] = [key, Engine(es)]
+    res = _v2_engine[1].scan(img_bgr)
+    warnings.extend(res.warnings)
+    panels = [{**p.as_grid_dict(), 'strength': p.strength} for p in res.grid.panels]
+    if not panels:
+        warnings.append('Stash grid not detected — check the capture region covers '
+                        'the stash, or recalibrate.')
+        return [], [{'cell_w': 64.0, 'cell_h': 64.0, 'origin_x': 0.0, 'origin_y': 0.0,
+                     'x0': 0, 'y0': 0, 'x1': img_bgr.shape[1], 'y1': img_bgr.shape[0]}], True
+    print(f"[v2] {len(res.detections)} items in {res.timings.get('total', 0):.2f}s "
+          f"({', '.join(f'{k} {v:.2f}' for k, v in res.timings.items() if k != 'total')})")
+    return [d.to_record() for d in res.detections], panels, False
+
+
+def tesseract_path_override():
+    """pytesseract's command if app.py had to point it at the default Windows install."""
+    cmd = pytesseract.pytesseract.tesseract_cmd
+    return cmd if cmd and cmd != 'tesseract' else None
+
+
+def is_unpriced_weapon(item_data, category=None):
+    """True for a gun the sell list should skip.
+
+    A gun's value depends on whatever parts are on it, so its identity can't
+    price it.  tarkov.dev also tags signal flares (RSP-30) as 'gun', but those
+    are fixed special-slot items with a real price, so they are kept.
+    """
+    types = set((item_data or {}).get('types') or ())
+    if 'specialSlot' in types:
         return False
-    # FIR_MIN_PX was calibrated on 63px cells (18px corner window); the ✓
-    # glyph's pixel count shrinks with the window AREA, so scale quadratically
-    # for low-pitch captures (floor 2 keeps a couple of stray bright px from
-    # reading as a checkmark).
-    min_px = max(2, round(FIR_MIN_PX * (grid['cell_w'] / 63.0) ** 2))
-    max_px = FIR_MAX_FRAC * window.shape[0] * window.shape[1]
-    if min_px <= n <= max_px:
+    if types & {'gun', 'preset'}:
         return True
+    return item_data is None and category == 'weapon'
+
+
+def is_dogtag(item_data):
+    """True for a PMC dogtag.  Dozens of themed tags share the names "Dogtag BEAR" /
+    "Dogtag USEC", so they can't be told apart or priced reliably; the sell list
+    skips them.  The Dogtag case is a normal container and is kept."""
+    name = (item_data or {}).get('name') or ''
+    return name.startswith('Dogtag ') and 'container' not in ((item_data or {}).get('types') or ())
+
+
+def skip_badge(item_data, category=None):
+    """Badge for an item the sell list leaves out ('GUN', 'TAG'), or None to price it."""
+    if is_unpriced_weapon(item_data, category):
+        return 'GUN'
+    if is_dogtag(item_data):
+        return 'TAG'
     return None
 
 
-def _canonical_bgr_flat(img_bgr, W, H):
-    """
-    Resize a BGR image to the canonical grid size (W*SLOT × H*SLOT) and return a
-    flat float32 array of shape (W*SLOT * H*SLOT * 3,).
-
-    Full BGR colour gives the NCC 3× the signal of grayscale and lets per-item
-    colour signatures drive matching.  The [0,210] clip suppresses residual
-    white UI artefacts that have no equivalent in the clean templates.
-
-    NOTE: near-identical items that share a silhouette and differ only by a
-    small coloured region + printed label (the whole stimulant-injector family)
-    are NOT reliably separable here — the shared shape dominates NCC.  Chroma
-    amplification was tried and made it worse (it turned the neutral body into
-    matching noise / universal high correlation).  Exact separation of those
-    needs the game's index.json hash → item mapping (see icon_cache notes).
-    """
-    tw = W * CANONICAL_PER_SLOT
-    th = H * CANONICAL_PER_SLOT
-    resized = cv2.resize(img_bgr, (tw, th), interpolation=cv2.INTER_AREA)
-    resized = np.clip(resized, 0, 210)   # suppress residual white UI artefacts
-    return resized.astype(np.float32).reshape(-1)
-
-
-def _build_foreground_mask(raw, w, h):
-    """
-    Build a per-pixel foreground mask at canonical resolution, BGR-replicated
-    flat (size W*SLOT * H*SLOT * 3).  Used to weight NCC so background pixels
-    don't dominate matches on icons with mostly-transparent assets (Meds,
-    screws, ornaments, etc.).
-
-    Source preference:
-      1. PNG alpha channel (alpha > 32) — most accurate.
-      2. Saturation fallback for non-alpha sources: |max(BGR) - min(BGR)| > 12
-         excludes near-uniform dark/grey areas.
-    """
-    tw = w * CANONICAL_PER_SLOT
-    th = h * CANONICAL_PER_SLOT
-    if raw.ndim == 3 and raw.shape[2] == 4:
-        alpha = raw[:, :, 3]
-        mask2d = (alpha > 32).astype(np.uint8)
-    else:
-        bgr = raw if raw.ndim == 3 else cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
-        bgr = bgr[:, :, :3].astype(np.int16)
-        sat = bgr.max(axis=2) - bgr.min(axis=2)
-        mask2d = (sat > 12).astype(np.uint8)
-    mask2d = cv2.resize(mask2d, (tw, th), interpolation=cv2.INTER_NEAREST)
-    # Zero out regions that get blanked by _apply_label_blank so they don't
-    # contribute to NCC — keeps the mask consistent with the BGR templates.
-    n = min(LABEL_BLANK_PX, th // 4)
-    if n > 0:
-        mask2d[:n, :] = 0
-    c = min(CORNER_BLANK_PX, th // 3, tw // 3)
-    if c > 0:
-        mask2d[:c, tw - c:] = 0
-        mask2d[th - c:, tw - c:] = 0
-    # Replicate per-pixel mask across BGR channels and flatten
-    mask3 = np.repeat(mask2d[:, :, None], 3, axis=2)
-    return mask3.reshape(-1).astype(np.uint8)
-
-
-def _template_from_bgra(src, W, H, tint):
-    """
-    From a BGRA (or BGR) source image at any resolution, produce a
-    (canonical BGR vector, foreground mask) pair for footprint W×H, or None
-    if the icon has no usable foreground.
-
-    `src` is composited onto the item's rarity `tint` so anti-aliased edges
-    match the real tinted stash cell.  The alpha channel drives the foreground
-    mask; masked-out (background) pixels never contribute to NCC.
-    """
-    composited = _composite_on_dark(src, tint)
-    composited = _apply_label_blank(composited)   # consistent with crop-side blanking
-    canon = _canonical_bgr_flat(composited, W, H)   # clip + chroma-weighted Lab applied inside
-    mask = _build_foreground_mask(src, W, H)
-    if mask.sum() < 16:
-        return None
-    return canon, mask
-
-
-def _load_template_source(item):
-    """
-    Return a BGRA (or BGR) source image for an item's template, preferring the
-    correct-geometry tarkov.dev base-image (transparent, per-slot resolution).
-    Falls back to the grid-image (background baked, no alpha) if base is absent.
-    Returns (src_ndarray, has_alpha) or (None, False).
-    """
-    path = download_base_image(item['id'], item.get('baseImageLink'))
-    if path:
-        src = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if src is not None and src.size and src.ndim == 3 and src.shape[2] == 4:
-            return src, True
-    # Fallback: grid image (baked background — weaker foreground mask)
-    gpath = download_base_image(item['id'] + '-g', item.get('gridImageLink'))
-    if gpath:
-        src = cv2.imread(gpath, cv2.IMREAD_UNCHANGED)
-        if src is not None and src.size:
-            return src, (src.ndim == 3 and src.shape[2] == 4)
-    return None, False
-
-
-def _rotations_for(src, W, H):
-    """
-    Yield (footprint_wh, rotated_flag, rotated_src) variants for a template.
-
-    Always yields the native orientation.  For non-square items, also yields
-    both 90° rotations (game rotates the icon pixels when placed rotated) into
-    the transposed (H,W) footprint bucket.  Both CW and CCW are indexed because
-    the in-game rotation direction is orientation-dependent; the id-aware margin
-    check keeps the two same-item variants from rejecting each other.
-    """
-    yield (W, H), False, src
-    if W != H:
-        yield (H, W), True, cv2.rotate(src, cv2.ROTATE_90_CLOCKWISE)
-        yield (H, W), True, cv2.rotate(src, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-
-def _build_one_template(item):
-    """
-    Worker: download the base image and produce API-source template record(s).
-
-    Returns a list of records
-        (footprint_wh, item_id, name, source, rotated, canon_vec, mask)
-    — one native plus (for non-square items) two rotated variants — or [].
-    """
-    W = item.get('width') or 1
-    H = item.get('height') or 1
-    tint = tint_for(item)
-    src, _has_alpha = _load_template_source(item)
-    if src is None:
-        return []
-    records = []
-    for (fw, fh), rotated, rsrc in _rotations_for(src, W, H):
-        made = _template_from_bgra(rsrc, fw, fh, tint)
-        if made is None:
-            continue
-        canon, mask = made
-        records.append(((fw, fh), item['id'], item['name'], 'api', rotated, canon, mask))
-    return records
-
-
-def _stack_raw(by_size_raw):
-    """
-    Convert {(w,h): {'ids': [...], ..., 'tmpls': [uint8 vec, ...], 'masks': [...]}}
-    into the compact RAW runtime form kept in memory:
-        {(w,h): {'ids','names','sources','rotated', 'T': (N,D) uint8, 'M': (N,D) uint8}}
-    Templates stay at canonical resolution (CANONICAL_PER_SLOT px/slot); the
-    matcher-ready float vectors are derived per screen pitch by get_db_at_pitch.
-    """
-    out = {}
-    for (w, h), b in by_size_raw.items():
-        if not b['tmpls']:
-            continue
-        n = len(b['ids'])
-        out[(w, h)] = {
-            'ids':     b['ids'],
-            'names':   b['names'],
-            'sources': b.get('sources', ['api'] * n),
-            'rotated': b.get('rotated', [False] * n),
-            'T':       np.vstack(b['tmpls']).astype(np.uint8),
-            'M':       np.vstack(b['masks']).astype(np.uint8),
-        }
-    return out
-
-
-def _finalize_arrays(tmpls, masks):
-    """
-    Precompute masked-NCC vectors from float32 (N, D) template/mask matrices.
-
-    Each template is masked-mean-centred and unit-normed using ITS OWN mask,
-    so at match time:
-        scores = (tmpls_unit @ cell) / sqrt(masks @ cell² - (masks @ cell)² / mask_counts)
-    correctly computes NCC restricted to each template's foreground region.
-    """
-    mask_counts = masks.sum(axis=1)                      # (N,)
-    # Per-template masked mean = Σ(mask * tmpl) / Σ(mask)
-    masked_means = (masks * tmpls).sum(axis=1) / np.maximum(mask_counts, 1.0)  # (N,)
-    # Mean-centre INSIDE the mask, zero OUTSIDE — multiply-by-mask handles both
-    centered = (tmpls - masked_means[:, None]) * masks
-    norms = np.linalg.norm(centered, axis=1, keepdims=True)
-    norms = np.where(norms > 1e-6, norms, 1.0)
-    tmpls_unit = (centered / norms).astype(np.float32)
-    return tmpls_unit, masks.astype(np.float32), mask_counts.astype(np.float32)
-
-
-def _slot_px(grid):
-    """
-    Matching slot size (px/slot) for a detected grid: the screen's own pitch,
-    capped at canonical (matching above canonical adds no information, only
-    memory), floored to keep degenerate grids from producing empty templates.
-    """
-    spw = max(16, min(CANONICAL_PER_SLOT, int(round(grid['cell_w']))))
-    sph = max(16, min(CANONICAL_PER_SLOT, int(round(grid['cell_h']))))
-    return spw, sph
-
-
-_pitch_db_cache = {}          # (spw, sph) -> matcher db; only most recent kept
-_pitch_db_lock = threading.Lock()
-
-
-def _invalidate_pitch_cache():
-    with _pitch_db_lock:
-        _pitch_db_cache.clear()
-
-
-def get_db_at_pitch(raw_db, spw, sph):
-    """
-    Matcher-ready DB at slot size (spw, sph): templates and masks resampled
-    from canonical resolution to the screen's own pitch (INTER_AREA — mirrors
-    the game's own downscale when it renders 63px cache icons in a smaller
-    window), then masked-NCC finalized.  Cached; a pitch change (rare) evicts
-    the previous pitch's arrays.
-    """
-    key = (spw, sph)
-    with _pitch_db_lock:
-        if key in _pitch_db_cache:
-            return _pitch_db_cache[key]
-        canonical = (spw == CANONICAL_PER_SLOT and sph == CANONICAL_PER_SLOT)
-        t0 = time.time()
-        out = {}
-        for (w, h), b in raw_db.items():
-            T, M = b['T'], b['M']
-            if canonical:
-                tmpls = T.astype(np.float32)
-                masks = (M > 0).astype(np.float32)
-            else:
-                n = T.shape[0]
-                src_h, src_w = h * CANONICAL_PER_SLOT, w * CANONICAL_PER_SLOT
-                dst_h, dst_w = h * sph, w * spw
-                D = dst_h * dst_w * 3
-                tmpls = np.empty((n, D), dtype=np.float32)
-                masks = np.empty((n, D), dtype=np.float32)
-                for i in range(n):
-                    img = T[i].reshape(src_h, src_w, 3)
-                    tmpls[i] = cv2.resize(img, (dst_w, dst_h),
-                                          interpolation=cv2.INTER_AREA).reshape(-1)
-                    m = M[i].reshape(src_h, src_w, 3)
-                    masks[i] = cv2.resize(m, (dst_w, dst_h),
-                                          interpolation=cv2.INTER_NEAREST).reshape(-1)
-                masks = (masks > 0).astype(np.float32)
-            tmpls_unit, masks_f, mask_counts = _finalize_arrays(tmpls, masks)
-            out[(w, h)] = {
-                'ids':         b['ids'],
-                'names':       b['names'],
-                'sources':     b['sources'],
-                'rotated':     b['rotated'],
-                'tmpls_unit':  tmpls_unit,
-                'masks':       masks_f,
-                'mask_counts': mask_counts,
-            }
-        if not canonical:
-            total = sum(len(b['ids']) for b in out.values())
-            print(f"[icon_db] resampled {total} templates to {spw}×{sph}px/slot "
-                  f"in {time.time() - t0:.1f}s")
-        _pitch_db_cache.clear()          # keep only the active pitch in RAM
-        _pitch_db_cache[key] = out
-        return out
-
-
-def get_matcher_db(grid):
-    """Raw DB → matcher DB at the grid's own pitch (None if no DB built)."""
-    raw = get_icon_db()
-    if not raw:
-        return None
-    spw, sph = _slot_px(grid)
-    return get_db_at_pitch(raw, spw, sph)
-
-
-def _append_record(by_size_raw, wh, item_id, name, source, rotated, vec, mask):
-    b = by_size_raw.setdefault(wh, {'ids': [], 'names': [], 'sources': [],
-                                    'rotated': [], 'tmpls': [], 'masks': []})
-    b['ids'].append(item_id)
-    b['names'].append(name)
-    b['sources'].append(source)
-    b['rotated'].append(bool(rotated))
-    b['tmpls'].append(vec)
-    b['masks'].append(mask)
-
-
-def build_icon_db(price_cache, progress_cb=None, workers=24, use_cache=True):
-    """
-    Build a size-bucketed database of BGR colour templates ready for masked NCC.
-
-    Two template sources are merged:
-      1. The game's local icon cache (pixel-perfect, includes modded builds) —
-         associated to item IDs by icon_cache.build_cache_templates().  Preferred.
-      2. tarkov.dev base-images composited onto the rarity tint — full catalog
-         coverage, including items this account has never rendered.
-
-    Non-square items also get 90°-rotated variants so rotated placements match.
-    Persists to ICON_DB_PATH (npz).  Returns runtime dict.
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    # Only build templates for match targets — dropping ammo/guns/presets/cases
-    # removes ~1k distractors (esp. near-identical ammo) and can't be matched.
-    all_items = price_cache.get('items', [])
-    items = [it for it in all_items if is_target_item(it)]
-    print(f"[icon_db] target items: {len(items)} of {len(all_items)} "
-          f"(excluded {len(all_items) - len(items)} ammo/gun/preset/container)")
-    total = len(items)
-    done = 0
-    by_size_raw = {}
-
-    # --- Source 1: game icon cache (visually associated) ---------------------
-    cache_ids = set()
-    if use_cache:
-        try:
-            import icon_cache
-            cache_recs = icon_cache.build_cache_templates(
-                items, _template_from_bgra, tint_for, _load_template_source)
-            for (wh, item_id, name, rotated, vec, mask, exact) in cache_recs:
-                src = 'cache-exact' if exact else 'cache'
-                _append_record(by_size_raw, wh, item_id, name, src, rotated, vec, mask)
-                cache_ids.add(item_id)
-            print(f"[icon_db] cache templates: {len(cache_recs)} "
-                  f"({len(cache_ids)} distinct items)")
-        except Exception as e:
-            print(f"[icon_db] icon-cache pass skipped: {e}")
-
-    # --- Source 2: tarkov.dev base-images (full catalog) ---------------------
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(_build_one_template, it) for it in items]
-        for fut in as_completed(futures):
-            done += 1
-            if progress_cb and done % 25 == 0:
-                progress_cb(done, total)
-            try:
-                records = fut.result()
-            except Exception:
-                continue
-            for (wh, item_id, name, source, rotated, vec, mask) in records:
-                _append_record(by_size_raw, wh, item_id, name, source, rotated, vec, mask)
-    if progress_cb:
-        progress_cb(done, total)
-
-    save_icon_db(by_size_raw)
-    return _stack_raw(by_size_raw)
-
-
-def save_icon_db(by_size_raw):
-    """Save raw uint8 BGR templates + foreground masks + metadata to .npz."""
-    meta = {'_version': DB_VERSION}   # version stamp — mismatches trigger rebuild
-    saves = {}
-    for (w, h), b in by_size_raw.items():
-        if not b['tmpls']:
-            continue
-        key = f'{w}x{h}'
-        n = len(b['ids'])
-        saves[f'T_{key}'] = np.vstack(b['tmpls']).astype(np.uint8)
-        saves[f'M_{key}'] = np.vstack(b['masks']).astype(np.uint8)
-        meta[key] = {
-            'ids':     b['ids'],
-            'names':   b['names'],
-            'sources': b.get('sources', ['api'] * n),
-            'rotated': [bool(x) for x in b.get('rotated', [False] * n)],
-        }
-    meta_bytes = json.dumps(meta).encode('utf-8')
-    saves['META'] = np.frombuffer(meta_bytes, dtype=np.uint8)
-    # Write-then-rename so no reader can ever observe a half-written archive:
-    # the compressed write takes tens of seconds for a full DB, and the status
-    # endpoints poll get_icon_db() the whole time — np.load on a partial zip
-    # raises BadZipFile ("File is not a zip file"). The tmp name must already
-    # end in .npz or numpy appends the extension and os.replace misses it.
-    tmp_path = ICON_DB_PATH + '.tmp.npz'
+def build_sell_context(settings, prices):
+    """sellcalc context for one scan: settings + the live rules cached with the
+    prices + the Intelligence Center level from the hideout progress."""
+    intel = 0
     try:
-        np.savez_compressed(tmp_path, **saves)
-        os.replace(tmp_path, ICON_DB_PATH)
-    finally:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-
-
-def load_icon_db():
-    """Load the persisted icon DB, or None if missing/invalid/outdated."""
-    global _icon_db_error
-    if not os.path.exists(ICON_DB_PATH):
-        return None
-    try:
-        z = np.load(ICON_DB_PATH, allow_pickle=False)
-        meta = json.loads(bytes(z['META']).decode('utf-8'))
-        db_ver = meta.get('_version', 1)
-        if db_ver != DB_VERSION:
-            print(f"[icon_db] version mismatch (file={db_ver}, code={DB_VERSION}) — "
-                  "rebuild required (click Build Icon DB)")
-            return None
-        by_size_raw = {}
-        for key, info in meta.items():
-            if key.startswith('_'):      # skip internal fields like _version
-                continue
-            w, h = (int(x) for x in key.split('x'))
-            arr = z[f'T_{key}']   # (N, D) uint8
-            marr = z[f'M_{key}']  # (N, D) uint8
-            n = len(info['ids'])
-            by_size_raw[(w, h)] = {
-                'ids':     info['ids'],
-                'names':   info['names'],
-                'sources': info.get('sources', ['api'] * n),
-                'rotated': info.get('rotated', [False] * n),
-                'tmpls':   [arr[i] for i in range(arr.shape[0])],
-                'masks':   [marr[i] for i in range(marr.shape[0])],
-            }
-        db = _stack_raw(by_size_raw)
-        _icon_db_error = None   # a good load supersedes any earlier failure
-        return db
+        tasks = get_tasks(allow_fetch=False)
+        if tasks:
+            progress = load_json(PROGRESS_PATH, default_progress)
+            intel = sellcalc.intel_center_level(tasks.get('hideoutStations'),
+                                                progress.get('completed_hideout'))
     except Exception as e:
-        _icon_db_error = f'Icon DB load failed: {e}'
-        print(f"[icon_db] load failed: {e}")
-        return None
-
-
-# Global in-memory DB (populated on first use)
-_icon_db = None
-_icon_db_error = None
-_icon_db_lock = threading.Lock()
-
-def get_icon_db():
-    """Return the runtime icon DB, loading from disk if needed.
-
-    While a rebuild is in flight, don't touch the disk at all — the status
-    endpoints poll this several times a second, and each miss would re-read
-    (and re-log a version mismatch for) a file that's about to be replaced
-    anyway. The build thread publishes the fresh DB directly into _icon_db
-    when it finishes.
-    """
-    global _icon_db
-    if _icon_db is None and not _index_build_state['running']:
-        with _icon_db_lock:
-            if _icon_db is None:
-                _icon_db = load_icon_db()
-    return _icon_db
-
-
-# ---------------------------------------------------------------------------
-# Grid-cell identification using the canonical-template DB
-# ---------------------------------------------------------------------------
-
-def _cell_block(img_bgr, col, row, W, H, grid, pad=0, dx=0, dy=0):
-    """
-    Pixel rect of a W×H cell block starting at (col, row), optionally padded
-    and shifted by (dx, dy) whole pixels (alignment-refinement search).
-
-    Grid pitch/origin are floats (non-integer pitch is the norm for windowed
-    captures — 63·900/1080 = 52.5); each edge is rounded independently off the
-    accumulated float position so rounding error never drifts across the panel.
-    """
-    ox, oy = grid['origin_x'], grid['origin_y']
-    cw, ch = grid['cell_w'], grid['cell_h']
-    x1 = int(round(ox + col * cw)) + dx - pad
-    y1 = int(round(oy + row * ch)) + dy - pad
-    x2 = int(round(ox + (col + W) * cw)) + dx + pad
-    y2 = int(round(oy + (row + H) * ch)) + dy + pad
-    sh, sw = img_bgr.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(sw, x2), min(sh, y2)
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return img_bgr[y1:y2, x1:x2]
-
-
-def _cell_is_empty(img_bgr, col, row, grid):
-    """
-    Empty stash cells are pure background — very uniform dark pixels.
-    Tarkov background ≈ (38,42,44) BGR → gray ≈ 41.
-    An item will raise either the std (texture/shape) OR have pixels
-    meaningfully above the background level, even if the item is dark.
-    """
-    crop = _cell_block(img_bgr, col, row, 1, 1, grid)
-    if crop is None or crop.size == 0:
-        return True
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    if gray.shape[0] > 8 and gray.shape[1] > 8:
-        gray = gray[4:-4, 4:-4]
-    # Pixels meaningfully above the dark stash background (~41 gray)
-    above_bg = float((gray > 58).mean())
-    # Empty = essentially uniform AND almost nothing above background
-    return float(gray.std()) < 5.0 and above_bg < 0.04
-
-
-def _native_cell_vec(img_bgr, col, row, W, H, grid, spw, sph, dx=0, dy=0):
-    """
-    Extract the (W×H) cell block from the screenshot and return a flat
-    float32 BGR vector at the matching slot size (spw×sph px/slot — the
-    screen's own pitch, capped at canonical), ready for masked NCC against
-    a get_db_at_pitch DB of the same slot size.
-
-    Preprocessing:
-      1. Resize to the exact bucket dims (±1px rounding normalization; a
-         no-op when the pitch is integral).
-      2. _apply_label_blank(slot=sph) — overwrites top rows + right corners
-         with bg colour to remove Tarkov's label, FiR ✓, and stack-count
-         overlays, scaled to the slot size.
-      3. Clip [0, 210] — suppresses residual white UI artefacts that have
-         no equivalent in the clean icon templates.
-
-    (dx, dy) shifts the source crop by whole pixels for the alignment-
-    refinement search.  Per-template masked-mean-centring + unit-norming is
-    done at match time, since each template uses its own mask.
-    """
-    crop = _cell_block(img_bgr, col, row, W, H, grid, dx=dx, dy=dy)
-    if crop is None or crop.shape[0] < 8 or crop.shape[1] < 8:
-        return None
-    tw, th = W * spw, H * sph
-    if crop.shape[1] != tw or crop.shape[0] != th:
-        crop = cv2.resize(crop, (tw, th), interpolation=cv2.INTER_AREA)
-    crop = _apply_label_blank(crop, slot=sph)
-    crop = np.clip(crop, 0, 210)
-    return crop.astype(np.float32).reshape(-1)
-
-
-OCR_FULL_MIN_PITCH  = 40  # px/slot at/above which the OCR label may override NCC identity
-OCR_AGREE_MIN_PITCH = 30  # px/slot at/above which the OCR label may confirm (never override) NCC
-OCR_LABEL_BASE   = 78   # rapidfuzz WRatio floor to consider an OCR name candidate at all
-OCR_AGREE_CUTOFF = 78   # OCR agrees with NCC → accept (mutual confirmation)
-OCR_OVER_CUTOFF  = 84   # OCR overrides a *different* NCC identity → needs this
-OCR_SHORT_OVER   = 99   # short OCR tokens (≤3 chars) overriding NCC need near-exact (blocks 'Li'→Splint)
-
-
-def _ocr_tokens_contained(text, name, short):
-    """
-    True iff every OCR token is equal to, or a prefix of, some token of the
-    candidate's `name + ' ' + short` (case-insensitive).  Empty OCR token list
-    (e.g. blank/whitespace-only OCR text) always fails.
-
-    Guards the OCR override tier: rapidfuzz's WRatio scores on overall string
-    similarity, so a misread label can still cross OCR_OVER_CUTOFF against an
-    unrelated item purely by chance substring overlap — the reproduced failure
-    was a PMAG label OCR'd as 'gen m3' scoring 85.5 against "Benelli M3 …
-    charging handle" (>= the old 84 cutoff).  'gen' is not a token (or prefix
-    of a token) of any Benelli name/shortName token, so this correctly rejects
-    it, while still allowing legitimate partial reads like 'benel m3' (a
-    prefix of 'benelli') or 'pmag 30 gen m3' (all exact tokens) through.
-    """
-    ocr_tokens = [t for t in re.split(r'[^A-Za-z0-9]+', text.lower()) if len(t) >= 2]
-    if not ocr_tokens:
-        return False
-    ref_tokens = [t for t in re.split(r'[^A-Za-z0-9]+', (name + ' ' + short).lower()) if t]
-    return all(any(rt.startswith(ot) for rt in ref_tokens) for ot in ocr_tokens)
-
-
-def _ocr_cell_label(img_bgr, col, row, W, grid):
-    """
-    OCR the item name the game prints across the top of a cell (single line,
-    left-aligned).  This is the signal NCC lacks: it separates same-shape items
-    like L1 / SJ12 / eTG-c that share one injector silhouette.
-    Returns cleaned text (leading UI junk stripped) or ''.
-    """
-    x = int(round(grid['origin_x'] + col * grid['cell_w']))
-    y = int(round(grid['origin_y'] + row * grid['cell_h']))
-    w = int(round(W * grid['cell_w']))
-    lh = max(12, int(round(grid['cell_h'] * 0.30)))
-    sh, sw = img_bgr.shape[:2]
-    x1, y1 = max(0, x), max(0, y)
-    x2, y2 = min(sw, x + w), min(sh, y + lh)
-    if x2 - x1 < 8 or y2 - y1 < 6:
-        return ''
-    if not tesseract_available():
-        return ''
-    strip = cv2.cvtColor(img_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-    # Upscale to a fixed ~80px strip height (min 4×): low-pitch captures need
-    # proportionally more magnification for Tesseract to resolve the label
-    # (measured +2–4% accuracy at 42–52px/slot over the flat 4×).
-    f = max(4, int(round(80.0 / strip.shape[0])))
-    strip = cv2.resize(strip, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC)
-    try:
-        txt = pytesseract.image_to_string(strip, config='--psm 7')
-    except Exception:
-        return ''
-    txt = txt.strip().replace('\n', ' ')
-    # Strip leading non-alphanumeric OCR junk (FiR tick / tint speckle) but keep
-    # inner punctuation like CALOK-B, AHF1-M, #FireKlean.
-    while txt and not (txt[0].isalnum() or txt[0] == '#'):
-        txt = txt[1:]
-    return txt.strip()
-
-
-def build_label_matcher(price_cache):
-    """
-    Build a fuzzy matcher from OCR'd cell text → item over the whole target
-    catalogue (not ammo/gun/preset/container).  Identity is decided by the
-    printed name; the footprint is then taken from the item's own catalogue size
-    (see identify_items_by_icon) rather than NCC's guessed size — so a 1×2 MGT
-    can't be mislabelled a 2×1 and over-claim its neighbour.
-
-    Restricting candidates to the detected footprint (plus 1×1, the common
-    fallback when NCC over-sizes) keeps short tokens like 'L1' from colliding
-    with different-size items and avoids same-name cross-size ambiguity
-    (CAT tourniquet vs Cat figurine).
-
-    Returns matcher(text, fw, fh) -> (item_id, score, name, short, native_w, native_h) | None.
-    """
-    from rapidfuzz import process, fuzz
-    by_size = {}   # (w,h) -> (choices, ids, names, shorts)
-    for it in price_cache.get('items', []):
-        if not is_target_item(it):
-            continue
-        wh = (it.get('width') or 1, it.get('height') or 1)
-        b = by_size.setdefault(wh, ([], [], [], []))
-        for s in {it.get('shortName') or '', it.get('name') or ''}:
-            if s:
-                b[0].append(s.lower())
-                b[1].append(it['id'])
-                b[2].append(it['name'])
-                b[3].append(it.get('shortName') or '')
-
-    def matcher(text, fw, fh):
-        if not text or len(text) < 2:
-            return None
-        best = None
-        for wh in {(fw, fh), (fh, fw)}:
-            b = by_size.get(wh)
-            if not b:
-                continue
-            r = process.extractOne(text.lower(), b[0], scorer=fuzz.WRatio,
-                                   score_cutoff=OCR_LABEL_BASE)
-            if r and (best is None or r[1] > best[1]):
-                _, score, idx = r
-                best = (b[1][idx], score, b[2][idx], b[3][idx], wh[0], wh[1])
-        return best
-
-    return matcher
-
-
-def _min_score_for_size(W, H):
-    """Adaptive NCC threshold: looser for tiny sparse icons, tighter for big rich ones."""
-    area = W * H
-    if area == 1:
-        return 0.35
-    if area <= 2:
-        return 0.40
-    return 0.50
-
-
-OCC_FRAC          = 0.72   # a footprint is a size candidate only if this fraction of its cells are occupied
-CACHE_SRC_BONUS   = 0.02   # adjust-score bias favouring exact game-cache templates over API templates
-CACHE_EXACT_BONUS = 0.04   # additional bias for cache-exact templates (validated hash identity, not just visual)
-
-
-def _build_occupancy(img_bgr, grid, n_rows, n_cols):
-    """Boolean [n_rows, n_cols] occupancy map (True = item present in cell)."""
-    occ = np.zeros((n_rows, n_cols), dtype=bool)
-    for r in range(n_rows):
-        for c in range(n_cols):
-            occ[r, c] = not _cell_is_empty(img_bgr, c, r, grid)
-    return occ
-
-
-def _footprint_fits(occ, claimed, col, row, W, H, n_cols, n_rows):
-    """
-    Return the occupied fraction of the W×H block at (col,row) if it is fully
-    unclaimed and in-bounds, else -1.  Used to gate which sizes are even tested,
-    so a 2×1 template can't claim a footprint whose second cell is empty.
-    """
-    if col + W > n_cols or row + H > n_rows:
-        return -1.0
-    occ_cells = 0
-    for dc in range(W):
-        for dr in range(H):
-            if claimed[row + dr, col + dc]:
-                return -1.0
-            if occ[row + dr, col + dc]:
-                occ_cells += 1
-    return occ_cells / float(W * H)
-
-
-def _best_with_margin(scores, ids):
-    """
-    Return (best_index, best_score, id_aware_margin).
-
-    The margin compares the top score to the best score belonging to a
-    *different* item ID, so near-duplicate rotations/presets of the same item
-    never reject each other.
-    """
-    i = int(np.argmax(scores))
-    top1 = float(scores[i])
-    top1_id = ids[i]
-    top2 = 0.0
-    for j in np.argsort(scores)[::-1]:
-        if ids[int(j)] != top1_id:
-            top2 = float(scores[int(j)])
-            break
-    return i, top1, top1 - top2
-
-
-GRID_ASPECT_TOL   = 0.10  # max |cell_w - cell_h| / max(...) — EFT slots are square on-screen
-GRID_MIN_STRENGTH = 1.6   # autocorr peak decisiveness floor (≈1 = no periodicity at all)
-
-
-def validate_grid(grid):
-    """
-    True if a detected/persisted grid is internally plausible.
-
-    Deliberately does NOT compare against 63px or any absolute pitch: the
-    captured game window can be any resolution (windowed, Lossless Scaling,
-    stretched res), so the pitch is whatever it is.  Checks instead:
-      - pitch within the supported range on both axes,
-      - near-square cells (EFT slots are square on-screen),
-      - a decisive autocorrelation peak when the detection carries one
-        (persisted grids were validated when saved and carry none).
-    """
-    if not grid:
-        return False
-    cw, ch = grid.get('cell_w', 0), grid.get('cell_h', 0)
-    if not (GRID_PITCH_LO - 1 <= cw <= GRID_PITCH_HI + 1
-            and GRID_PITCH_LO - 1 <= ch <= GRID_PITCH_HI + 1):
-        return False
-    if abs(cw - ch) / max(cw, ch) > GRID_ASPECT_TOL:
-        return False
-    strength = grid.get('strength')
-    if strength is not None and strength < GRID_MIN_STRENGTH:
-        return False
-    return True
-
-
-def resolve_grid(img_bgr, settings, persist_fn=None):
-    """
-    Detect the stash grid at whatever pitch the capture actually has, validate
-    it for internal plausibility, and fall back to the last-good persisted grid
-    (settings['grid']) or the flat cell_size when detection is noisy.  On a
-    fresh valid detection, persist it via persist_fn(grid) so one bad frame
-    can't derail future scans.
-    """
-    grid = detect_stash_grid(img_bgr)
-    if validate_grid(grid):
-        if persist_fn:
-            persist_fn(grid)
-        return grid, 'detected'
-    saved = settings.get('grid')
-    if validate_grid(saved):
-        return dict(saved), 'persisted'
-    cs = settings.get('cell_size', 64)
-    return {'cell_w': float(cs), 'cell_h': float(cs),
-            'origin_x': 0.0, 'origin_y': 0.0}, 'fallback'
-
-
-def resolve_panels(img_bgr, settings, persist_fn=None):
-    """
-    Panel-aware grid resolution: detect every container/stash panel with its
-    own origin (see detect_panels).  Falls back to the single-grid chain
-    (resolve_grid: detect → persisted → flat cell_size) wrapped as one
-    full-frame panel, so it is never worse than the old behaviour.
-
-    Panels themselves are NOT persisted — open container windows move
-    between scans; only the pitch-bearing single grid persists (via
-    resolve_grid's persist_fn on the fallback path, or the first panel here).
-
-    Returns (panels, src) — panels is a non-empty list of grid dicts with
-    x0/y0/x1/y1 span bounds.
-    """
-    panels = detect_panels(img_bgr)
-    if panels:
-        if persist_fn:
-            # Persist the first panel as the last-good single grid: its pitch
-            # is frame-global, so it keeps the fallback chain plausible.
-            persist_fn({k: panels[0][k] for k in
-                        ('cell_w', 'cell_h', 'origin_x', 'origin_y')})
-        return panels, 'panels'
-    grid, src = resolve_grid(img_bgr, settings, persist_fn=persist_fn)
-    sh, sw = img_bgr.shape[:2]
-    return [{**grid, 'x0': 0, 'y0': 0, 'x1': sw, 'y1': sh}], src
-
-
-def _masked_ncc_scores(cell_vec, bucket):
-    """
-    Per-template masked NCC against all templates in a size bucket.
-
-    For each template t with mask m_t (per-pixel 0/1, BGR-replicated):
-        cm_t        = (m_t · cell)  / Σ(m_t)                       # cell mean inside m_t
-        num_t       = (m_t * (cell - cm_t)) · tmpl_unit_t          # numerator
-                    = tmpl_unit_t · cell        (since tmpl_unit·m_t = 0 by construction)
-        denom_t²    = Σ m_t * (cell - cm_t)²
-                    = (m_t · cell²) - (m_t · cell)² / Σ(m_t)
-        score_t     = num_t / denom_t
-
-    Returns (N,) float32 NCC scores.
-    """
-    masks       = bucket['masks']         # (N, D) float32
-    mask_counts = bucket['mask_counts']   # (N,)   float32
-    tmpls_unit  = bucket['tmpls_unit']    # (N, D) float32
-
-    cell_sq    = cell_vec * cell_vec
-    sums_c     = masks @ cell_vec               # (N,)
-    sums_c2    = masks @ cell_sq                # (N,)
-    var_c      = sums_c2 - (sums_c * sums_c) / np.maximum(mask_counts, 1.0)
-    denom      = np.sqrt(np.maximum(var_c, 1e-6))
-    num        = tmpls_unit @ cell_vec          # (N,)
-    return num / denom
-
-
-def _masked_ncc_scores_multi(cell_mat, masks, mask_counts, tmpls_unit):
-    """
-    Masked NCC of several cell vectors at once against a (sub)set of templates.
-    `cell_mat` is (S, D); returns (N, S) scores — same math as
-    _masked_ncc_scores, batched over the S candidate crops.
-    """
-    cm      = cell_mat.T                          # (D, S)
-    sums_c  = masks @ cm                          # (N, S)
-    sums_c2 = masks @ (cm * cm)                   # (N, S)
-    var_c   = sums_c2 - (sums_c * sums_c) / np.maximum(mask_counts, 1.0)[:, None]
-    denom   = np.sqrt(np.maximum(var_c, 1e-6))
-    num     = tmpls_unit @ cm                     # (N, S)
-    return num / denom
-
-
-SHIFT_RESCUE_TOP = 64    # templates re-scored against shifted crops
-SHIFT_RESCUE_PX  = 2     # ± whole-pixel alignment search radius
-SHIFT_GOOD_SCORE = 0.90  # unshifted match at/above this skips the rescue
-
-
-def _shift_rescue(img_bgr, col, row, W, H, grid, spw, sph, bucket, scores):
-    """
-    Re-score the current top templates against crops shifted ±SHIFT_RESCUE_PX
-    in x/y, keeping each template's best score over all shifts.  Absorbs the
-    residual grid-phase error that survives detection (sub-pixel pitch,
-    panel-edge rounding) — exactly the error that otherwise depresses the
-    correct template's NCC below its rivals'.
-    Returns an updated copy of `scores` (never lower than the input).
-    """
-    top = np.argsort(scores)[::-1][:SHIFT_RESCUE_TOP]
-    mats = []
-    for dy in range(-SHIFT_RESCUE_PX, SHIFT_RESCUE_PX + 1):
-        for dx in range(-SHIFT_RESCUE_PX, SHIFT_RESCUE_PX + 1):
-            if dx == 0 and dy == 0:
-                continue
-            v = _native_cell_vec(img_bgr, col, row, W, H, grid, spw, sph,
-                                 dx=dx, dy=dy)
-            if v is not None:
-                mats.append(v)
-    if not mats:
-        return scores
-    cell_mat = np.stack(mats)
-    shifted = _masked_ncc_scores_multi(cell_mat,
-                                       bucket['masks'][top],
-                                       bucket['mask_counts'][top],
-                                       bucket['tmpls_unit'][top])
-    out = scores.copy()
-    out[top] = np.maximum(out[top], shifted.max(axis=1))
-    return out
-
-
-def identify_items_by_icon(img_bgr, grid, icon_db, min_score=ICON_MATCH_MIN_SCORE,
-                           label_matcher=None, progress_cb=None):
-    """
-    Footprint-first identification, with optional OCR-label fusion.
-
-    1. Build a per-cell occupancy map from the image.
-    2. Walk occupied, unclaimed cells row-major.  For each anchor, only test
-       (W,H) sizes whose footprint is actually occupied (measured, not guessed),
-       so a wrong multi-cell size can't over-claim empty neighbours.
-    3. Masked NCC against every template of that size (rotations + presets
-       included).  The winning (item, size) needs to clear the size-adaptive
-       threshold AND beat the best *different-item* score by >NCC_MARGIN_MIN.
-    4. Ties within NCC_MARGIN prefer exact game-cache templates over API ones.
-    5. If `label_matcher` is given, OCR the game's printed name across the top of
-       the footprint.  A confident name match is AUTHORITATIVE for identity
-       (NCC keeps the footprint/rotation) — this is what separates same-shape
-       items (L1 vs SJ12 vs eTG-c) that NCC alone cannot.
-
-    Detections carry `rotated` and `source` (ncc / cache / cache-exact / api /
-    ocr / ncc+ocr).  `cache-exact` is a validation-gated exact hash identity
-    (see eft_hash.py) and is trusted enough to bypass the NCC margin check
-    and to require a near-perfect OCR read before being overridden.
-    """
-    if not icon_db:
-        return []
-
-    sh, sw = img_bgr.shape[:2]
-    cw, ch = grid['cell_w'], grid['cell_h']
-    ox, oy = grid['origin_x'], grid['origin_y']
-    n_cols = max(0, int((sw - ox) // cw))
-    n_rows = max(0, int((sh - oy) // ch))
-    if n_cols == 0 or n_rows == 0:
-        return []
-
-    spw, sph = _slot_px(grid)
-    # OCR legibility gate: the printed label shrinks with the capture pitch.
-    # Below OCR_AGREE_MIN_PITCH Tesseract output is noise — overriding NCC with
-    # it is exactly the failure mode this gate exists to stop; between the two
-    # thresholds it may only *confirm* an NCC identity, never overturn one.
-    pitch = min(cw, ch)
-    if pitch >= OCR_FULL_MIN_PITCH:
-        ocr_mode = 'full'
-    elif pitch >= OCR_AGREE_MIN_PITCH:
-        ocr_mode = 'agree'
-    else:
-        ocr_mode = 'off'
-    if label_matcher is not None and ocr_mode == 'off':
-        label_matcher = None
-
-    occ = _build_occupancy(img_bgr, grid, n_rows, n_cols)
-    claimed = np.zeros((n_rows, n_cols), dtype=bool)
-
-    # Test larger footprints first so a correct multi-cell item claims its cells
-    # before any 1×1 sub-region can.
-    sizes = sorted(icon_db.keys(), key=lambda wh: -wh[0] * wh[1])
-
-    detections = []
-    n_ambig = 0
-    occ_total = int(occ.sum())
-    # Row-major cumulative count of occupied cells — monotonic progress even
-    # when multi-cell claims let the walk skip ahead.
-    occ_cum = np.cumsum(occ.reshape(-1))
-
-    for row in range(n_rows):
-        for col in range(n_cols):
-            if claimed[row, col] or not occ[row, col]:
-                continue
-            if progress_cb:
-                progress_cb(int(occ_cum[row * n_cols + col]), occ_total)
-
-            best = None   # (adj, sc, margin, i, W, H)
-            for (W, H) in sizes:
-                frac = _footprint_fits(occ, claimed, col, row, W, H, n_cols, n_rows)
-                if frac < OCC_FRAC and not (W == 1 and H == 1):
-                    continue
-                if frac < 0:
-                    continue
-
-                vec = _native_cell_vec(img_bgr, col, row, W, H, grid, spw, sph)
-                if vec is None:
-                    continue
-                bucket = icon_db[(W, H)]
-                scores = _masked_ncc_scores(vec, bucket)
-                i, sc, margin = _best_with_margin(scores, bucket['ids'])
-
-                # Size preference + exact-cache-source bias.
-                adj = sc + (W * H - 1) * 0.012
-                if bucket['sources'][i] in ('cache', 'cache-exact'):
-                    adj += CACHE_SRC_BONUS
-                if bucket['sources'][i] == 'cache-exact':
-                    adj += CACHE_EXACT_BONUS
-                if best is None or adj > best[0]:
-                    best = (adj, sc, margin, i, W, H, bucket, scores)
-
-            # Footprint / NCC identity (may be None if no vector could be built).
-            if best is not None:
-                _, sc, margin, i, W, H, bucket, scores = best
-                # Alignment rescue: a weak or ambiguous winner is retried with
-                # ±2px-shifted crops before we trust (or reject) it.
-                if sc < SHIFT_GOOD_SCORE or margin < NCC_MARGIN_MIN:
-                    scores = _shift_rescue(img_bgr, col, row, W, H, grid,
-                                           spw, sph, bucket, scores)
-                    i, sc, margin = _best_with_margin(scores, bucket['ids'])
-                ncc_id, ncc_name = bucket['ids'][i], bucket['names'][i]
-                rotated, ncc_src = bool(bucket['rotated'][i]), bucket['sources'][i]
-            else:
-                W = H = 1; sc = margin = 0.0
-                ncc_id = ncc_name = None; rotated = False; ncc_src = 'ncc'
-
-            # OCR-label fusion — the printed name is authoritative for identity,
-            # but tiered so a short OCR token can't partial-match its way over a
-            # different NCC identity (e.g. 'Li' → 'Splint').
-            ocr_hit = None
-            if label_matcher is not None:
-                text = _ocr_cell_label(img_bgr, col, row, W, grid)
-                cand = label_matcher(text, W, H)
-                if cand is not None:
-                    o_id, o_sc, o_name, o_short, o_w, o_h = cand
-                    agrees = ncc_id is not None and o_id == ncc_id
-                    if agrees:
-                        passes = o_sc >= OCR_AGREE_CUTOFF
-                    elif ocr_mode != 'full':
-                        # Agree-only tier (45–55px pitch): a barely-legible label
-                        # may confirm the NCC identity but never overturn it.
-                        passes = False
-                    elif len(text) <= 3:
-                        passes = o_sc >= OCR_SHORT_OVER
-                    else:
-                        # Override tier: OCR disagrees with (or NCC found no)
-                        # identity.  A cache-exact NCC identity (validated hash
-                        # match, not just visual) is trusted enough that only a
-                        # near-perfect OCR read should override it.
-                        need = OCR_SHORT_OVER if ncc_src == 'cache-exact' else OCR_OVER_CUTOFF
-                        # Token-containment guard: blocks a short/partial OCR
-                        # misread (e.g. a PMAG label OCR'd as 'gen m3') from
-                        # WRatio-matching an unrelated item's name ('Benelli M3
-                        # … charging handle', WRatio 85.5 >= old 84 cutoff).
-                        passes = o_sc >= need and _ocr_tokens_contained(text, o_name, o_short)
-                    if passes:
-                        ocr_hit = cand
-
-            if ocr_hit is not None:
-                item_id, ocr_sc, name, _o_short, _o_w, _o_h = ocr_hit
-                detections.append({
-                    'col': col, 'row': row, 'W': W, 'H': H,
-                    'item_id': item_id, 'name': name,
-                    'rotated': rotated,
-                    'source':  'ocr' if (ncc_id is None or item_id != ncc_id) else 'ncc+ocr',
-                    'score':   round(float(ocr_sc), 1),
-                })
-                claimed[row:row + H, col:col + W] = True
-                continue
-
-            # Over-sizing rescue: NCC's area bias can pick W>1 for a 1×1 item,
-            # which garbles the OCR crop.  If nothing matched, retry OCR at 1×1.
-            # Override-class action, so it needs the full-legibility OCR tier.
-            if (label_matcher is not None and ocr_mode == 'full' and (W > 1 or H > 1)
-                    and _footprint_fits(occ, claimed, col, row, 1, 1, n_cols, n_rows) >= 0):
-                text1 = _ocr_cell_label(img_bgr, col, row, 1, grid)
-                cand1 = label_matcher(text1, 1, 1)
-                if cand1 is not None:
-                    o_id, o_sc, o_name, o_short, _w, _h = cand1
-                    if len(text1) <= 3:
-                        passes = o_sc >= OCR_SHORT_OVER
-                    else:
-                        passes = (o_sc >= OCR_OVER_CUTOFF
-                                  and _ocr_tokens_contained(text1, o_name, o_short))
-                    if passes:
-                        detections.append({
-                            'col': col, 'row': row, 'W': 1, 'H': 1,
-                            'item_id': o_id, 'name': o_name,
-                            'rotated': False, 'source': 'ocr',
-                            'score': round(float(o_sc), 1),
-                        })
-                        claimed[row, col] = True
-                        continue
-
-            if best is None:
-                continue
-            size_min = _min_score_for_size(W, H)
-            # A cache-exact identity (validated hash match — see eft_hash.py)
-            # is authoritative on its own: accept it even below the NCC margin
-            # floor, provided the raw score still clears a stricter bar.  This
-            # is what separates the stimulant-injector family (shared
-            # silhouette dominates plain NCC — see comment at _canonical_bgr_flat).
-            exact_authoritative = ncc_src == 'cache-exact' and sc >= max(size_min, 0.75)
-            if sc >= size_min and (margin >= NCC_MARGIN_MIN or exact_authoritative):
-                detections.append({
-                    'col': col, 'row': row, 'W': W, 'H': H,
-                    'item_id': ncc_id, 'name': ncc_name,
-                    'rotated': rotated,
-                    'source':  ncc_src,
-                    'score':   round(sc * 100, 1),
-                })
-                claimed[row:row + H, col:col + W] = True
-            elif sc >= size_min and margin < NCC_MARGIN_MIN:
-                n_ambig += 1
-                print(f"[ncc] AMBIG ({col:2d},{row:2d}) {W}×{H}  "
-                      f"sc={sc:.3f} m={margin:.3f}  '{ncc_name}'")
-
-    if detections:
-        scores = [d['score'] for d in detections]
-        print(f"[ncc] matched {len(detections)} items ({n_ambig} ambiguous) | "
-              f"scores {min(scores):.1f}–{max(scores):.1f}%  avg {sum(scores)/len(scores):.1f}%")
-
-    # Found-in-Raid pass — reads the raw (un-blanked) frame, so this must run
-    # after all NCC/OCR matching (which works off label/corner-blanked crops).
-    for d in detections:
-        d['fir'] = detect_fir(img_bgr, grid, d['col'], d['row'], d['W'], d['H'])
-    return detections
-
-
-def scan_all_panels(img_bgr, panels, matcher_db, label_matcher=None,
-                    progress_cb=None):
-    """
-    Run identify_items_by_icon over each detected panel's sub-image (so a
-    panel's occupancy/OCR/FiR never bleeds into a neighbour) and return one
-    flat detection list.  Each detection keeps its panel-local col/row and
-    gains `panel` (index) plus the absolute pixel rect `px, py, pw, ph` —
-    callers draw and hit-test with those and never need panel awareness.
-    """
-    all_dets = []
-    for pi, p in enumerate(panels):
-        crop = img_bgr[p['y0']:p['y1'], p['x0']:p['x1']]
-        local = {'cell_w': p['cell_w'], 'cell_h': p['cell_h'],
-                 'origin_x': p['origin_x'] - p['x0'],
-                 'origin_y': p['origin_y'] - p['y0']}
-        dets = identify_items_by_icon(crop, local, matcher_db,
-                                      label_matcher=label_matcher,
-                                      progress_cb=progress_cb)
-        for d in dets:
-            x1, y1, x2, y2 = grid_rect(d['col'], d['row'], d['W'], d['H'],
-                                       local, pad=0)
-            d['panel'] = pi
-            d['px'], d['py'] = x1 + p['x0'], y1 + p['y0']
-            d['pw'], d['ph'] = x2 - x1, y2 - y1
-        all_dets.extend(dets)
-    return all_dets
-
-
-
-def prefetch_keep_list_icons(keep_list, price_index, scale=2.0):
-    """Download icons for all keep-list items using tarkov.dev iconLink."""
-    downloaded = 0
-    for cat in keep_list['categories']:
-        for item in cat['items']:
-            name_lower = item['name'].lower()
-            item_data = price_index.get(name_lower)
-            if not item_data:
-                # Try aliases
-                for alias in item.get('aliases', []):
-                    item_data = price_index.get(alias.lower())
-                    if item_data:
-                        break
-            if item_data and item_data.get('iconLink'):
-                path = download_icon(item_data['id'], item_data['iconLink'])
-                if path:
-                    downloaded += 1
-    return downloaded
-
-
-def best_trader_price(item_data):
-    """Return (trader_name, priceRUB) for the highest trader sell offer."""
-    best = (None, 0)
-    for sf in item_data.get('sellFor', []):
-        vendor = sf.get('vendor', {}).get('name', '')
-        if vendor.lower() == 'flea market':
-            continue
-        p = sf.get('priceRUB', 0) or 0
-        if p > best[1]:
-            best = (vendor, p)
-    return best
-
-def calc_flea_fee(base_price, listing_price):
-    """Tarkov flea market listing fee formula."""
-    if not base_price or not listing_price:
-        return 0
-    q0, q = base_price, listing_price
-    fee = q0 * 0.03 * (4 ** math.log10(q0 / q)) + q * 0.03 * (4 ** math.log10(q / q0))
-    return round(fee)
-
-def price_420(target):
-    """Floor target to nearest price ending in 420. Falls back to target-1."""
-    if target <= 420:
-        return max(1, target - 1)
-    rem = target % 1000
-    p = (target - rem + 420) if rem >= 420 else (target - rem - 580)
-    return p if p >= 420 else max(1, target - 1)
-
-def sell_recommendation(item_data):
-    """
-    Returns dict with trader, flea, and recommendation.
-    Flea is recommended only if net-after-fee exceeds trader by FLEA_MIN_PROFIT.
-    """
-    trader_name, trader_price = best_trader_price(item_data)
-    base_price   = item_data.get('basePrice') or 0
-    low24h       = item_data.get('low24hPrice') or 0
-    avg24h       = item_data.get('avg24hPrice') or 0
-    flea_ref     = low24h or avg24h  # prefer lowest current listing
-
-    rec = {
-        'trader_name':  trader_name,
-        'trader_price': trader_price,
-        'flea_list':    None,
-        'flea_net':     None,
-        'recommend':    'trader',
-        'reason':       '',
-    }
-
-    if not flea_ref or not trader_price:
-        rec['reason'] = 'No flea data' if not flea_ref else 'No trader data'
-        return rec
-
-    flea_list = price_420(flea_ref)
-    flea_fee  = calc_flea_fee(base_price, flea_list)
-    flea_net  = flea_list - flea_fee
-    rec['flea_list'] = flea_list
-    rec['flea_net']  = flea_net
-
-    if flea_net - trader_price >= FLEA_MIN_PROFIT:
-        rec['recommend'] = 'flea'
-        rec['reason']    = f'+{(flea_net - trader_price):,} over trader after fees'
-    else:
-        rec['reason'] = f'Flea net {flea_net:,} not {FLEA_MIN_PROFIT//1000}k+ above trader'
-
-    return rec
+        print(f'[sell] intel center level unavailable: {e}')
+    return sellcalc.make_context(settings, (prices or {}).get('rules'), intel)
 
 
 # ---------------------------------------------------------------------------
@@ -1817,12 +779,37 @@ def default_settings():
     return {
         'region': None, 'monitor': 0, 'hotkey': DEFAULT_HOTKEY, 'prestige': 3,
         'scan_countdown': 3,   # seconds before the manual Scan button captures (0 = instant)
-        'cell_size': 64,    # fallback: pixels per slot when grid auto-detect fails
-        'icon_scale': 2.0,  # scale applied to tarkov.dev icons for template matching
-        'icon_cache_path': None,  # override for the EFT icon-cache folder (auto-discovered if null)
-        'grid': None,       # last-good detected grid, persisted so a noisy frame can't derail a scan
-        'kappa_only_tasks': True,  # only kappaRequired tasks count toward task aggregate/KEEP totals
+        # Only kappaRequired tasks count toward the KEEP totals.  Off by default: since 1.0
+        # tarkov.dev marks only the Collector's own prerequisite chain (~13 quests) Kappa-required,
+        # so "on" would sell the items of almost every open quest.
+        'kappa_only_tasks': False,
+        'auto_task_progress': True,  # read completed/failed quests from EFT's logs (eftlogs.py)
+        'eft_install_dir': None,     # None = find the install via the registry / common paths
+        'game_mode': 'auto',         # 'auto' (profile of the latest session) | 'pvp' | 'pve' | 'season'
+        'faction': 'auto',           # 'auto' (from faction-only quests in the logs) | 'BEAR' | 'USEC'
         'debug_dumps': True,  # save raw frame + detections of the last few scans under data/debug/
+        # Sell advice (see sellcalc.SELL_DEFAULTS for what each means; all are optional in settings.json)
+        'flea_requires_fir': None,  # None = follow tarkov.dev's flea rule (live: FiR only); set false when Battlestate lifts it for an event
+        'flea_offer_slots': sellcalc.DEFAULT_FLEA_SLOTS,  # simultaneous flea offers (your flea rating decides; shown as 'Offers x/y' in the flea tab)
+        'flea_overflow': 'queue',   # flea picks beyond the slots: 'queue' (list when a slot frees) or 'trader' (sell now)
+        'flea_min_gain': sellcalc.FLEA_MIN_GAIN,  # roubles an offer must beat the trader by to be worth a slot
+        'intel_center_level': None,  # None = read from Tasks & Hideout progress; level 3 = -30% flea fee
+        'hideout_management_level': 0,  # skill level 0-51; each level adds 0.3% flea fee discount (with Intel Center 3)
+        'skip_traders': ['Ref'],   # Ref pays GP coins, not roubles
+        'trader_levels': {},       # e.g. {'Ref': 4} - only Ref's pay rate changes with loyalty level
+        'auto_scan': True,  # watch the game passively and scan the stash when it settles (autoscan/)
+        'ignore_task_items': False,     # never hold items back for tasks / Kappa: flea vs trader only
+        'ignore_hideout_items': False,  # never hold items back for hideout upgrades
+        # Open and close with the game (lifecycle.py); changes take effect when settings are saved
+        'start_with_windows': True,  # register the tiny watcher at sign-in + keep it running (False: unregister, stop it)
+        'follow_tarkov': True,       # open when Tarkov starts, close ~15 s after it exits (False: the watcher opens the app once at sign-in and it stays)
+        'show_window_on_game_start': True,  # False: when Tarkov starts the app opens straight to the tray, no window
+        'auto_scan_in_raid': False,  # also scan the in-raid inventory (off: only the lobby stash)
+        # Live page (identify inventory grids on the fly; the live viewer owns what these do)
+        'live_viewer': True,               # identify inventory grids on the fly and show them on the Live page
+        'live_in_raid': True,              # also work in raid: what is worth grabbing / what to drop
+        'live_top_n': 5,                   # how many 'worth grabbing' items to highlight (1-20)
+        'live_min_value_per_slot': 10000,  # roubles: ignore loot worth less than this per slot
     }
 
 def default_keep_list():
@@ -2193,49 +1180,216 @@ def default_progress():
     return {'completed_tasks': [], 'completed_hideout': [], 'have': {}}
 
 
-def fetch_tasks():
-    """Fetch task + hideout item requirements from tarkov.dev, cache 24 h."""
+# ---------------------------------------------------------------------------
+# Automatic task progress from EFT's own logs (eftlogs.py)
+# ---------------------------------------------------------------------------
+
+import eftlogs  # noqa: E402
+
+EFTLOGS_CACHE_PATH = os.path.join(DATA, 'eftlogs_cache.json')
+_log_scanner = eftlogs.LogScanner(EFTLOGS_CACHE_PATH)
+_log_progress = {'key': None, 'result': None, 'error': None, 'scanned': False}
+_log_progress_lock = threading.Lock()
+
+
+def scan_task_logs(full=False):
+    """Bring the log records up to date (full: re-check every folder; otherwise only new folders
+    and the live one).  Never raises; the error is kept for the status endpoint."""
+    settings = load_json(SETTINGS_PATH, default_settings)
+    if not settings.get('auto_task_progress', True):
+        return None
+    try:
+        inst = eftlogs.find_install_dir(settings.get('eft_install_dir') or None)
+        if not inst:
+            raise FileNotFoundError('Escape from Tarkov install (with a Logs folder) not found')
+        res = _log_scanner.scan(inst, full=full or not _log_progress['scanned'])
+        _log_progress['scanned'] = True
+        _log_progress['error'] = None
+        return res
+    except Exception as e:
+        _log_progress['error'] = str(e)
+        print(f'[eftlogs] scan failed: {e}')
+        return None
+
+
+def log_task_progress(cache=None):
+    """The quest progress read from the logs for the configured mode/faction, or None when the
+    feature is off or nothing could be read.  Cached until the logs or the task data change."""
+    settings = load_json(SETTINGS_PATH, default_settings)
+    if not settings.get('auto_task_progress', True):
+        return None
+    if not _log_progress['scanned']:
+        scan_task_logs(full=True)
+    if cache is None:
+        cache = get_tasks(allow_fetch=False)
+    tasks = (cache or {}).get('tasks') or None
+    key = (_log_scanner.last_scan_at, (cache or {}).get('timestamp'),
+           settings.get('game_mode', 'auto'), settings.get('faction', 'auto'))
+    with _log_progress_lock:
+        if _log_progress['key'] == key and _log_progress['result'] is not None:
+            return _log_progress['result']
+        try:
+            res = _log_scanner.progress(settings.get('game_mode', 'auto'), tasks,
+                                        settings.get('faction', 'auto'))
+        except Exception as e:
+            _log_progress['error'] = str(e)
+            return None
+        if not res.get('folders'):
+            return None
+        _log_progress.update(key=key, result=res)
+        return res
+
+
+def effective_progress(cache=None):
+    """progress.json with the quest completion the logs prove merged in: completed, failed (a
+    failed quest needs nothing any more) and the other faction's quests count as done.  The
+    player's clicks on the Tasks page win: ``manual_overrides[task] = 'done'|'open'``.
+    Adds ``auto_done`` (ids done because of the logs) and ``log_status``."""
+    progress = load_json(PROGRESS_PATH, default_progress)
+    manual = set(progress.get('completed_tasks', []))
+    overrides = progress.get('manual_overrides') or {}
+    lp = log_task_progress(cache)
+    auto = set()
+    if lp:
+        auto = set(lp['completed']) | set(lp['failed']) | set(lp.get('other_faction') or ())
+    forced_open = {t for t, v in overrides.items() if v == 'open'}
+    forced_done = {t for t, v in overrides.items() if v == 'done'}
+    done = ((manual | auto) - forced_open) | forced_done
+    out = dict(progress)
+    out['completed_tasks'] = sorted(done)
+    out['auto_done'] = sorted((auto & done) - forced_done)
+    out['log_status'] = None if not lp else {
+        'mode': lp['mode'], 'completed': len(lp['completed']), 'failed': len(lp['failed']),
+        'active': len(lp['active']), 'faction': lp.get('faction'),
+        'last_event_at': lp['last_event_at'], 'reset_at': lp['reset_at'],
+        'reset_kind': lp['reset_kind'], 'folders': lp.get('folders')}
+    return out
+
+
+def _graphql_tasks():
+    """Task + hideout item requirements from tarkov.dev's GraphQL API (the fallback source) as
+    a cache dict.  Not written anywhere; raises RuntimeError."""
     r = http_requests.post(TARKOV_API, json={'query': TASKS_QUERY}, timeout=60)
-    payload = r.json()
+    try:
+        payload = r.json()
+    except ValueError:
+        raise RuntimeError(f'tarkov.dev returned HTTP {r.status_code} with no JSON')
     if payload.get('errors'):
         raise RuntimeError(f"tarkov.dev tasks query failed: {payload['errors']}")
     data = payload.get('data') or {}
-    cache = {
+    return {
         'timestamp':       time.time(),
+        'source':          'graphql',
+        'schema':          tarkovdata.TASKS_SCHEMA,
         'tasks':           data.get('tasks') or [],
         'hideoutStations': data.get('hideoutStations') or [],
     }
-    save_json(TASKS_CACHE_PATH, cache)
+
+
+def fetch_tasks_graphql(previous=None):
+    """Refresh the tasks cache from the GraphQL API alone; validated, written atomically."""
+    cache = _graphql_tasks()
+    previous = previous if previous is not None else _load_cache(TASKS_CACHE_PATH)
+    try:
+        tarkovdata.validate_tasks(cache['tasks'], (previous or {}).get('tasks'))
+        tarkovdata.validate_stations(cache['hideoutStations'], (previous or {}).get('hideoutStations'))
+    except tarkovdata.SourceError as e:
+        raise RuntimeError(f'tarkov.dev GraphQL task data refused: {e}')
+    tarkovdata.write_json_atomic(TASKS_CACHE_PATH, cache, indent=1)
     return cache
 
 
+def refresh_tasks(force=False):
+    """Bring the tasks/hideout cache up to date: json.tarkov.dev first, then GraphQL; a bad
+    payload never replaces the cache on disk.  Returns ``{'status', 'source', 'cache'}``."""
+    with _refresh_lock:
+        previous = _load_cache(TASKS_CACHE_PATH)
+        if previous and not (previous.get('tasks') and previous.get('hideoutStations')):
+            previous = None
+        meta = _load_meta()
+        _refresh_state['tasks']['attempt'] = meta['attempted']['tasks'] = time.time()
+        if force:
+            meta['etags'] = {k: v for k, v in meta['etags'].items() if k not in
+                             ('tasks', 'tasks_en', 'hideout', 'hideout_en')}
+        names = tarkovdata.item_names_from_prices(_load_cache(PRICES_PATH))
+        try:
+            try:
+                res = tarkovdata.refresh_tasks(TASKS_CACHE_PATH, meta, previous, names)
+                res['source'] = tarkovdata.SOURCE_NAME
+            except Exception as json_err:      # network, bad payload, a converter bug: all fall back
+                print(f'[tasks] json.tarkov.dev failed ({json_err}); trying the GraphQL API')
+                try:
+                    cache = fetch_tasks_graphql(previous)
+                except (RuntimeError, http_requests.RequestException) as gql_err:
+                    raise RuntimeError(f'json.tarkov.dev: {json_err}; GraphQL: {gql_err}')
+                meta['checked']['tasks'] = cache['timestamp']
+                meta['sources']['tasks'] = 'graphql'
+                for k in ('tasks', 'tasks_en', 'hideout', 'hideout_en'):
+                    meta['etags'].pop(k, None)
+                res = {'status': 'updated', 'source': 'graphql', 'cache': cache}
+        except RuntimeError as e:
+            meta['errors']['tasks'] = str(e)
+            _refresh_state['tasks']['error'] = str(e)
+            _save_meta_quietly(meta)
+            raise
+        meta['errors'].pop('tasks', None)
+        _refresh_state['tasks']['error'] = None
+        _save_meta_quietly(meta)
+        return res
+
+
+def fetch_tasks():
+    """Refresh the task + hideout item requirements now (see :func:`refresh_tasks`)."""
+    return refresh_tasks()['cache']
+
+
 def get_tasks(allow_fetch=True):
-    """Cached task data, refreshed when stale. With allow_fetch=False, returns
-    whatever cache exists (or None) without touching the network — used inside
+    """Cached task data, refreshed when stale (the background refresher normally keeps it
+    current; a failed refresh falls back to the cache on disk). With allow_fetch=False,
+    returns whatever cache exists (or None) without touching the network - used inside
     scans so a scan can never block on tarkov.dev."""
-    if os.path.exists(TASKS_CACHE_PATH):
-        cache = load_json(TASKS_CACHE_PATH, lambda: None)
-        if cache and (not allow_fetch
-                      or time.time() - cache.get('timestamp', 0) < TASKS_CACHE_TTL):
-            return cache
-    return fetch_tasks() if allow_fetch else None
+    cache = _load_cache(TASKS_CACHE_PATH)
+    if cache and not (cache.get('tasks') and cache.get('hideoutStations')):
+        cache = None
+    if cache and (not allow_fetch or _cache_age_seconds(cache, 'tasks') < TASKS_CACHE_TTL):
+        return cache
+    if not allow_fetch:
+        return None
+    err = _refresh_state['tasks']['error']
+    if cache and err and time.time() - _refresh_state['tasks']['attempt'] < RETRY_BACKOFF:
+        return cache
+    try:
+        return fetch_tasks()
+    except (RuntimeError, http_requests.RequestException) as e:
+        if not cache:
+            raise
+        print(f'[tasks] refresh failed, using cached tasks: {e}')
+        return cache
 
 
 # Money hand-ins (e.g. "Compensation for Damage" wants 1M roubles) aren't
 # stash items worth tracking — they'd bury real requirements in the aggregate.
 CURRENCY_NAMES = {'roubles', 'dollars', 'euros'}
 
-def compute_tasks_view(cache, progress, kappa_only=False):
+def compute_tasks_view(cache, progress, kappa_only=False, kinds=('giveItem',), split_any_of=False):
     """
     Server-side merged view of what the player still needs.
-    Only 'giveItem' objectives count as hand-ins; objectives with a null item
-    are skipped (tarkov.dev is migrating TaskObjectiveItem.item → items).
+    Only 'giveItem' objectives count as hand-ins (the Tasks page); the sell
+    advisor also passes 'plantItem', whose items are consumed in raid and so
+    must not be sold.  Objectives with a null item are skipped (tarkov.dev is
+    migrating TaskObjectiveItem.item → items).
 
     `kappa_only` restricts which TASK objectives contribute to the aggregate
     totals to those on tasks with `kappaRequired` — non-kappa tasks (e.g.
     "Compensation for Damage") still appear in `tasks_out` (the client dims
     them) but no longer inflate the aggregate/KEEP totals. Hideout
     accumulation is untouched regardless, since it's needed for prestige.
+
+    An objective that accepts ANY ONE of several items (tarkov.dev's ``items`` list)
+    shows on the Tasks page under its first item, with the rest in ``alternatives``.
+    With ``split_any_of`` (the sell advisor) it stays out of ``aggregate`` and is
+    returned in ``any_of`` instead - ``{'label', 'count', 'fir', 'items': [{id, name}]}``
+    per still-open objective - because each item's own total would be wrong for it.
     """
     done_tasks  = set(progress.get('completed_tasks', []))
     done_levels = set(progress.get('completed_hideout', []))
@@ -2255,25 +1409,33 @@ def compute_tasks_view(cache, progress, kappa_only=False):
             rec['sources'].append({'type': src_type, 'name': src_name,
                                    'count': count, 'fir': bool(fir)})
 
+    any_of = []
     tasks_out = []
     for t in cache.get('tasks', []):
         items = []
         for o in (t.get('objectives') or []):
-            if o.get('type') != 'giveItem':
+            if o.get('type') not in kinds:
                 continue
-            it, cnt = o.get('item'), o.get('count') or 0
-            if not it or not it.get('id') or cnt <= 0:
+            alts = [a for a in tarkovdata.objective_items(o)
+                    if (a.get('name') or '').lower() not in CURRENCY_NAMES]
+            cnt = o.get('count') or 0
+            if not alts or cnt <= 0:
                 continue
-            if (it.get('name') or '').lower() in CURRENCY_NAMES:
-                continue
+            it = alts[0]
             fir = bool(o.get('foundInRaid'))
-            items.append({'item_id': it['id'], 'name': it.get('name') or '?',
-                          'count': cnt, 'fir': fir})
+            rec = {'item_id': it['id'], 'name': it.get('name') or '?', 'count': cnt, 'fir': fir}
+            if len(alts) > 1:
+                rec['alternatives'] = [a.get('name') or '?' for a in alts]
+            items.append(rec)
             active = (t['id'] not in done_tasks
                       and (not kappa_only or bool(t.get('kappaRequired'))))
-            _acc(it, cnt, fir, 'task',
-                 f"{(t.get('trader') or {}).get('name', '?')} — {t['name']}",
-                 active=active)
+            label = f"{(t.get('trader') or {}).get('name', '?')} — {t['name']}"
+            if len(alts) > 1 and split_any_of:
+                if active:
+                    any_of.append({'label': label, 'count': cnt, 'fir': fir,
+                                   'items': [{'id': a['id'], 'name': a.get('name') or '?'} for a in alts]})
+                continue
+            _acc(it, cnt, fir, 'task', label, active=active)
         if not items:
             continue   # only hand-in tasks are interesting here
         tasks_out.append({
@@ -2315,6 +1477,7 @@ def compute_tasks_view(cache, progress, kappa_only=False):
 
     return {
         'aggregate': aggregate,
+        'any_of':    any_of,
         'tasks':     tasks_out,
         'stations':  stations_out,
         'cache_age_minutes': round((time.time() - cache.get('timestamp', 0)) / 60, 1),
@@ -2323,365 +1486,118 @@ def compute_tasks_view(cache, progress, kappa_only=False):
 
 
 def get_protected_ids(keep_list, price_idx):
-    """
-    {tarkov.dev item id: {'reason': str, 'fir_only': bool}} for everything the
-    player should NOT unconditionally sell: unacquired keep-list entries +
-    task/hideout items still short of their required count.  Task data is
-    cache-only here — a scan never waits on the network for it.
+    """The item-keyed half of :func:`get_protected_plan` (the single-item needs)."""
+    return get_protected_plan(keep_list, price_idx)[0]
 
-    `fir_only` marks entries where a Found-in-Raid copy specifically is what's
-    required, meaning a NON-FiR copy of the same item is safe to sell instead:
+
+def get_protected_plan(keep_list, price_idx):
+    """
+    ``(protected, any_of)``.  ``protected`` is
+    {tarkov.dev item id: {'reason', 'fir_only', 'need', 'fir_need', 'why'}} for
+    everything the player should NOT unconditionally sell: unacquired keep-list
+    entries + task/hideout items still short of their required count.  Task
+    data is cache-only here — a scan never waits on the network for it.
+
+    ``need`` is how many copies are still short (the scan keeps that many and
+    sells the surplus - see sellcalc.allocate_keep), ``fir_need`` how many of
+    those must be Found-in-Raid, ``why`` one string per source for the KEEP row.
+    Copies on the Tasks page's ``have`` count are treated as already secured
+    elsewhere and subtracted.  ``fir_only`` stays the summary the scan used
+    before: True when no remaining need accepts a non-FiR copy, so a copy
+    confidently read as non-FiR is safe to sell:
       - keep-list KAPPA (Collector) entries — Collector hand-ins require FiR.
       - keep-list manual/task entries — not FiR-gated (fir_only=False), those
         categories accept any copy.
-      - task/hideout aggregate items — fir_only only when EVERY remaining
-        need across all sources is FiR-specific (fir_needed >= total_needed);
-        if even one source accepts non-FiR, a non-FiR copy is still needed,
-        so fir_only must stay False.
+      - task/hideout items — fir_only only when EVERY remaining need across
+        all sources is FiR-specific; if even one source accepts non-FiR, a
+        non-FiR copy is still needed.
+    Task hand-ins and plant-item objectives both count (planted items are
+    consumed); completed tasks/hideout levels are excluded by the progress data.
+
+    ``any_of`` lists the open objectives that accept ANY ONE of several items:
+    ``{'label', 'count', 'fir', 'items': [{id, name}]}``.  Which copies to keep for them
+    depends on what the scan found, so sellcalc.plan_entries allocates them after the
+    single-item needs.  ``count`` is already net of ``have`` copies of those items that
+    no single-item need claims.
     """
-    protected = {}
-    entry_cat = {e['id']: cat['id']
+    protected, any_of = {}, []
+    settings = load_json(SETTINGS_PATH, default_settings)
+    # "Pure money" switches (Settings page): skip whole need sources so every item is routed
+    # to the flea or a trader.  Task items include the Collector (Kappa) and manual task lists.
+    ignore_tasks = bool(settings.get('ignore_task_items'))
+    ignore_hideout = bool(settings.get('ignore_hideout_items'))
+    entry_cat = {e['id']: cat
                  for cat in keep_list['categories'] for e in cat['items']}
     mapped, _unmapped = map_keep_entries_to_ids(keep_list, price_idx)
     for tid, entry in mapped.items():
         if not entry.get('acquired'):
-            fir_only = entry_cat.get(entry['id']) == 'kappa'
-            protected[tid] = {'reason': 'On keep list', 'fir_only': fir_only}
+            cat = entry_cat.get(entry['id']) or {}
+            if ignore_tasks and cat.get('id') in ('kappa', 'tasks'):
+                continue
+            fir_only = cat.get('id') == 'kappa'
+            protected[tid] = {
+                'reason': 'On keep list', 'fir_only': fir_only,
+                'need': 1, 'fir_need': 1 if fir_only else 0,
+                'why': [f"{cat.get('label') or 'Keep list'}: 1 needed"
+                        + (' (Found in Raid)' if fir_only else '')],
+            }
     try:
         cache = get_tasks(allow_fetch=False)
+        if cache and (ignore_tasks or ignore_hideout):
+            cache = {**cache,
+                     'tasks': [] if ignore_tasks else cache.get('tasks', []),
+                     'hideoutStations': [] if ignore_hideout else cache.get('hideoutStations', [])}
         if cache:
-            progress = load_json(PROGRESS_PATH, default_progress)
-            settings = load_json(SETTINGS_PATH, default_settings)
+            progress = effective_progress(cache)
             view = compute_tasks_view(cache, progress,
-                                      kappa_only=settings.get('kappa_only_tasks', True))
+                                      kappa_only=settings.get('kappa_only_tasks', False),
+                                      kinds=('giveItem', 'plantItem'), split_any_of=True)
+            spare = {rec['item_id']: max(0, rec['have'] - rec['total_needed'])
+                     for rec in view['aggregate']}
+            for g in view['any_of']:
+                left = g['count']
+                for a in g['items']:                       # set-aside copies cover it first
+                    i = a['id']
+                    avail = spare.get(i, int(progress.get('have', {}).get(i, 0)))
+                    use = min(avail, left)
+                    spare[i] = avail - use
+                    left -= use
+                if left:
+                    any_of.append({**g, 'count': left})
             for rec in view['aggregate']:
-                if rec['have'] >= rec['total_needed']:
+                need, fir_need = sellcalc.remaining_needs(
+                    rec['total_needed'], rec['fir_needed'], rec['have'])
+                if need <= 0:
                     continue
                 srcs = rec['sources']
                 first = srcs[0]['name'] if srcs else 'tasks'
                 more = f' +{len(srcs) - 1} more' if len(srcs) > 1 else ''
-                fir_only = rec['fir_needed'] >= rec['total_needed'] > 0
-                protected.setdefault(
-                    rec['item_id'],
-                    {'reason': f"Needed: {first} (×{rec['total_needed']}){more}",
-                     'fir_only': fir_only})
+                why = [f"{s['name']} ×{s['count']}" + (' FiR' if s['fir'] else '') for s in srcs]
+                have = f", {rec['have']} already set aside" if rec['have'] else ''
+                if rec['item_id'] in protected:        # on the keep list too: the needs add up
+                    cur = protected[rec['item_id']]
+                    cur['need'] += need
+                    cur['fir_need'] += fir_need
+                    cur['why'] += why
+                    cur['fir_only'] = cur['need'] == cur['fir_need']
+                    continue
+                protected[rec['item_id']] = {
+                    'reason': f"Needed: {first} (×{rec['total_needed']}){more}",
+                    'fir_only': need == fir_need, 'need': need, 'fir_need': fir_need,
+                    'why': why[:] if not have else why + [have.lstrip(', ')],
+                }
     except Exception as e:
         print(f"[tasks] protected-id pass skipped: {e}")
-    return protected
+    return protected, any_of
 
 
 # ---------------------------------------------------------------------------
 # Grid detection helpers
 # ---------------------------------------------------------------------------
 
-GRID_PITCH_LO = 24    # smallest supported px/slot (~720p windowed capture)
-GRID_PITCH_HI = 200   # largest supported px/slot (4K + UI scale headroom)
 
-
-def _dominant_period(sig, lo=GRID_PITCH_LO, hi=GRID_PITCH_HI):
-    """
-    Find the dominant repeating period in `sig` (1-D numpy array) using FFT
-    autocorrelation.  Returns (float period, strength) — the period is
-    parabola-interpolated around the integer peak (true pitch is non-integer
-    for arbitrary window sizes), strength is the peak-vs-median decisiveness
-    of the autocorrelation window (≈1 = no periodicity).  (None, 0.0) on
-    failure.
-    """
-    sig = np.asarray(sig, dtype=float)
-    sig -= sig.mean()
-    n = len(sig)
-    if n < hi * 2:
-        hi = max(lo + 1, n // 2 - 1)
-        if n < hi * 2:
-            return None, 0.0
-    nfft = 1 << int(np.ceil(np.log2(2 * n)))
-    S = np.fft.rfft(sig, n=nfft)
-    acorr = np.fft.irfft(S * np.conj(S), n=nfft)[:n].real
-    acorr[0] = 0
-    window = acorr[lo:hi + 1]
-    if window.max() <= 0:
-        return None, 0.0
-    k = int(np.argmax(window))
-    # Harmonic disambiguation: a periodic grid also autocorrelates at 2×, 3×…
-    # its pitch, and a harmonic can edge out the fundamental (measured: 105px
-    # scoring 7.3 vs the true 52.5px at 6.8).  If a subharmonic of the peak
-    # also shows a strong local peak, the true pitch is the smallest such —
-    # without this, everything downstream runs on doubled cells.
-    peak = window[k]
-    for m in (4, 3, 2):
-        q = (lo + k) / m
-        if q < lo:
-            continue
-        qi = int(round(q)) - lo
-        a, b = max(0, qi - 3), min(len(window), qi + 4)
-        if window[a:b].max() >= 0.6 * peak:
-            k = a + int(np.argmax(window[a:b]))
-            break
-    p = lo + k
-    # Parabolic interpolation on the peak and its neighbours → sub-px period.
-    if 0 < k < len(window) - 1:
-        y0, y1, y2 = window[k - 1], window[k], window[k + 1]
-        denom = y0 - 2 * y1 + y2
-        if abs(denom) > 1e-9:
-            p += 0.5 * (y0 - y2) / denom
-    med = float(np.median(np.abs(window)))
-    strength = float(window[k] / med) if med > 0 else 0.0
-    return float(p), strength
-
-
-def _grid_phase(sig, period):
-    """
-    Given a signal and a known (int) period, find the offset (0..period-1)
-    where the repeating grid lines fall — i.e. the origin coordinate mod period.
-    """
-    sig = np.asarray(sig, dtype=float)
-    period = int(round(period))
-    n = len(sig)
-    # Pad to a multiple of period then fold and sum
-    r = n % period
-    padded = np.pad(sig, (0, period - r)) if r else sig
-    folded = padded.reshape(-1, period).sum(axis=0)
-    return int(np.argmax(folded))
-
-
-def _comb_score(proj, origin, period):
-    """Mean projection energy sampled at the comb origin + k·period."""
-    n = len(proj)
-    ks = np.arange(int((n - origin) / period) + 1)
-    idx = np.round(origin + ks * period).astype(int)
-    idx = idx[(idx >= 0) & (idx < n)]
-    if len(idx) < 3:
-        return -1.0
-    return float(proj[idx].mean())
-
-
-def _refine_axis(proj, period, phase):
-    """
-    Jointly refine (origin, period) as floats around the coarse estimates by
-    maximizing the grid-line comb response.  A fraction-of-a-pixel period
-    error accumulates to whole pixels across a 10+ cell panel, so this is
-    what keeps far cells aligned.
-    """
-    best = (float(phase), float(period), _comb_score(proj, phase, period))
-    for p in np.arange(period - 0.75, period + 0.751, 0.125):
-        if p < GRID_PITCH_LO * 0.8:
-            continue
-        for o in np.arange(phase - 3.0, phase + 3.01, 0.5):
-            s = _comb_score(proj, o, p)
-            if s > best[2]:
-                best = (float(o), float(p), s)
-    return best[0], best[1]
-
-
-def detect_stash_grid(img_bgr, lo=GRID_PITCH_LO, hi=GRID_PITCH_HI):
-    """
-    Auto-detect the Tarkov stash grid parameters from the screenshot.
-    Uses the repeating edge pattern (cell borders) via autocorrelation, then
-    refines pitch+origin to sub-pixel precision via the comb response.
-
-    Returns dict {cell_w, cell_h, origin_x, origin_y (floats), strength}
-    or None on failure.  Pitch is NOT assumed to be 63px — windowed captures
-    render the grid at whatever the game window's resolution dictates.
-    """
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-
-    # Project each axis — peaks mark the grid lines
-    h_proj = np.sum(np.abs(gy), axis=1)   # rows → horizontal line positions
-    v_proj = np.sum(np.abs(gx), axis=0)   # cols → vertical line positions
-
-    cell_h, strength_h = _dominant_period(h_proj, lo, hi)
-    cell_w, strength_w = _dominant_period(v_proj, lo, hi)
-    if not cell_h or not cell_w:
-        return None
-
-    origin_y = _grid_phase(h_proj, cell_h)
-    origin_x = _grid_phase(v_proj, cell_w)
-    origin_x, cell_w = _refine_axis(v_proj, cell_w, origin_x)
-    origin_y, cell_h = _refine_axis(h_proj, cell_h, origin_y)
-
-    # Origins are phases (mod pitch): shift into the first full cell.
-    while origin_x >= cell_w:
-        origin_x -= cell_w
-    while origin_y >= cell_h:
-        origin_y -= cell_h
-
-    return {
-        'cell_w': float(cell_w), 'cell_h': float(cell_h),
-        'origin_x': float(origin_x), 'origin_y': float(origin_y),
-        'strength': round(min(strength_w, strength_h), 2),
-    }
-
-
-PANEL_COMB_MIN  = 1.6  # folded comb peak/median floor to START a span
-PANEL_COMB_CONT = 1.5  # response floor AT THE RUN'S OWN PHASE to continue a span
-
-
-def _phase_spans(proj, pitch):
-    """
-    Segment a Sobel line projection into spans of stable grid-line phase.
-
-    Slides a 3-pitch window along `proj` in 1-pitch steps; each window folds
-    to a per-phase comb response.  A span starts at a window whose peak is
-    decisive, and CONTINUES for as long as later windows still respond at the
-    span's own phase (±2px, circular) — even when their argmax phase is
-    elsewhere.  That distinction matters: rows filled with multi-cell items
-    hide the interior grid lines, and overlay text (stack counts sit a fixed
-    ~13px above each cell bottom) then wins the argmax with a bogus phase,
-    while the true lines still respond well above background.  A window with
-    no response at the span phase (panel gap, chrome, world background, a
-    different panel) ends the span.
-
-    Two adjacent panels that happen to share a phase merge — harmless, since
-    a single grid then fits both by construction.
-
-    Returns [(start_px, end_px), ...].
-    """
-    p = int(round(pitch))
-    n = len(proj)
-    win = 3 * p
-    if n < win:
-        return [(0, n)] if n >= 2 * p else []
-    spans, cur = [], None          # cur = [start, end, phase]
-    for a in range(0, n - win + 1, p):
-        folded = proj[a:a + win].reshape(3, p).sum(axis=0)
-        med = float(np.median(folded))
-        if med <= 0:
-            med = 1.0
-        k = int(np.argmax(folded))
-        st = float(folded[k]) / med
-        if cur is not None:
-            j = int(cur[2] - a) % p
-            at_run = max(float(folded[(j + o) % p]) for o in (-2, -1, 0, 1, 2)) / med
-            if at_run >= PANEL_COMB_CONT:
-                cur[1] = a + win
-                continue
-            spans.append(cur)
-            cur = None
-        if st >= PANEL_COMB_MIN:
-            cur = [a, a + win, (a + k) % p]
-    if cur:
-        spans.append(cur)
-    return [(s, min(e, n)) for s, e, _ in spans if e - s >= 2 * p]
-
-
-def detect_panels(img_bgr):
-    """
-    Find every stash/container grid panel in the frame, each with its own
-    origin (pitch is shared — the whole frame renders at one UI scale, but
-    side-by-side container windows sit at arbitrary offsets, so a single
-    global phase misaligns all but one of them).
-
-    Two-level phase segmentation: split the x-axis into spans of stable
-    vertical-line phase, then split each span's y-axis the same way; each
-    (x-span × y-span) rectangle gets its own detect_stash_grid pass on the
-    sub-image (clean single-phase projections), keeping only validated grids
-    covering ≥2×2 cells.  Cells outside every panel never enter matching.
-
-    Returns [{cell_w, cell_h, origin_x, origin_y, strength, x0, y0, x1, y1}, ...]
-    (origins in full-frame coordinates); [] when nothing panel-like is found.
-    """
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
-    gy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
-    v_proj = gx.sum(axis=0)
-    pitch_x, _ = _dominant_period(v_proj)
-    if not pitch_x:
-        return []
-
-    sh, sw = img_bgr.shape[:2]
-    px_i = int(round(pitch_x))
-    candidates = []
-    for (sx0, sx1) in _phase_spans(v_proj, pitch_x):
-        h_local = gy[:, sx0:sx1].sum(axis=1)
-        pitch_y, _ = _dominant_period(h_local)
-        if not pitch_y:
-            continue
-        py_i = int(round(pitch_y))
-        for (sy0, sy1) in _phase_spans(h_local, pitch_y):
-            # Span boundaries are window-quantized (1-pitch steps) and can cut
-            # a panel's first/last row or column — expand by one pitch each
-            # way so the sub-detection sees the true edge lines; overlaps into
-            # a neighbour are trimmed at its first grid line below.
-            x0, x1 = max(0, sx0 - px_i), min(sw, sx1 + px_i)
-            y0, y1 = max(0, sy0 - py_i), min(sh, sy1 + py_i)
-            sub = img_bgr[y0:y1, x0:x1]
-            g = detect_stash_grid(sub)
-            if not g or not validate_grid(g):
-                continue
-            # One frame renders at one UI scale, so every real panel shares
-            # the frame-global pitch — a sub-crop straddling a panel seam
-            # "detects" some other periodicity and gets rejected here.  Both
-            # axes compare against the x pitch: a full-frame y reference is
-            # poisoned by cross-panel correlation when panels sit at offset
-            # heights (measured: two panels 27px apart → global y "pitch" 27),
-            # and validate_grid enforces near-square cells anyway.
-            if (abs(g['cell_w'] - pitch_x) / pitch_x > 0.06
-                    or abs(g['cell_h'] - pitch_x) / pitch_x > 0.10):
-                continue
-            if (x1 - x0) < 2 * g['cell_w'] or (y1 - y0) < 2 * g['cell_h']:
-                continue
-            g['origin_x'] += x0
-            g['origin_y'] += y0
-            candidates.append({**g, 'x0': int(x0), 'y0': int(y0),
-                               'x1': int(x1), 'y1': int(y1)})
-
-    # Containment dedupe: a seam window can survive the pitch check when its
-    # junk period lands near-global, but such candidates sit almost entirely
-    # INSIDE a stronger panel (measured ~100% contained) — whereas a true
-    # neighbouring panel only overlaps by the one-pitch span expansion
-    # (measured ~27%).  Drop only the mostly-contained ones.
-    candidates.sort(key=lambda p: -p.get('strength', 0.0))
-    panels = []
-    for c in candidates:
-        area = (c['x1'] - c['x0']) * (c['y1'] - c['y0'])
-        contested = False
-        for k in panels:
-            ix = max(0, min(c['x1'], k['x1']) - max(c['x0'], k['x0']))
-            iy = max(0, min(c['y1'], k['y1']) - max(c['y0'], k['y0']))
-            if ix * iy > 0.6 * area:
-                contested = True
-                break
-        if not contested:
-            panels.append(c)
-
-    # Trim residual pairwise overlap (from the one-pitch span expansion) at
-    # the downstream panel's first grid line, so every cell is scanned by
-    # exactly one panel — a neighbour's grid running misaligned over this
-    # panel's cells is how false "extra" detections are born.
-    for i in range(len(panels)):
-        for j in range(i + 1, len(panels)):
-            a, b = panels[i], panels[j]
-            ix = min(a['x1'], b['x1']) - max(a['x0'], b['x0'])
-            iy = min(a['y1'], b['y1']) - max(a['y0'], b['y0'])
-            if ix <= 0 or iy <= 0:
-                continue
-            if ix <= iy:   # side-by-side → split along x
-                left, right = (a, b) if a['x0'] <= b['x0'] else (b, a)
-                cut = int(max(left['x0'] + 1, right['origin_x'] - 2))
-                left['x1'] = min(left['x1'], cut)
-                right['x0'] = max(right['x0'], min(cut, int(right['origin_x'])))
-            else:          # stacked → split along y
-                top, bot = (a, b) if a['y0'] <= b['y0'] else (b, a)
-                cut = int(max(top['y0'] + 1, bot['origin_y'] - 2))
-                top['y1'] = min(top['y1'], cut)
-                bot['y0'] = max(bot['y0'], min(cut, int(bot['origin_y'])))
-    panels = [p for p in panels
-              if p['x1'] - p['x0'] >= 2 * p['cell_w']
-              and p['y1'] - p['y0'] >= 2 * p['cell_h']]
-    panels.sort(key=lambda p: (p['y0'], p['x0']))
-    return panels
-
-
-def grid_rect(cx, cy, slots_w, slots_h, grid, pad=2):
-    """Pixel bounding rect for a grid region starting at (cx,cy), spanning slots."""
-    ox, oy = grid['origin_x'], grid['origin_y']
-    cw, ch = grid['cell_w'], grid['cell_h']
-    return (int(round(ox + cx * cw)) - pad,
-            int(round(oy + cy * ch)) - pad,
-            int(round(ox + (cx + slots_w) * cw)) + pad,
-            int(round(oy + (cy + slots_h) * ch)) + pad)
+                            # energy is UI chrome (toolbar/header rule), not a grid
+                            # line — grid lines sit ≤~2× median even when bold.
 
 
 # ---------------------------------------------------------------------------
@@ -2716,7 +1632,7 @@ def draw_badge(draw, x, y, label, bg=(30, 160, 30, 230)):
 
 
 # PIL's ImageDraw takes RGB(A) tuples (the highlight overlay is composited
-# onto `img`, a PIL Image, in the icon-DB pass below — unlike the OpenCV/BGR
+# onto `img`, a PIL Image, in the scan below — unlike the OpenCV/BGR
 # pipeline the rest of this module uses for matching).
 # This is the RGB equivalent of the amber/orange (0,165,255) BGR the FiR
 # feature spec calls for, so it renders as amber rather than blue on screen.
@@ -2726,11 +1642,6 @@ FIR_AMBER_RGB = (255, 165, 0)
 # ---------------------------------------------------------------------------
 # Keep-list scan — one pipeline shared by the hotkey and the Scan button
 # ---------------------------------------------------------------------------
-
-def _persist_grid(g):
-    s = load_json(SETTINGS_PATH, default_settings)
-    s['grid'] = g
-    save_json(SETTINGS_PATH, s)
 
 
 DEBUG_DIR  = os.path.join(DATA, 'debug')
@@ -2742,7 +1653,7 @@ def _save_debug_bundle(img_bgr, panels, detections, kind):
     Persist the raw frame + detected panels + every raw detection for the
     last few scans under data/debug/scan-<ts>-<kind>/.  This is what turns
     "that scan looked wrong" into an actionable report: the frame doubles as
-    an eval image (test_scan.py --label data/debug/.../frame.png) and the
+    an eval image (test_scan.py --prefill data/debug/.../frame.png) and the
     JSON shows exactly what the matcher decided.  Best-effort — a failed
     dump must never break a scan.
     """
@@ -2764,13 +1675,10 @@ def _save_debug_bundle(img_bgr, panels, detections, kind):
 
 def run_keep_scan(from_calibration=False):
     """
-    Capture → panel grids → icon-DB identification, annotated for the keep
-    list.  Identity comes exclusively from the icon matcher (OCR participates
-    only as the label-fusion layer inside identify_items_by_icon) — the old
-    whole-image OCR sweep drew fuzzy-matched boxes on essentially random
-    cells and suppressed correct icon matches at those spots, so it is gone.
+    Capture → identify every item (identify/ engine), annotated for the keep
+    list.
 
-    Returns {image, detections, grid, grid_src, warnings, checklist_matches}.
+    Returns {image, detections, grid, grid_failed, warnings, checklist_matches}.
     Raises ScanError/Exception — callers decide how to surface it.
 
     `from_calibration=True` reuses the region-picker's just-grabbed full-
@@ -2795,10 +1703,10 @@ def run_keep_scan(from_calibration=False):
         img, img_bgr = capture_for_scan(settings, from_calibration,
                                         require_region=False, warnings=warnings)
 
-        _scan_state['phase'] = 'grid'
-        panels, grid_src = resolve_panels(img_bgr, settings, persist_fn=_persist_grid)
+        _scan_state['phase'] = 'identify'
+        all_dets, panels, grid_failed = scan_with_v2(img_bgr, settings, warnings)
         grid = panels[0]
-        print(f"Grid[{grid_src}]: {len(panels)} panel(s), "
+        print(f"Grid: {len(panels)} panel(s), "
               f"cell={grid['cell_w']:.2f}×{grid['cell_h']:.2f} "
               f"origin=({grid['origin_x']:.1f},{grid['origin_y']:.1f})")
 
@@ -2813,21 +1721,8 @@ def run_keep_scan(from_calibration=False):
                             f"catalog: {', '.join(unmapped[:3])}"
                             + ('…' if len(unmapped) > 3 else ''))
 
-        icon_db = get_icon_db()
-        if not icon_db:
-            warnings.append('Icon DB not built — icon matching skipped '
-                            '(build it from the Sell Advisor page)')
-        if icon_db and keepid_to_entry:
-            _scan_state['phase'] = 'resample'
-            matcher_db = get_matcher_db(grid)
-            _scan_state['phase'] = 'match'
+        if keepid_to_entry:
             draw = ImageDraw.Draw(img, 'RGBA')
-            label_matcher = build_label_matcher(prices)
-            def _cb(done, total):
-                _scan_state['done'], _scan_state['total'] = done, total
-            all_dets = scan_all_panels(img_bgr, panels, matcher_db,
-                                       label_matcher=label_matcher,
-                                       progress_cb=_cb)
             if settings.get('debug_dumps', True):
                 _save_debug_bundle(img_bgr, panels, all_dets, 'keep')
             for d in all_dets:
@@ -2863,7 +1758,8 @@ def run_keep_scan(from_calibration=False):
         buf = BytesIO()
         img.save(buf, format='PNG')
         encoded = base64.b64encode(buf.getvalue()).decode()
-        return {'image': encoded, 'detections': detections, 'grid': grid, 'grid_src': grid_src,
+        return {'image': encoded, 'detections': detections, 'grid': grid,
+                'grid_failed': grid_failed,
                 'warnings': warnings, 'checklist_matches': checklist_matches}
     finally:
         _scan_state.update({'running': False, 'phase': None, 'ts': time.time()})
@@ -2881,8 +1777,8 @@ def do_scan():
         print(f"[hotkey scan] ERROR:\n{traceback.format_exc()}")
         with _scan_lock:
             _last_scan.update({'image': None, 'detections': [], 'warnings': [],
-                               'checklist_matches': [], 'error': str(e),
-                               'ts': time.time()})
+                               'checklist_matches': [], 'grid_failed': False,
+                               'error': str(e), 'ts': time.time()})
 
 
 # ---------------------------------------------------------------------------
@@ -2961,32 +1857,16 @@ def last_scan():
 def scan_status():
     return jsonify(dict(_scan_state))
 
-def _exact_ids_status():
-    """Report the eft_hash validation-gate status for /api/health."""
-    try:
-        import eft_hash
-        status = eft_hash.get_status(DATA)
-        if not status:
-            return {'enabled': False}
-        return {
-            'enabled':   bool(status.get('enabled')),
-            'agreement': status.get('agreement'),
-            'provider':  status.get('provider'),
-        }
-    except Exception:
-        return {'enabled': False}
-
 
 @app.route('/api/health', methods=['GET'])
 def health():
     return jsonify({
         'tesseract':      tesseract_available(),
         'tesseract_cmd':  pytesseract.pytesseract.tesseract_cmd,
-        'icon_db_ready':  get_icon_db() is not None,
-        'icon_db_error':  _index_build_state.get('error') or _icon_db_error,
+        'catalog_ready':  catalog_summary() is not None,
+        'catalog_error':  _index_build_state.get('error'),
         'prices_cached':  os.path.exists(PRICES_PATH),
         'hotkey':         hotkey_manager.current,
-        'exact_ids':      _exact_ids_status(),
         'app_version':    APP_VERSION,
     })
 
@@ -3013,6 +1893,7 @@ def take_screenshot():
         tb = traceback.format_exc()
         print(f"[screenshot] ERROR:\n{tb}")
         return jsonify({'error': str(e), 'image': None, 'detections': [],
+                        'grid_failed': False,
                         'warnings': [], 'checklist_matches': []})
 
 @app.route('/api/keep-list', methods=['GET'])
@@ -3106,15 +1987,188 @@ def calibration_screenshot():
     encoded = base64.b64encode(buf.getvalue()).decode()
     return jsonify({'image': encoded, 'width': img.width, 'height': img.height})
 
+# ---------------------------------------------------------------------------
+# Settings API (the Settings page edits every key below; unknown keys are kept as they are)
+# ---------------------------------------------------------------------------
+
+class _BadSetting(ValueError):
+    """A settings value of the wrong type or outside its choices (the message is shown to the user)."""
+
+
+def _s_bool(v):
+    if isinstance(v, bool):
+        return v
+    raise _BadSetting('must be true or false')
+
+
+def _s_bool_or_none(v):
+    return None if v is None else _s_bool(v)
+
+
+def _s_int(lo, hi, nullable=False):
+    """A whole number, clamped into [lo, hi] (a number outside the range is corrected, not refused)."""
+    def check(v):
+        if v is None and nullable:
+            return None
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise _BadSetting('must be a number')
+        if isinstance(v, float):
+            if v != v or v in (float('inf'), float('-inf')) or not v.is_integer():
+                raise _BadSetting('must be a whole number')
+            v = int(v)
+        return max(lo, min(hi, v))
+    return check
+
+
+def _s_enum(choices):
+    """One of ``choices`` (matched case-insensitively, stored in the canonical spelling)."""
+    canon = {c.lower(): c for c in choices}
+    def check(v):
+        if isinstance(v, str) and v.strip().lower() in canon:
+            return canon[v.strip().lower()]
+        raise _BadSetting('must be one of: ' + ', '.join(choices))
+    return check
+
+
+def _s_text(v):
+    """Free text, trimmed; an empty string means 'not set' (None)."""
+    if v is None:
+        return None
+    if not isinstance(v, str) or '\x00' in v or len(v) > 1024:
+        raise _BadSetting('must be text')
+    return v.strip() or None
+
+
+def _s_hotkey(v):
+    if not isinstance(v, str) or not v.strip():
+        raise _BadSetting('must be a key combination such as <ctrl>+<shift>+s')
+    v = v.strip()
+    try:
+        hotkey_manager.validate(v)
+    except Exception as e:
+        raise _BadSetting(f'is not a valid key combination ({e})')
+    return v
+
+
+def _s_name_list(v):
+    if not isinstance(v, list) or len(v) > 64 or not all(isinstance(n, str) for n in v):
+        raise _BadSetting('must be a list of names')
+    out = []
+    for n in (n.strip() for n in v):
+        if n and len(n) <= 40 and n not in out:
+            out.append(n)
+    return out
+
+
+def _s_trader_levels(v):
+    if not isinstance(v, dict) or len(v) > 64:
+        raise _BadSetting('must be an object of trader name to loyalty level')
+    level = _s_int(1, 4)
+    out = {}
+    for name, lv in v.items():
+        try:
+            out[str(name)] = level(lv)
+        except _BadSetting:
+            raise _BadSetting(f'level for {name} must be a number from 1 to 4')
+    return out
+
+
+def _s_region(v):
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise _BadSetting('must be null or {x, y, w, h}')
+    out = dict(v)
+    for k, lo in (('x', 0), ('y', 0), ('w', 1), ('h', 1)):
+        if k not in v:
+            raise _BadSetting(f'is missing "{k}"')
+        out[k] = _s_int(lo, 100000)(v[k])
+    return out
+
+
+# key -> checker returning the clean value (or raising _BadSetting).  A key that is not listed
+# here is not ours to judge (other modules, hand-edited extras) and is stored as given.
+_SETTING_RULES = {
+    'region': _s_region, 'monitor': _s_int(0, 16), 'hotkey': _s_hotkey, 'prestige': _s_int(0, 6),
+    'scan_countdown': _s_int(0, 10), 'kappa_only_tasks': _s_bool, 'debug_dumps': _s_bool,
+    'flea_requires_fir': _s_bool_or_none, 'flea_offer_slots': _s_int(0, 100),
+    'flea_overflow': _s_enum(('queue', 'trader')), 'flea_min_gain': _s_int(0, 10 ** 9),
+    'intel_center_level': _s_int(0, 3, nullable=True), 'hideout_management_level': _s_int(0, 51),
+    'skip_traders': _s_name_list, 'trader_levels': _s_trader_levels,
+    'auto_scan': _s_bool, 'auto_scan_in_raid': _s_bool, 'auto_scan_exe': _s_text,
+    'auto_task_progress': _s_bool, 'eft_install_dir': _s_text,
+    'game_mode': _s_enum(('auto', 'pvp', 'pve', 'season')), 'faction': _s_enum(('auto', 'BEAR', 'USEC')),
+    'start_with_windows': _s_bool, 'follow_tarkov': _s_bool, 'show_window_on_game_start': _s_bool,
+    'ignore_task_items': _s_bool, 'ignore_hideout_items': _s_bool,
+    'live_viewer': _s_bool, 'live_in_raid': _s_bool, 'live_top_n': _s_int(1, 20),
+    'live_min_value_per_slot': _s_int(0, 10 ** 9),
+}
+
+# Modules that must react when a setting changes (lifecycle: the Windows start-up entry, ...)
+# append ``fn(old_settings, new_settings)`` here; a failing hook never fails the save.
+SETTINGS_CHANGED_HOOKS = []
+
+
+def _validate_settings(incoming, current):
+    """``current`` (the stored settings) updated with ``incoming``.  Returns ``(merged, errors)``;
+    ``errors`` maps a key to what is wrong with it and ``merged`` is only good when it is empty.
+    Keys that are not in ``incoming`` are left alone (a partial update never drops a setting) and
+    a value equal to the stored one is not judged again, so a hand-edited oddity in settings.json
+    cannot block every later save."""
+    merged = dict(current)
+    errors = {}
+    for key, value in incoming.items():
+        if key in current and type(current[key]) is type(value) and current[key] == value:
+            continue
+        check = _SETTING_RULES.get(key)
+        try:
+            merged[key] = check(value) if check else value
+        except _BadSetting as e:
+            errors[key] = f'{key} {e}'
+    return merged, errors
+
+
 @app.route('/api/settings', methods=['GET'])
 def get_settings():
-    return jsonify(load_json(SETTINGS_PATH, default_settings))
+    # lifecycle keys filled in for settings files saved before they existed
+    stored = lifecycle.with_defaults(load_json(SETTINGS_PATH, default_settings))
+    if request.args.get('full') in ('1', 'true'):     # the Settings page: stored values over the defaults
+        defaults = default_settings()
+        return jsonify({'settings': {**defaults, **stored}, 'defaults': defaults})
+    return jsonify(stored)
 
 @app.route('/api/settings', methods=['POST'])
 def save_settings():
-    settings = request.json
-    save_json(SETTINGS_PATH, settings)
-    return jsonify({'ok': True})
+    """Merge the posted keys into data/settings.json.  Any bad value refuses the whole request
+    (400, nothing is written); on success the response carries the settings as saved."""
+    incoming = request.get_json(silent=True)
+    if not isinstance(incoming, dict):
+        return jsonify({'ok': False, 'error': 'Expected a JSON object of settings.'}), 400
+    old = load_json(SETTINGS_PATH, default_settings)
+    new, errors = _validate_settings(incoming, old)
+    if errors:
+        return jsonify({'ok': False, 'error': '; '.join(errors.values()), 'errors': errors}), 400
+    if new.get('hotkey') != old.get('hotkey') and hotkey_manager.current is not None:
+        try:
+            hotkey_manager.register(new['hotkey'])      # a changed hotkey takes effect at once
+        except Exception as e:
+            return jsonify({'ok': False, 'error': f'Invalid hotkey: {e}',
+                            'errors': {'hotkey': str(e)}}), 400
+    save_json(SETTINGS_PATH, new)
+    try:
+        autoscanner.poke()                              # Auto-scan on/off and friends: re-evaluate now
+    except Exception:
+        pass
+    try:
+        lifecycle.apply_settings(new)   # start_with_windows: register/unregister + start/stop the watcher, now
+    except Exception as e:
+        print(f'[settings] lifecycle: {e}')
+    for hook in list(SETTINGS_CHANGED_HOOKS):
+        try:
+            hook(old, new)
+        except Exception as e:
+            print(f'[settings] change hook failed: {e}')
+    return jsonify({'ok': True, 'settings': new})
 
 @app.route('/api/reset', methods=['POST'])
 def reset_keep_list():
@@ -3270,7 +2324,8 @@ def update_apply():
         # Give the HTTP response time to flush to the browser before tearing
         # the window/tray down.
         time.sleep(1.5)
-        _shutdown_desktop()
+        # the watcher runs from this same exe file, and updater.bat cannot replace a running exe
+        _shutdown_desktop(stop_watcher=True)
     threading.Thread(target=_delayed_restart, daemon=True).start()
 
     return jsonify({'ok': True, 'restarting': True})
@@ -3289,13 +2344,18 @@ def api_tasks():
         cache = get_tasks()
     except Exception as e:
         return jsonify({'error': str(e)}), 502
-    progress = load_json(PROGRESS_PATH, default_progress)
+    progress = effective_progress(cache)
     settings = load_json(SETTINGS_PATH, default_settings)
-    kappa_only = settings.get('kappa_only_tasks', True)
+    kappa_only = settings.get('kappa_only_tasks', False)
     qp = request.args.get('kappa_only')
     if qp is not None:
         kappa_only = qp not in ('0', 'false', 'False')
-    return jsonify(compute_tasks_view(cache, progress, kappa_only=kappa_only))
+    view = compute_tasks_view(cache, progress, kappa_only=kappa_only)
+    view['cache_age_minutes'] = round(_cache_age_seconds(cache, 'tasks') / 60, 1)   # since last confirmed current
+    view['source'] = cache.get('source') or 'graphql'
+    view['task_progress'] = _task_progress_status(progress)
+    view['auto_done'] = progress.get('auto_done') or []
+    return jsonify(view)
 
 @app.route('/api/tasks/refresh', methods=['POST'])
 def api_tasks_refresh():
@@ -3317,8 +2377,31 @@ def api_tasks_complete():
     ids = set(progress.get(key, []))
     (ids.add if done else ids.discard)(tid)
     progress[key] = sorted(ids)
+    if typ == 'task':
+        # An explicit click beats what the logs say, both ways (see effective_progress).
+        progress.setdefault('manual_overrides', {})[tid] = 'done' if done else 'open'
     save_json(PROGRESS_PATH, progress)
     return jsonify({'ok': True})
+
+
+def _task_progress_status(progress=None):
+    settings = load_json(SETTINGS_PATH, default_settings)
+    progress = progress or effective_progress()
+    return {'enabled': bool(settings.get('auto_task_progress', True)),
+            'log': progress.get('log_status'), 'error': _log_progress['error'],
+            'auto_done': len(progress.get('auto_done') or ()),
+            'install_dir': _log_scanner.install_dir, 'scanned_at': _log_scanner.last_scan_at}
+
+
+@app.route('/api/task-progress/status', methods=['GET'])
+def api_task_progress_status():
+    return jsonify(_task_progress_status())
+
+
+@app.route('/api/task-progress/rescan', methods=['POST'])
+def api_task_progress_rescan():
+    res = scan_task_logs(full=True)
+    return jsonify({'ok': res is not None, 'scan': res, **_task_progress_status()})
 
 @app.route('/api/tasks/have', methods=['POST'])
 def api_tasks_have():
@@ -3379,106 +2462,149 @@ def api_prestige_advance():
 def sell_page():
     return render_template('sell.html')
 
+@app.route('/settings')
+def settings_page():
+    return render_template('settings.html')
+
+def _cache_status(path, kind, count_key):
+    """Status of one cache for /api/prices/status: age since last confirmed current, when it was
+    last rewritten, which source produced it, and the last refresh error (None when the latest
+    attempt succeeded)."""
+    cache = _load_cache(path)
+    if not cache or not cache.get(count_key):
+        return {'cached': False, 'age_minutes': None, 'count': 0,
+                'error': _refresh_state[kind]['error']}
+    meta = _load_meta()
+    now = time.time()
+    return {
+        'cached': True,
+        'age_minutes': round(_cache_age_seconds(cache, kind) / 60, 1),
+        'updated_minutes': round((now - cache.get('timestamp', 0)) / 60, 1),
+        'count': len(cache[count_key]),
+        'source': cache.get('source') or 'graphql',
+        'error': _refresh_state[kind]['error'] or meta['errors'].get(kind),
+    }
+
+
 @app.route('/api/prices/status', methods=['GET'])
 def prices_status():
-    if not os.path.exists(PRICES_PATH):
-        return jsonify({'cached': False, 'age_minutes': None, 'count': 0})
-    cache = load_json(PRICES_PATH, lambda: {})
-    age = (time.time() - cache.get('timestamp', 0)) / 60
-    return jsonify({'cached': True, 'age_minutes': round(age, 1), 'count': len(cache.get('items', []))})
+    st = _cache_status(PRICES_PATH, 'prices', 'items')
+    st['stale'] = bool(st['cached'] and st['age_minutes'] > 3 * PRICE_REFRESH_INTERVAL / 60)
+    st['refresh_minutes'] = PRICE_REFRESH_INTERVAL // 60
+    st['tasks'] = _cache_status(TASKS_CACHE_PATH, 'tasks', 'tasks')
+    st['catalog_pending'] = len(_load_meta()['catalog_pending'])
+    st['catalog_building'] = _index_build_state['running']
+    return jsonify(st)
 
 @app.route('/api/prices/refresh', methods=['POST'])
 def prices_refresh():
     try:
-        cache = fetch_prices()
-        return jsonify({'ok': True, 'count': len(cache['items'])})
+        res = refresh_prices()
+        return jsonify({'ok': True, 'count': len(res['cache']['items']), 'status': res['status'],
+                        'source': res['source'], 'new_items': len(res['new_ids'])})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
-@app.route('/api/debug/grid', methods=['POST'])
-def debug_grid():
-    """Capture the configured region and return detected grid/panel parameters."""
-    settings = load_json(SETTINGS_PATH, default_settings)
-    img, img_bgr = capture_stash_image(settings)
-    grid = detect_stash_grid(img_bgr)
-    panels = detect_panels(img_bgr)
-    return jsonify({'grid': grid, 'panels': panels,
-                    'img_size': [img.width, img.height]})
 
-@app.route('/api/icons/prefetch', methods=['POST'])
-def icons_prefetch():
-    """Pre-download icons for all keep-list items in background."""
-    def _run():
-        keep_list = load_json(KEEPLIST_PATH, default_keep_list)
-        prices    = get_prices()
-        price_idx = build_price_index(prices)
-        settings  = load_json(SETTINGS_PATH, default_settings)
-        scale     = settings.get('icon_scale', 2.0)
-        n = prefetch_keep_list_icons(keep_list, price_idx, scale)
-        print(f"Icon prefetch complete: {n} icons downloaded/verified")
-    threading.Thread(target=_run, daemon=True).start()
-    return jsonify({'ok': True, 'message': 'Icon prefetch started in background'})
+_index_build_state = {'running': False, 'phase': None, 'done': 0, 'total': 0, 'ts': 0, 'error': None}
+_catalog_rerun = threading.Event()     # items changed while a build was running: build once more
+_startup_done = threading.Event()      # the engine warm-up at launch finished (builds wait for it)
 
-_index_build_state = {'running': False, 'done': 0, 'total': 0, 'ts': 0, 'error': None}
 
-@app.route('/api/icons/build-index', methods=['POST'])
-def icons_build_index():
-    """Download all icons and build the NCC icon index."""
-    if _index_build_state['running']:
-        return jsonify({'ok': False, 'message': 'Build already in progress'})
+def _wait_for_idle_scan(timeout=300):
+    """Block until no scan is running (a hot-swap of the engine must not pull it out from under one)."""
+    t0 = time.time()
+    while _scan_state['running'] and time.time() - t0 < timeout:
+        time.sleep(1)
 
-    def _run():
-        global _icon_db, _icon_db_error
-        _index_build_state.update({'running': True, 'done': 0, 'total': 0,
-                                   'ts': time.time(), 'error': None})
-        try:
+
+def run_icon_db_build(reason='manual'):
+    """The Build Icon DB work, synchronously (the caller claimed ``_index_build_state``): download
+    the base image of every item that lacks one, rebuild the catalog, wait for any running scan to
+    finish, then hot-swap the engine.  New-item ids that were pending are cleared once every image
+    arrived.  Repeats once more if items changed while it ran."""
+    try:
+        if reason != 'manual':
+            _startup_done.wait(600)           # never race the launch-time engine warm-up
+        while True:
+            _catalog_rerun.clear()
+            pending = set(_load_meta()['catalog_pending'])
             prices = get_prices()
-            _index_build_state['total'] = len(prices.get('items', []))
             def cb(done, total):
                 _index_build_state['done']  = done
                 _index_build_state['total'] = total
-            db = build_icon_db(prices, progress_cb=cb)
-            with _icon_db_lock:
-                _icon_db = db
-                _icon_db_error = None   # fresh build supersedes any stale load error
-            _invalidate_pitch_cache()   # pitch-resampled copies of the old DB are stale
-            _index_build_state['done'] = _index_build_state['total']
-            print(f"[icon_db] built: {sum(len(b['ids']) for b in db.values())} items")
-        except Exception as e:
-            _index_build_state['error'] = str(e)
-            print(f"[icon_db] build failed: {e}")
-            return
-        finally:
-            _index_build_state['running'] = False
+            _index_build_state.update({'phase': 'images', 'done': 0, 'total': 0})
+            ok, failed = download_missing_base_images(prices, progress_cb=cb)
+            print(f"[catalog] base images: {ok} downloaded, {failed} failed ({reason})")
+            _index_build_state['phase'] = 'catalog'    # ~35 s, no progress to report
+            from identify.catalog import load_catalog
+            load_catalog(force_rebuild=True)
+            _index_build_state['phase'] = 'engine'
+            _wait_for_idle_scan()
+            _warm_v2_engine()
+            print('[catalog] built')
+            if failed == 0 and pending:
+                meta = _load_meta()
+                meta['catalog_pending'] = sorted(set(meta['catalog_pending']) - pending)
+                _save_meta_quietly(meta)
+            if not _catalog_rerun.is_set():
+                break
+    except Exception as e:
+        _index_build_state['error'] = str(e)
+        print(f"[catalog] build failed: {e}")
+    finally:
+        _index_build_state.update({'running': False, 'phase': None})
 
-    threading.Thread(target=_run, daemon=True).start()
+
+def start_icon_db_build(reason='manual'):
+    """Start :func:`run_icon_db_build` in the background.  False (and a request to build once
+    more when the running build finishes) if one is already running."""
+    if _index_build_state['running']:
+        _catalog_rerun.set()
+        return False
+    # claim the slot before the thread starts so a double click cannot start two builds
+    _index_build_state.update({'running': True, 'phase': 'images', 'done': 0, 'total': 0,
+                               'ts': time.time(), 'error': None})
+    threading.Thread(target=run_icon_db_build, args=(reason,), daemon=True).start()
+    return True
+
+
+def _has_catalog():
+    """True once this install has built its item catalog (so the app should keep it current)."""
+    return catalog_summary() is not None
+
+
+def _queue_catalog_update():
+    """New items arrived: fetch their images and rebuild the catalog in the background, but only
+    on installs that already have a catalog (a clean install waits for its first Build Icon DB,
+    which covers them).  The ids stay in the meta file until a build has covered them."""
+    if _has_catalog():
+        start_icon_db_build('new items')
+
+
+@app.route('/api/icons/build-index', methods=['POST'])
+def icons_build_index():
+    """Build everything the identification engine needs: download the tarkov.dev base image of
+    every item that lacks one (data/tmpl_src/), then rebuild the template catalog from them
+    (data/identify_catalog_v2.npz) and load it into the running engine."""
+    if not start_icon_db_build('manual'):
+        return jsonify({'ok': False, 'message': 'Build already in progress'})
     return jsonify({'ok': True, 'message': 'Icon DB build started'})
-
-
-@app.route('/api/icons/index-status', methods=['GET'])
-def icons_index_status():
-    db = get_icon_db()
-    summary = None
-    if db:
-        summary = {
-            'sizes':       len(db),
-            'total_items': sum(len(b['ids']) for b in db.values()),
-        }
-    return jsonify({'build': _index_build_state, 'index': summary})
 
 
 @app.route('/api/icons/matcher-status', methods=['GET'])
 def icons_matcher_status():
-    """Unified status endpoint for the sell page — covers icon DB build + readiness."""
-    db = get_icon_db()
-    item_count = sum(len(b['ids']) for b in db.values()) if db else 0
+    """Status endpoint for the sell page: build progress + whether the catalog is ready."""
+    running = _index_build_state['running']
+    summary = None if running else catalog_summary()
     return jsonify({
-        'running':    _index_build_state['running'],
+        'running':    running,
+        'phase':      _index_build_state.get('phase'),
         'done_count': _index_build_state.get('done', 0),
         'total':      _index_build_state.get('total', 0),
-        'error':      _index_build_state.get('error') or _icon_db_error,
-        'ready':      db is not None,
-        'item_count': item_count,
+        'error':      _index_build_state.get('error'),
+        'ready':      summary is not None,
+        'item_count': summary['items'] if summary else 0,
     })
 
 
@@ -3494,16 +2620,8 @@ def sell_scan():
     print(f"[sell_scan] ERROR:\n{tb}")
     return jsonify({'error': str(e), 'traceback': tb, 'image': None, 'results': [], 'grid': None})
 
-def _sell_scan_inner(from_calibration=False):
+def _sell_scan_inner(from_calibration=False, frame_bgr=None):
     settings = load_json(SETTINGS_PATH, default_settings)
-
-    # --- Icon DB required ----------------------------------------------------
-    icon_db = get_icon_db()
-    if not icon_db:
-        return jsonify({
-            'image': None, 'results': [], 'grid': None,
-            'error': 'Icon index not built yet. Click "Build Icon DB" first.',
-        })
 
     _scan_state.update({'running': True, 'phase': 'capture',
                         'done': 0, 'total': 0, 'ts': time.time()})
@@ -3512,120 +2630,89 @@ def _sell_scan_inner(from_calibration=False):
 
         # --- Screenshot (region required for sell scans) ----------------------
         try:
-            img, img_bgr = capture_for_scan(settings, from_calibration,
-                                            require_region=True, warnings=warnings)
+            if frame_bgr is not None:      # full frame captured passively by autoscan.py
+                img_bgr = frame_bgr
+                img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+            else:
+                img, img_bgr = capture_for_scan(settings, from_calibration,
+                                                require_region=True, warnings=warnings)
         except ScanError as e:
             return jsonify({'image': None, 'results': [], 'grid': None,
-                            'error': str(e)})
+                            'grid_failed': False, 'error': str(e)})
 
-        # --- Grid detection (any pitch, per-panel origins, persisted) --------
-        _scan_state['phase'] = 'grid'
-        panels, grid_src = resolve_panels(img_bgr, settings, persist_fn=_persist_grid)
+        # --- Identification (grid, per-panel origins, every item) -------------
+        _scan_state['phase'] = 'identify'
+        raw_detections, panels, grid_failed = scan_with_v2(img_bgr, settings, warnings)
         grid = panels[0]
-        print(f"Grid[{grid_src}]: {len(panels)} panel(s), "
+        print(f"Grid: {len(panels)} panel(s), "
               f"cell={grid['cell_w']:.2f}×{grid['cell_h']:.2f} "
               f"origin=({grid['origin_x']:.1f},{grid['origin_y']:.1f})")
 
         prices     = get_prices()
+        if prices.get('stale_error'):
+            age_h = (time.time() - prices.get('timestamp', 0)) / 3600
+            warnings.append(f'Price refresh failed ({prices["stale_error"]}); '
+                            f'using prices from {age_h:.0f} h ago')
         price_idx  = build_price_index(prices)
         id_to_item = {it['id']: it for it in prices.get('items', [])}
 
         # Everything the player shouldn't sell: unacquired keep-list entries +
         # task/hideout items still short of their required count.
         keep_list = load_json(KEEPLIST_PATH, default_keep_list)
-        protected = get_protected_ids(keep_list, price_idx)
+        protected, any_of = get_protected_plan(keep_list, price_idx)
 
         if not tesseract_available():
             warnings.append('Tesseract OCR not installed — name reading disabled '
                             '(winget install UB-Mannheim.TesseractOCR)')
 
-        # --- NCC + OCR-label identification (uses existing icon DB) ----------
-        _scan_state['phase'] = 'resample'
-        matcher_db = get_matcher_db(grid)
-        _scan_state['phase'] = 'match'
-        def _cb(done, total):
-            _scan_state['done'], _scan_state['total'] = done, total
-        label_matcher = build_label_matcher(prices)
-        raw_detections = scan_all_panels(img_bgr, panels, matcher_db,
-                                         label_matcher=label_matcher,
-                                         progress_cb=_cb)
         print(f"[sell_scan] matches: {len(raw_detections)}")
         if settings.get('debug_dumps', True):
             _save_debug_bundle(img_bgr, panels, raw_detections, 'sell')
 
-        # --- Number items in reading order, KEEP items highlighted cyan ------
+        # --- Build every entry, then number them in SELL order ---------------
+        # The list and the badges on the image share one numbering, so badge 1
+        # is the first row to sell: trader items grouped in the game's trader
+        # order (one visit per trader), then the flea offers that fit in the
+        # player's slots by margin, then the flea queue, then KEEP items.
+        # Everything is outlined on the image in its own colour.  The decisions
+        # themselves are sellcalc.plan_entries (pure); this only draws them.
         draw    = ImageDraw.Draw(img, 'RGBA')
-        results = []
-        num     = 1
+        skipped_weapons = 0
 
-        keep_results = []   # KEEP items — appended after numbered items
+        sellable = []
         for d in sorted(raw_detections, key=lambda r: (r['panel'], r['row'], r['col'])):
-            bx, by = d['px'] + 2, d['py'] + 2
-
-            item_data = id_to_item.get(d['item_id'])
-            if not item_data:
-                continue
-
-            prot = protected.get(d['item_id'])
-            # A FiR-only protection (Kappa hand-ins, or aggregate needs that
-            # are entirely FiR-gated) only holds for a FiR copy — a detection
-            # confidently read as non-FiR falls through to a normal sell rec
-            # instead of being force-kept.  `fir is None` (indeterminate) must
-            # never unprotect, so it still counts as protected here.
-            non_fir_note = False
-            if prot and prot['fir_only'] and d.get('fir') is False:
-                prot = None
-                non_fir_note = True
-
-            if prot:
-                # Cyan = KEEP: unmistakably different from flea-green and
-                # trader-gold so "do not sell" reads at a glance.
-                fx1, fy1 = d['px'], d['py']
-                fx2, fy2 = d['px'] + d['pw'], d['py'] + d['ph']
-                draw.rectangle([fx1, fy1, fx2, fy2],
-                               fill=(0, 180, 220, 60), outline=(0, 220, 255, 255), width=3)
-                draw_badge(draw, bx, by, 'KEEP', bg=(0, 140, 180, 230))
-                keep_results.append({
-                    'num':          'K',
-                    'matched_name': item_data['name'],
-                    'score':        d['score'],
-                    'col':          d['col'], 'row': d['row'],
-                    'W':            d['W'],   'H':   d['H'],
-                    'rotated':      d.get('rotated', False),
-                    'fir':          d.get('fir'),
-                    'x': bx, 'y': by,
-                    'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph'],
-                    'recommend':    'keep',
-                    'trader_name':  None, 'trader_price': None,
-                    'flea_list':    None, 'flea_net':     None,
-                    'reason':       prot['reason'],
-                })
-                continue
-
-            rec = sell_recommendation(item_data)
-            if non_fir_note:
-                rec['reason'] += ' - not FIR, cannot be handed in'
-            if rec['recommend'] == 'flea':
-                bg = (30, 150, 30, 230)
+            badge = skip_badge(id_to_item.get(d['item_id']), d.get('category'))
+            if badge:
+                # Guns are never priced (a build can use any of hundreds of parts) and
+                # dogtags come in dozens of identically named themed variants.  Mark them so
+                # the player sees they were recognised, and leave them out of the sell list.
+                draw.rectangle([d['px'], d['py'], d['px'] + d['pw'], d['py'] + d['ph']],
+                               outline=(110, 110, 110, 255), width=2)
+                draw_badge(draw, d['px'] + 2, d['py'] + 2, badge, bg=(80, 80, 80, 220))
+                skipped_weapons += 1
             else:
-                trader_rgb = TRADER_COLORS_RGB.get(rec['trader_name'], DEFAULT_TRADER_BADGE_RGB)
-                bg = trader_rgb + (230,)
-            draw_badge(draw, bx, by, str(num), bg=bg)
+                sellable.append(d)
 
-            results.append({
-                'num':          num,
-                'matched_name': item_data['name'],
-                'score':        d['score'],
-                'col':          d['col'], 'row': d['row'],
-                'W':            d['W'],   'H':   d['H'],
-                'rotated':      d.get('rotated', False),
-                'fir':          d.get('fir'),
-                'non_fir_note': non_fir_note,
-                'x': bx, 'y': by,
-                'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph'],
-                **rec,
-            })
-            num += 1
+        ctx = build_sell_context(settings, prices)
+        results, keep_results = sellcalc.plan_entries(sellable, id_to_item, protected, settings, ctx, any_of)
+
+        for r in results:
+            if r['recommend'] == 'flea':
+                rgb = FLEA_QUEUE_RGB if r.get('flea_queue') else FLEA_RGB
+            else:
+                rgb = TRADER_COLORS_RGB.get(r['trader_name'], DEFAULT_TRADER_BADGE_RGB)
+            draw.rectangle([r['px'], r['py'], r['px'] + r['pw'], r['py'] + r['ph']],
+                           fill=rgb + (40,), outline=rgb + (255,), width=3)
+            draw_badge(draw, r['x'], r['y'], str(r['num']), bg=rgb + (230,))
+
+        for k in keep_results:
+            if k.pop('drawn'):
+                # Cyan = KEEP: unmistakably different from flea-green and
+                # trader-gold so "do not sell" reads at a glance.  A stack that
+                # is only partly needed is drawn by its sell row instead.
+                draw.rectangle([k['px'], k['py'], k['px'] + k['pw'], k['py'] + k['ph']],
+                               fill=(0, 180, 220, 60), outline=(0, 220, 255, 255), width=3)
+                draw_badge(draw, k['x'], k['y'], 'CHECK' if k.get('check') else 'KEEP', bg=(0, 140, 180, 230))
 
         results.extend(keep_results)   # KEEP items always at the end
 
@@ -3633,27 +2720,71 @@ def _sell_scan_inner(from_calibration=False):
         img.save(buf, format='PNG')
         encoded = base64.b64encode(buf.getvalue()).decode()
         return jsonify({
-            'image':    encoded,
-            'results':  results,
-            'grid':     grid,
-            'warnings': warnings,
+            'image':       encoded,
+            'results':     results,
+            'grid':        grid,
+            'grid_failed': grid_failed,
+            'warnings':    warnings,
+            'skipped_weapons': skipped_weapons,
         })
     finally:
         _scan_state.update({'running': False, 'phase': None, 'ts': time.time()})
 
 
+# ---------------------------------------------------------------------------
+# Auto-scan (autoscan/): passive capture of the game window, scan on a settled stash
+# ---------------------------------------------------------------------------
+
+def _autoscan_scan(frame_bgr):
+    """Run the normal sell scan on an already-captured full frame; returns its JSON payload."""
+    with app.app_context():
+        return _sell_scan_inner(frame_bgr=frame_bgr).get_json()
+
+
+def _load_settings():
+    return load_json(SETTINGS_PATH, default_settings)
+
+
+import autoscan  # noqa: E402  (needs app + the helpers above)
+autoscanner = autoscan.AutoScanner(_autoscan_scan, _load_settings,
+                                   busy_fn=lambda: _scan_state['running'],
+                                   collect_dir=os.path.join(DATA, 'scenes', 'live'))
+app.register_blueprint(autoscan.make_blueprint(
+    autoscanner, _load_settings, lambda s: save_json(SETTINGS_PATH, s)))
+# GET /api/lifecycle/status, POST /api/lifecycle/show (a second launch by hand brings this window up)
+app.register_blueprint(lifecycle.make_blueprint(_load_settings, lambda: _show_window()))
+
+
 HOST = '127.0.0.1'
-PORT = 8877
+PORT = int(os.environ.get('TSH_PORT', 8877))   # env override: smoke tests next to a running instance
 URL = f'http://{HOST}:{PORT}'
 
 
 def run_server():
     """The Flask app + all /api routes are unchanged — this just serves them
     on localhost instead of the old port-80/custom-hostname setup. The window
-    below is the only thing that changed; nothing about scanning, OCR, or the
-    icon DB was touched."""
+    below is the only thing that changed; nothing about scanning or OCR was touched."""
     from waitress import serve
     serve(app, host=HOST, port=PORT, _quiet=True)
+
+
+def migrate_settings(path=None):
+    """One-time fixes to settings saved by older versions.  Returns the list of migrations run."""
+    path = path or SETTINGS_PATH
+    if not os.path.exists(path):
+        return []
+    s = load_json(path, default_settings)
+    done = set(s.get('migrations') or ())
+    ran = []
+    if 'kappa_scope_all_tasks' not in done:
+        # kappa_only_tasks used to default to on, when ~200 quests were Kappa-required; since 1.0
+        # only the Collector's ~13-quest chain is, so "on" sold nearly every open quest's items.
+        s['kappa_only_tasks'] = False
+        ran.append('kappa_scope_all_tasks')
+    if ran:
+        s['migrations'] = sorted(done | set(ran))
+        save_json(path, s)
+    return ran
 
 
 def _startup_maintenance():
@@ -3667,12 +2798,102 @@ def _startup_maintenance():
                 print(f"[cleanup] removed retired file {fn}")
             except Exception as e:
                 print(f"[cleanup] could not remove {fn}: {e}")
+    migrate_settings()
+    try:
+        scan_task_logs(full=True)            # quest progress from the game logs, before the first scan
+    except Exception as e:
+        print(f"[eftlogs] startup scan skipped: {e}")
     try:
         cache = load_json(KAPPA_WIKI_PATH, lambda: None) if os.path.exists(KAPPA_WIKI_PATH) else None
         if not cache or time.time() - cache.get('timestamp', 0) > KAPPA_WIKI_TTL:
             kappa_sync()
     except Exception as e:
         print(f"[kappa] startup sync skipped (offline?): {e}")
+    # Warm the v2 identification engine (loads/builds the template catalog - ~35 s the first
+    # time - and the optional DINO model) so the first hotkey scan isn't the one that pays for it.
+    try:
+        _warm_v2_engine()
+    finally:
+        _startup_done.set()
+
+
+def _warm_v2_engine():
+    try:
+        if os.path.exists(PRICES_PATH):
+            from identify.config import EngineSettings
+            from identify.pipeline import Engine
+            es = EngineSettings.from_settings(load_json(SETTINGS_PATH, default_settings))
+            _v2_engine[:] = [repr(es), Engine(es)]
+            print('[v2] identification engine ready')
+    except Exception as e:
+        print(f"[v2] warm-up skipped: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Background refresher: keeps prices, tasks and the item catalog current without being asked
+# ---------------------------------------------------------------------------
+
+def _refresh_due(kind, path, interval, meta, now):
+    """True when this cache was last confirmed current more than ``interval`` seconds ago (so a
+    cache that is already old at startup refreshes immediately) and the last attempt - failed ones
+    included - is at least RETRY_BACKOFF (or the interval, if shorter) back."""
+    cache = _load_cache(path)
+    confirmed = max((cache or {}).get('timestamp', 0), meta['checked'].get(kind) or 0) if cache else 0
+    if now - confirmed < interval:
+        return False
+    attempt = max(meta['attempted'].get(kind) or 0, _refresh_state[kind]['attempt'])
+    return now - attempt >= min(RETRY_BACKOFF, interval)
+
+
+def refresh_cycle(now=None):
+    """One pass of the refresher: refresh whatever is due (prices first - the task data takes its
+    item names from them), then resume catalog work a previous run left unfinished.  Never
+    raises.  Returns the list of what was refreshed."""
+    now = time.time() if now is None else now
+    ran = []
+    for kind, path, interval, fn in (
+            ('prices', PRICES_PATH, PRICE_REFRESH_INTERVAL, refresh_prices),
+            ('tasks', TASKS_CACHE_PATH, TASKS_REFRESH_INTERVAL, refresh_tasks)):
+        try:
+            if _refresh_due(kind, path, interval, _load_meta(), now):
+                fn()
+                ran.append(kind)
+        except Exception as e:
+            print(f'[refresh] {kind}: {e}')
+    try:
+        if scan_task_logs():
+            ran.append('task_logs')
+    except Exception as e:
+        print(f'[refresh] task logs: {e}')
+    try:
+        if _load_meta()['catalog_pending'] and not _index_build_state['running']:
+            _queue_catalog_update()
+    except Exception as e:
+        print(f'[refresh] catalog: {e}')
+    return ran
+
+
+_refresher = {'thread': None, 'stop': threading.Event()}
+
+
+def _refresher_loop(stop, poll=60):
+    while not stop.is_set():
+        refresh_cycle()
+        stop.wait(poll)
+
+
+def start_refresher():
+    """Start the daemon thread (idempotent).  The first pass runs at once, so a cache that is
+    older than its interval is refreshed on startup."""
+    t = _refresher['thread']
+    if t is not None and t.is_alive():
+        return t
+    _refresher['stop'].clear()
+    t = threading.Thread(target=_refresher_loop, args=(_refresher['stop'],), daemon=True,
+                         name='tarkovdev-refresher')
+    _refresher['thread'] = t
+    t.start()
+    return t
 
 
 # Module-level handle to the running pywebview window / pystray icon / quit
@@ -3680,24 +2901,50 @@ def _startup_maintenance():
 # (which has no closure over _run_app's locals) tear the desktop down through
 # the exact same path the tray's Quit menu item uses. Stays all-None when run
 # from source without the desktop shell (e.g. under pytest).
-_desktop = {'window': None, 'tray': None, 'quitting': None}
+_desktop = {'window': None, 'tray': None, 'tray_thread': None, 'quitting': None}
 
 
-def _shutdown_desktop():
+def _show_window():
+    """Bring the window up (tray 'Open', and a second launch by hand via /api/lifecycle/show)."""
+    window = _desktop.get('window')
+    if window is None:
+        raise RuntimeError('no window yet')
+    lifecycle.allow_activation(window)   # a window started with focus=False could not take focus on click
+    window.show()
+
+
+def _shutdown_desktop(stop_watcher=False):
     """
     Tear down the tray + window the same way the tray's Quit action does,
-    then exit the process. Shared by on_quit and the post-update-apply
-    restart so both paths behave identically. When _desktop was never
-    populated (no pywebview window — running windowless from source), this
-    just falls back to os._exit(0).
+    then exit the process. Shared by on_quit, the post-update-apply
+    restart and "Tarkov exited" so all paths behave identically. When
+    _desktop was never populated (no pywebview window — running windowless
+    from source), this just falls back to os._exit(0).
+
+    The watcher (lifecycle.py) is left running - it opens the app again
+    for the next Tarkov launch - unless ``stop_watcher``: the self-update
+    must be able to replace the exe the watcher is running from.
     """
     quitting = _desktop.get('quitting')
     if quitting is not None:
         quitting.set()
+    _refresher['stop'].set()
+    try:
+        autoscanner.stop()      # releases the screen duplication
+    except Exception:
+        pass
+    if stop_watcher:
+        try:
+            lifecycle.stop_watcher()
+        except Exception:
+            pass
     tray = _desktop.get('tray')
     if tray is not None:
         try:
             tray.stop()
+            t = _desktop.get('tray_thread')
+            if t is not None:
+                t.join(1.0)     # let it delete its notification-area icon, or a ghost icon stays until hovered
         except Exception:
             pass
     window = _desktop.get('window')
@@ -3714,17 +2961,30 @@ def _run_app():
     browser tab, so there's no URL for the user to see or navigate to — it
     just looks like a normal desktop app. Closing the window minimizes to
     the tray; Quit from the tray menu actually exits."""
+    import inspect
     import webview
     import pystray
     from icon_asset import load_tray_image
 
+    # Single instance, the startup entry + watcher, and "close when Tarkov exits" (lifecycle.py).
+    # None = a copy is already running; it was told to show its window and this one just leaves.
+    session = lifecycle.begin_app_session(sys.argv[1:], _load_settings, _shutdown_desktop)
+    if session is None:
+        return
+
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=_startup_maintenance, daemon=True).start()
+    start_refresher()
     start_hotkey_listener()
+    autoscanner.start()
 
+    # Started by the watcher (or to the tray): never take the focus from the game, and with
+    # show_window_on_game_start off do not open a window at all.
+    opts = lifecycle.window_kwargs(inspect.signature(webview.create_window).parameters,
+                                   session['quiet'], session['hidden'])
     window = webview.create_window(
         'Tarkov Stash Helper', URL,
-        width=1180, height=860, min_size=(900, 640),
+        width=1180, height=860, min_size=(900, 640), **opts,
     )
 
     quitting = threading.Event()
@@ -3738,12 +2998,23 @@ def _run_app():
         return False  # veto the close — minimize to tray instead
 
     window.events.closing += on_closing
+    window.events.loaded += lambda: lifecycle.allow_activation(window)
 
     def on_open(icon, item):
-        window.show()
+        _show_window()
 
     def on_quit(icon, item):
-        _shutdown_desktop()
+        _shutdown_desktop()      # the watcher stays: it opens the app again at the next Tarkov launch
+
+    def on_quit_stop(icon, item):
+        try:
+            s = _load_settings()
+            s['start_with_windows'] = False
+            save_json(SETTINGS_PATH, s)
+            lifecycle.apply_settings(s)      # unregisters the startup entry and stops the watcher
+        except Exception as e:
+            print(f"[lifecycle] could not turn auto-launch off: {e}")
+        _shutdown_desktop(stop_watcher=True)
 
     tray_icon = pystray.Icon(
         'TarkovStashHelper',
@@ -3752,15 +3023,31 @@ def _run_app():
         menu=pystray.Menu(
             pystray.MenuItem('Open Stash Helper', on_open, default=True),
             pystray.MenuItem('Quit', on_quit),
+            pystray.MenuItem('Quit and stop auto-launch', on_quit_stop),
         ),
     )
+
+    def tray_setup(icon):
+        icon.visible = True
+        if session.get('first_registration'):
+            try:
+                icon.notify('It will now open when Tarkov starts and close when Tarkov exits. '
+                            'Right-click this icon > "Quit and stop auto-launch" to turn that off.',
+                            'Tarkov Stash Helper')
+            except Exception:
+                pass
+
     _desktop['tray'] = tray_icon
-    threading.Thread(target=tray_icon.run, daemon=True).start()
+    _desktop['tray_thread'] = threading.Thread(target=tray_icon.run, args=(tray_setup,), daemon=True)
+    _desktop['tray_thread'].start()
 
     webview.start()  # blocks; owns the main thread
 
 
 if __name__ == '__main__':
+    if '--selftest' in sys.argv:    # packaged-build smoke test: no window/tray/hotkey (selftest.py)
+        import selftest
+        sys.exit(selftest.main(sys.modules[__name__], sys.argv[sys.argv.index('--selftest') + 1:]))
     # Packaged windowed builds (PyInstaller --windowed) have no console and
     # sys.stdout is None, so print() would raise — route output to a log file.
     if FROZEN and sys.stdout is None:
