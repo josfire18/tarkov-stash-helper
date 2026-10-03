@@ -200,6 +200,8 @@
   </div>
 </header>
 
+<div id="progress-bar" style="padding:6px 14px;font-size:12px;color:#9a9;background:#141814;border-bottom:1px solid #222;display:none"></div>
+
 <div class="main">
   <!-- Left: aggregate items needed -->
   <div class="panel panel-left">
@@ -230,10 +232,10 @@
       <span class="panel-title">Tasks &amp; Hideout</span>
       <input type="text" id="task-search" placeholder="Filter tasks/stations…">
       <label style="font-size:11px;color:#666;display:flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap">
-        <input type="checkbox" id="kappa-only" style="flex:none;width:auto" checked> &kappa;-required only
+        <input type="checkbox" id="kappa-only" style="flex:none;width:auto"> &kappa;-required only
       </label>
       <label style="font-size:11px;color:#666;display:flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap">
-        <input type="checkbox" id="hide-completed-tasks" style="flex:none;width:auto"> hide done
+        <input type="checkbox" id="hide-completed-tasks" style="flex:none;width:auto" checked> hide done
       </label>
     </div>
     <div class="panel-scroll" id="tasks-scroll">
@@ -249,8 +251,8 @@ let view = null;          // /api/tasks response
 let filterText = '';
 let taskFilter = '';
 let hideDone = true;
-let hideCompletedTasks = false;
-let kappaOnly = true;             // mirrors settings.kappa_only_tasks
+let hideCompletedTasks = true;
+let kappaOnly = false;            // mirrors settings.kappa_only_tasks
 let prestigeData = null;          // /api/prestige response
 const expanded = new Set();       // item_ids with the sources list open
 const collapsedSections = new Set();
@@ -289,11 +291,37 @@ async function loadView() {
     const age = Math.round(res.cache_age_minutes);
     document.getElementById('cache-age').textContent =
       age < 60 ? `data ${age}m old` : `data ${Math.round(age / 60)}h old`;
+    renderProgressBar();
     renderAggregate();
     renderTasks();
   } catch(e) {
     document.getElementById('agg-scroll').innerHTML =
       `<div class="empty-note">Could not load task data: ${e.message}</div>`;
+  }
+}
+
+function renderProgressBar() {
+  const el = document.getElementById('progress-bar');
+  const tp = view && view.task_progress;
+  if (!tp) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  const modeName = {season: 'Seasonal PvP', pvp: 'PvP', pve: 'PvE'};
+  if (!tp.enabled) {
+    el.style.color = '#998';
+    el.textContent = 'Automatic task progress is off (Settings) — tick tasks by hand.';
+  } else if (tp.log) {
+    const l = tp.log;
+    const ago = l.last_event_at ? Math.max(0, Math.round((Date.now() / 1000 - l.last_event_at) / 60)) : null;
+    const agoTxt = ago === null ? '' : ago < 60 ? `, last quest event ${ago} min ago`
+      : ago < 2880 ? `, last quest event ${Math.round(ago / 60)} h ago` : `, last quest event ${Math.round(ago / 1440)} d ago`;
+    el.style.color = '#9a9';
+    el.textContent = `✓ Task progress read from your game logs (${modeName[l.mode] || l.mode} profile`
+      + `${l.faction ? ', ' + l.faction : ''}): ${l.completed} completed, ${l.active} active, ${l.failed} failed${agoTxt}. `
+      + `Updates by itself while you play. Click a task's box to override.`;
+  } else {
+    el.style.color = '#c96';
+    el.textContent = 'Could not read task progress from the game logs' + (tp.error ? ': ' + tp.error : '')
+      + ' — tick tasks by hand or set the game folder in Settings.';
   }
 }
 
@@ -398,6 +426,7 @@ function renderTasks() {
 
   // --- Tasks grouped by trader ---
   const byTrader = {};
+  const autoDone = new Set(view.auto_done || []);
   let tDone = 0;
   for (const t of view.tasks) {
     if (t.completed) tDone++;
@@ -425,7 +454,7 @@ function renderTasks() {
       const info = document.createElement('div');
       info.className = 'task-info';
       info.innerHTML = `
-        <div class="task-name">${t.name}</div>
+        <div class="task-name">${t.name}${autoDone.has(t.id) ? ' <span style="font-size:10px;color:#7a7;text-decoration:none" title="Completed according to your game logs">auto</span>' : ''}</div>
         <div class="task-items">${t.items.map(i => `${i.count}× ${i.name}${i.fir ? ' (FIR)' : ''}`).join(' · ')}</div>`;
       row.append(check, info);
       if (t.kappaRequired) {
@@ -607,13 +636,14 @@ document.getElementById('btn-refresh').addEventListener('click', async () => {
 async function init() {
   try {
     const settings = await api('GET', '/api/settings');
-    kappaOnly = settings.kappa_only_tasks ?? true;
+    kappaOnly = settings.kappa_only_tasks ?? false;
     document.getElementById('kappa-only').checked = kappaOnly;
   } catch (_) {}
   await loadView();
   loadPrestige();
 }
 init();
+setInterval(loadView, 60000);   // quest progress from the logs changes while you play
 </script>
 </body>
 </html>

@@ -770,7 +770,14 @@ def default_settings():
     return {
         'region': None, 'monitor': 0, 'hotkey': DEFAULT_HOTKEY, 'prestige': 3,
         'scan_countdown': 3,   # seconds before the manual Scan button captures (0 = instant)
-        'kappa_only_tasks': True,  # only kappaRequired tasks count toward task aggregate/KEEP totals
+        # Only kappaRequired tasks count toward the KEEP totals.  Off by default: since 1.0
+        # tarkov.dev marks only the Collector's own prerequisite chain (~13 quests) Kappa-required,
+        # so "on" would sell the items of almost every open quest.
+        'kappa_only_tasks': False,
+        'auto_task_progress': True,  # read completed/failed quests from EFT's logs (eftlogs.py)
+        'eft_install_dir': None,     # None = find the install via the registry / common paths
+        'game_mode': 'auto',         # 'auto' (profile of the latest session) | 'pvp' | 'pve' | 'season'
+        'faction': 'auto',           # 'auto' (from faction-only quests in the logs) | 'BEAR' | 'USEC'
         'debug_dumps': True,  # save raw frame + detections of the last few scans under data/debug/
         # Sell advice (see sellcalc.SELL_DEFAULTS for what each means; all are optional in settings.json)
         'flea_requires_fir': None,  # None = follow tarkov.dev's flea rule (live: FiR only); set false when Battlestate lifts it for an event
@@ -1154,6 +1161,92 @@ def default_progress():
     return {'completed_tasks': [], 'completed_hideout': [], 'have': {}}
 
 
+# ---------------------------------------------------------------------------
+# Automatic task progress from EFT's own logs (eftlogs.py)
+# ---------------------------------------------------------------------------
+
+import eftlogs  # noqa: E402
+
+EFTLOGS_CACHE_PATH = os.path.join(DATA, 'eftlogs_cache.json')
+_log_scanner = eftlogs.LogScanner(EFTLOGS_CACHE_PATH)
+_log_progress = {'key': None, 'result': None, 'error': None, 'scanned': False}
+_log_progress_lock = threading.Lock()
+
+
+def scan_task_logs(full=False):
+    """Bring the log records up to date (full: re-check every folder; otherwise only new folders
+    and the live one).  Never raises; the error is kept for the status endpoint."""
+    settings = load_json(SETTINGS_PATH, default_settings)
+    if not settings.get('auto_task_progress', True):
+        return None
+    try:
+        inst = eftlogs.find_install_dir(settings.get('eft_install_dir') or None)
+        if not inst:
+            raise FileNotFoundError('Escape from Tarkov install (with a Logs folder) not found')
+        res = _log_scanner.scan(inst, full=full or not _log_progress['scanned'])
+        _log_progress['scanned'] = True
+        _log_progress['error'] = None
+        return res
+    except Exception as e:
+        _log_progress['error'] = str(e)
+        print(f'[eftlogs] scan failed: {e}')
+        return None
+
+
+def log_task_progress(cache=None):
+    """The quest progress read from the logs for the configured mode/faction, or None when the
+    feature is off or nothing could be read.  Cached until the logs or the task data change."""
+    settings = load_json(SETTINGS_PATH, default_settings)
+    if not settings.get('auto_task_progress', True):
+        return None
+    if not _log_progress['scanned']:
+        scan_task_logs(full=True)
+    if cache is None:
+        cache = get_tasks(allow_fetch=False)
+    tasks = (cache or {}).get('tasks') or None
+    key = (_log_scanner.last_scan_at, (cache or {}).get('timestamp'),
+           settings.get('game_mode', 'auto'), settings.get('faction', 'auto'))
+    with _log_progress_lock:
+        if _log_progress['key'] == key and _log_progress['result'] is not None:
+            return _log_progress['result']
+        try:
+            res = _log_scanner.progress(settings.get('game_mode', 'auto'), tasks,
+                                        settings.get('faction', 'auto'))
+        except Exception as e:
+            _log_progress['error'] = str(e)
+            return None
+        if not res.get('folders'):
+            return None
+        _log_progress.update(key=key, result=res)
+        return res
+
+
+def effective_progress(cache=None):
+    """progress.json with the quest completion the logs prove merged in: completed, failed (a
+    failed quest needs nothing any more) and the other faction's quests count as done.  The
+    player's clicks on the Tasks page win: ``manual_overrides[task] = 'done'|'open'``.
+    Adds ``auto_done`` (ids done because of the logs) and ``log_status``."""
+    progress = load_json(PROGRESS_PATH, default_progress)
+    manual = set(progress.get('completed_tasks', []))
+    overrides = progress.get('manual_overrides') or {}
+    lp = log_task_progress(cache)
+    auto = set()
+    if lp:
+        auto = set(lp['completed']) | set(lp['failed']) | set(lp.get('other_faction') or ())
+    forced_open = {t for t, v in overrides.items() if v == 'open'}
+    forced_done = {t for t, v in overrides.items() if v == 'done'}
+    done = ((manual | auto) - forced_open) | forced_done
+    out = dict(progress)
+    out['completed_tasks'] = sorted(done)
+    out['auto_done'] = sorted((auto & done) - forced_done)
+    out['log_status'] = None if not lp else {
+        'mode': lp['mode'], 'completed': len(lp['completed']), 'failed': len(lp['failed']),
+        'active': len(lp['active']), 'faction': lp.get('faction'),
+        'last_event_at': lp['last_event_at'], 'reset_at': lp['reset_at'],
+        'reset_kind': lp['reset_kind'], 'folders': lp.get('folders')}
+    return out
+
+
 def _graphql_tasks():
     """Task + hideout item requirements from tarkov.dev's GraphQL API (the fallback source) as
     a cache dict.  Not written anywhere; raises RuntimeError."""
@@ -1436,9 +1529,9 @@ def get_protected_plan(keep_list, price_idx):
                      'tasks': [] if ignore_tasks else cache.get('tasks', []),
                      'hideoutStations': [] if ignore_hideout else cache.get('hideoutStations', [])}
         if cache:
-            progress = load_json(PROGRESS_PATH, default_progress)
+            progress = effective_progress(cache)
             view = compute_tasks_view(cache, progress,
-                                      kappa_only=settings.get('kappa_only_tasks', True),
+                                      kappa_only=settings.get('kappa_only_tasks', False),
                                       kinds=('giveItem', 'plantItem'), split_any_of=True)
             spare = {rec['item_id']: max(0, rec['have'] - rec['total_needed'])
                      for rec in view['aggregate']}
@@ -2058,15 +2151,17 @@ def api_tasks():
         cache = get_tasks()
     except Exception as e:
         return jsonify({'error': str(e)}), 502
-    progress = load_json(PROGRESS_PATH, default_progress)
+    progress = effective_progress(cache)
     settings = load_json(SETTINGS_PATH, default_settings)
-    kappa_only = settings.get('kappa_only_tasks', True)
+    kappa_only = settings.get('kappa_only_tasks', False)
     qp = request.args.get('kappa_only')
     if qp is not None:
         kappa_only = qp not in ('0', 'false', 'False')
     view = compute_tasks_view(cache, progress, kappa_only=kappa_only)
     view['cache_age_minutes'] = round(_cache_age_seconds(cache, 'tasks') / 60, 1)   # since last confirmed current
     view['source'] = cache.get('source') or 'graphql'
+    view['task_progress'] = _task_progress_status(progress)
+    view['auto_done'] = progress.get('auto_done') or []
     return jsonify(view)
 
 @app.route('/api/tasks/refresh', methods=['POST'])
@@ -2089,8 +2184,31 @@ def api_tasks_complete():
     ids = set(progress.get(key, []))
     (ids.add if done else ids.discard)(tid)
     progress[key] = sorted(ids)
+    if typ == 'task':
+        # An explicit click beats what the logs say, both ways (see effective_progress).
+        progress.setdefault('manual_overrides', {})[tid] = 'done' if done else 'open'
     save_json(PROGRESS_PATH, progress)
     return jsonify({'ok': True})
+
+
+def _task_progress_status(progress=None):
+    settings = load_json(SETTINGS_PATH, default_settings)
+    progress = progress or effective_progress()
+    return {'enabled': bool(settings.get('auto_task_progress', True)),
+            'log': progress.get('log_status'), 'error': _log_progress['error'],
+            'auto_done': len(progress.get('auto_done') or ()),
+            'install_dir': _log_scanner.install_dir, 'scanned_at': _log_scanner.last_scan_at}
+
+
+@app.route('/api/task-progress/status', methods=['GET'])
+def api_task_progress_status():
+    return jsonify(_task_progress_status())
+
+
+@app.route('/api/task-progress/rescan', methods=['POST'])
+def api_task_progress_rescan():
+    res = scan_task_logs(full=True)
+    return jsonify({'ok': res is not None, 'scan': res, **_task_progress_status()})
 
 @app.route('/api/tasks/have', methods=['POST'])
 def api_tasks_have():
@@ -2450,6 +2568,25 @@ def run_server():
     serve(app, host=HOST, port=PORT, _quiet=True)
 
 
+def migrate_settings(path=None):
+    """One-time fixes to settings saved by older versions.  Returns the list of migrations run."""
+    path = path or SETTINGS_PATH
+    if not os.path.exists(path):
+        return []
+    s = load_json(path, default_settings)
+    done = set(s.get('migrations') or ())
+    ran = []
+    if 'kappa_scope_all_tasks' not in done:
+        # kappa_only_tasks used to default to on, when ~200 quests were Kappa-required; since 1.0
+        # only the Collector's ~13-quest chain is, so "on" sold nearly every open quest's items.
+        s['kappa_only_tasks'] = False
+        ran.append('kappa_scope_all_tasks')
+    if ran:
+        s['migrations'] = sorted(done | set(ran))
+        save_json(path, s)
+    return ran
+
+
 def _startup_maintenance():
     """One-shot background housekeeping: purge retired CNN model files from
     user machines and freshen the kappa list from the wiki when stale."""
@@ -2461,6 +2598,11 @@ def _startup_maintenance():
                 print(f"[cleanup] removed retired file {fn}")
             except Exception as e:
                 print(f"[cleanup] could not remove {fn}: {e}")
+    migrate_settings()
+    try:
+        scan_task_logs(full=True)            # quest progress from the game logs, before the first scan
+    except Exception as e:
+        print(f"[eftlogs] startup scan skipped: {e}")
     try:
         cache = load_json(KAPPA_WIKI_PATH, lambda: None) if os.path.exists(KAPPA_WIKI_PATH) else None
         if not cache or time.time() - cache.get('timestamp', 0) > KAPPA_WIKI_TTL:
@@ -2518,6 +2660,11 @@ def refresh_cycle(now=None):
                 ran.append(kind)
         except Exception as e:
             print(f'[refresh] {kind}: {e}')
+    try:
+        if scan_task_logs():
+            ran.append('task_logs')
+    except Exception as e:
+        print(f'[refresh] task logs: {e}')
     try:
         if _load_meta()['catalog_pending'] and not _index_build_state['running']:
             _queue_catalog_update()

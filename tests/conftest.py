@@ -23,3 +23,10 @@ def _no_network_no_real_data(monkeypatch, tmp_path):
         for name, fn in (('META_PATH', 'tarkovdev_meta.json'), ('PRICES_PATH', 'prices_cache.json'),
                          ('TASKS_CACHE_PATH', 'tasks_cache.json')):
             monkeypatch.setattr(app, name, str(tmp_path / 'autouse_data' / fn), raising=False)
+        # Never read the real game's Logs folder or write data/eftlogs_cache.json.
+        if hasattr(app, '_log_scanner'):
+            import eftlogs
+            monkeypatch.setattr(app, '_log_scanner', eftlogs.LogScanner(None))
+            monkeypatch.setattr(app, '_log_progress',
+                                {'key': None, 'result': None, 'error': None, 'scanned': False})
+            monkeypatch.setattr(eftlogs, 'find_install_dir', lambda override=None: None)
