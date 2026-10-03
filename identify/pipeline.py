@@ -29,6 +29,7 @@ fitted on the labelled stash (``CALIB``); anything below ``uncertain_below`` is 
 from __future__ import annotations
 
 import math
+import re
 import threading
 import time
 import dataclasses
@@ -75,6 +76,7 @@ TWIN_GAP_OK = 2.0          # fused-score lead that settles same-label twins by p
 TWIN_GAP_OK_RES = 6.0      # ...when the picture score is the residual alone (no DINO: colour variants differ by little)
 LABEL_VERIFIED_CONF = 0.97  # exact, unambiguous label read of an item that fits the footprint
 WEAPON_SURE_CONF = 0.95    # certainly a gun (guns are skipped, the exact gun does not matter)
+_CAL_TOKEN = re.compile(r'\d+[.,]?\d*x\d{2}|\d{1,2}ga|[.,]\d{3}', re.I)
 # logistic calibration of the reported confidence: p = sigmoid(b + sum(w * feature)); fitted by
 # `python -m identify.calibrate` on degraded variants of the labelled stash (see that module)
 CALIB = {'b': 1.753, 'margin': 0.372, 'res': -0.311, 'ocr': 3.225, 'dino': 0.947}
@@ -783,14 +785,20 @@ class Engine:
         # A build template (anonymous cache render of a modded item) or a poor visual match
         # only says what the footprint looks like: the identity comes from the printed label.
         auth = None
+        calibre_gun = False
         edge = _at_viewport_edge(it, panel, tile)
+
+        cal_read = {'txt': ''}
 
         def gun_probe() -> bool:
             # guns print their calibre bottom-left ("20ga", "5.45x39"); parts never do
             if it.clipped_bottom or not self._use_ocr():
                 return False
             st = ocr_mod.bottom_strip(img_bgr, it.rect, panel.pitch_x, panel.pitch_y, left=True)
-            return st is not None and ocr_mod.looks_like_caliber(ocr_mod.read_strips([st])[0])
+            if st is None:
+                return False
+            cal_read['txt'] = ocr_mod.read_strips([st])[0]
+            return ocr_mod.looks_like_caliber(cal_read['txt'])
         if cat.src[c.row] == 'build' or (str(cat.cats[c.row]) == 'weapon' and c.score > 3.0) \
                 or best_res > 9.0:
             auth = self._label_authority(w.get('ocr_all') or [], tile,
@@ -823,7 +831,9 @@ class Engine:
             if close and gun_probe():
                 auth = self._label_authority(w.get('ocr_all') or [], tile, prefer_weapon=True,
                                              res_by_row=_best_res_by_id(cat, cands), at_edge=edge,
-                                             twin_rank=self._twin_ranker(w))
+                                             twin_rank=self._twin_ranker(w), only_weapons=True)
+                if auth is not None and self._calibre_names_gun(cal_read['txt'], auth[0], w, tile, edge):
+                    calibre_gun = True
         item_id = str(cat.ids[c.row])
         name = str(cat.names[c.row])
         evidence = {'residual': round(c.score, 3), 'stage1_best': round(best_res, 3),
@@ -927,7 +937,19 @@ class Engine:
             # guns are skipped by the sell list: being sure it IS a gun is all that matters
             conf = max(conf, WEAPON_SURE_CONF)
             evidence['verified'] = 'weapon'
-        if is_tie(tie_gap):
+        if auth is None and not calibre_gun and item_id and text and (o or 0) >= 100.0                 and self._unresolved_label_twins(w, tile, edge, item_id, have_dino):
+            # the exact label is printed by several items that fit this footprint ("MP5": a
+            # receiver, a magazine, a gun) and the picture did not separate them clearly
+            conf = min(conf, TIE_CONF_CAP)
+            evidence['note'] = 'printed label is shared by several items; picture does not separate them'
+            evidence['label_twins'] = True
+        if calibre_gun:
+            # the printed calibre ("20g") is the chosen gun's own and no same-label part's name
+            # carries it: that is the gun (the sell list skips guns, so no more is needed)
+            conf = max(conf, WEAPON_SURE_CONF)
+            evidence['verified'] = 'weapon+calibre'
+            evidence.pop('note', None)
+        elif is_tie(tie_gap):
             conf = min(conf, TIE_CONF_CAP)
             evidence['note'] = 'indistinguishable look-alike (same picture, same label read)'
         # absolute plausibility: a large residual is only acceptable when the printed name
@@ -981,6 +1003,69 @@ class Engine:
                         break
             self._fold_of = {int(r): ocr_mod.fold_glyph(str(c.shorts[r])) for r in self._api}
         return self._api
+
+    def _unresolved_label_twins(self, w, tile: Tile, edge: bool, item_id: str, have_dino: bool) -> bool:
+        """True when the item the picture chose shares its exactly-read label with another
+        differently named item that fits the footprint unturned while the chosen one only fits
+        turned, and the picture's lead over that item is below the twin gap (:data:`TWIN_GAP_OK`, :data:`TWIN_GAP_OK_RES` without DINO).  Guns
+        among themselves do not count: the sell list skips them."""
+        self._api_rows()
+        cat = self.cat
+        me = self._id_row.get(item_id)
+        if me is None:
+            return False
+        rows = {me}
+        for t_ in (w.get('ocr_all') or []):
+            for i, s_ in self._label_hits(t_, tile.W).items():
+                r = self._id_row.get(i)
+                if r is not None and s_ >= 100.0 and self._footprint_ok(r, tile, edge):
+                    rows.add(r)
+        names = {str(cat.names[r]) for r in rows}
+        if len(names) < 2:
+            return False
+        if all(str(cat.cats[r]) == 'weapon' for r in rows):
+            return False
+        rk = self._twin_ranker(w)(sorted(rows))
+        if me not in rk:
+            return False
+        # the picture chose the item only by turning it, while a same-label item fits the tile
+        # unturned: that is the case to doubt (an MP5 receiver, 2x1, drawn as a turned 1x2
+        # magazine).  Same-orientation twins (colour variants, ammo of one box size) are settled
+        # by the twin rules instead.
+        def native(r):
+            return (int(cat.tw[r]), int(cat.th[r])) == (tile.W, tile.H)
+        if native(me) or tile.W == tile.H:
+            return False
+        rivals = [v for r, v in rk.items() if r != me and str(cat.names[r]) != str(cat.names[me])
+                  and native(r)]
+        if not rivals:
+            return False
+        return rk[me] - max(rivals) < TWIN_GAP_OK
+
+    def _calibre_names_gun(self, read: str, gun_row: int, w, tile: Tile, edge: bool) -> bool:
+        """The calibre printed bottom-left is the gun's own calibre, and no non-weapon item that
+        shares the label (a stock, a receiver) names that calibre too - so art that merely looks
+        like text ("9x19PARA" on an MP5 upper receiver) cannot pass for the gun's calibre."""
+        m = ocr_mod._CALIBER.match(read or '')
+        if not m:
+            return False
+        got = re.sub(r'[\s,]', '', m.group(1).lower().replace(chr(0xd7), 'x'))
+        cat = self.cat
+
+        def toks(name: str) -> set:
+            return {t_.replace(',', '.').lower() for t_ in _CAL_TOKEN.findall(name)}
+
+        def has(name: str) -> bool:
+            return any(t_.startswith(got) or got.startswith(t_) for t_ in toks(name))
+        if not has(str(cat.names[gun_row])):
+            return False
+        top = 0.0
+        for t_ in (w.get('ocr_all') or []):
+            for i, s_ in self._label_hits(t_, tile.W).items():
+                r = self._id_row.get(i)
+                if r is not None and str(cat.cats[r]) != 'weapon' and s_ >= OCR_AUTH - 5                         and self._footprint_ok(r, tile, edge) and has(str(cat.names[r])):
+                    return False
+        return True
 
     def _weapon_like(self, row: int) -> bool:
         c = self.cat
@@ -1052,7 +1137,7 @@ class Engine:
         return rank
 
     def _label_authority(self, texts: list, tile: Tile, prefer_weapon: bool, res_by_row: dict | None = None,
-                         at_edge: bool = False, twin_rank=None, is_gun=None):
+                         at_edge: bool = False, twin_rank=None, is_gun=None, only_weapons: bool = False):
         """Identity from the printed short name over *all* base items whose footprint can be
         this tile (:meth:`_footprint_ok`).  All OCR variants of the label are pooled: needs a
         confident read (>= ``OCR_AUTH``) and no *different* name within 5 points, except names
@@ -1075,6 +1160,10 @@ class Engine:
         if at_edge and not any(s_ >= 100.0 for s_, _ in sc):
             # the viewport may cut an item: an exact read of a bigger item is possible there
             sc += [(s_, r) for r, s_ in allsc.items() if s_ >= 100.0 and (s_, r) not in sc]
+        if only_weapons:
+            # the bottom-left calibre already says "gun": parts that share the label (or merely
+            # resemble a truncated read of it) are not rivals
+            sc = [(s_, r) for s_, r in sc if str(cat.cats[r]) == 'weapon']
         if not sc:
             return None
         sc.sort(key=lambda t: -t[0])
