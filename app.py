@@ -3120,7 +3120,10 @@ def _run_app():
     import inspect
     import webview
     import pystray
-    from icon_asset import load_tray_image
+    from icon_asset import load_tray_image, set_app_id, ensure_ico, apply_window_icon
+
+    # own AppUserModelID before any window: the taskbar shows our icon, not python.exe's
+    print(f"[icon] AppUserModelID set: {set_app_id()}")
 
     # Single instance, the startup entry + watcher, and "close when Tarkov exits" (lifecycle.py).
     # None = a copy is already running; it was told to show its window and this one just leaves.
@@ -3155,6 +3158,15 @@ def _run_app():
 
     window.events.closing += on_closing
     window.events.loaded += lambda: lifecycle.allow_activation(window)
+    ico = ensure_ico(os.path.join(DATA, 'app.ico'))
+
+    def sharpen_icon(*_):        # taskbar / Alt-Tab get a full-size image, not WinForms' single 16 px one
+        try:
+            if ico:
+                apply_window_icon(int(window.native.Handle.ToInt64()), ico)
+        except Exception as e:
+            print(f"[icon] {e}")
+    window.events.shown += sharpen_icon
 
     def on_open(icon, item):
         _show_window()
@@ -3197,7 +3209,7 @@ def _run_app():
     _desktop['tray_thread'] = threading.Thread(target=tray_icon.run, args=(tray_setup,), daemon=True)
     _desktop['tray_thread'].start()
 
-    webview.start()  # blocks; owns the main thread
+    webview.start(icon=ico)  # blocks; owns the main thread
 
 
 if __name__ == '__main__':
