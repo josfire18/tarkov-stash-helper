@@ -37,7 +37,7 @@ import lifecycle    # open/close with the game (stdlib + ctypes only)
 from sellcalc import (best_trader_price, calc_flea_fee, price_420, flea_block_reason,  # noqa: F401
                       sell_recommendation, order_for_selling, TRADER_ORDER)
 
-APP_VERSION = '0.3.1'
+APP_VERSION = '0.4.0'
 
 FROZEN = getattr(sys, 'frozen', False)
 
