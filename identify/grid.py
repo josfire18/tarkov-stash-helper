@@ -75,6 +75,7 @@ class Panel:
     clip_top: bool = False
     clip_bottom: bool = False
     strength: float = 0.0
+    own: bool = False       # a cell group of the player's own gear (rig / pockets / backpack ...)
 
     # --- geometry helpers -------------------------------------------------
     def rect(self, col: int, row: int, w: int = 1, h: int = 1) -> tuple[int, int, int, int]:

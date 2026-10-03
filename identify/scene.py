@@ -601,8 +601,46 @@ def split_panels(grid_result: GridResult, scene: SceneInfo, frame_bgr: np.ndarra
                           clip_top=bool(ct), clip_bottom=bool(cb), strength=panel.strength)
                 reg = Region((p.x0, p.y0, p.x1 - p.x0, p.y1 - p.y0), role, side, title, conf)
                 out.append((p, reg))
+    if frame_bgr is not None:
+        out = _own_gear_pieces(out, grid_result, scene, frame_bgr)
     out.sort(key=lambda t: (t[0].y0, t[0].x0))
     return out
+
+
+def _own_gear_pieces(out: list, grid_result: GridResult, scene: SceneInfo, frame_bgr: np.ndarray) -> list:
+    """Replace / complete the pieces of the player's own gear regions with the cell groups of
+    :mod:`identify.owngrid` (rig slots with gaps, pockets, a faint-lined backpack): ``detect_grid``
+    needs one lattice in the stash border colour and misses them.  Own pieces ``detect_grid`` found
+    are dropped where an own-grid frame covers them; the stash path is untouched."""
+    from .owngrid import OWN_ROLES, region_panels
+    pitch = scene.pitch
+    mp = grid_result.pitch_x
+    if mp and 0.9 * pitch <= mp <= 1.1 * pitch:          # EFT draws every cell at the stash pitch
+        pitch = float(mp)
+    wins = [w.bbox for w in scene.windows]
+    mine = []
+    for reg in scene.regions:
+        if reg.role not in OWN_ROLES:
+            continue
+        for p in region_panels(frame_bgr, reg.bbox, pitch, wins):
+            if any(_overlap_frac(p, q) > 0.5 for q, _ in mine):
+                continue
+            p.own = True
+            mine.append((p, Region((p.x0, p.y0, p.x1 - p.x0, p.y1 - p.y0), reg.role, reg.side, reg.title, 0.85)))
+    keep = [(p, r) for p, r in out
+            if not (r.role in OWN_ROLES and any(_overlap_frac(p, q) > 0.3 for q, _ in mine))]
+    for p, r in keep:
+        if r.role in OWN_ROLES:
+            p.own = True
+    return keep + mine
+
+
+def _overlap_frac(a: Panel, b: Panel) -> float:
+    ix = min(a.x1, b.x1) - max(a.x0, b.x0)
+    iy = min(a.y1, b.y1) - max(a.y0, b.y0)
+    if ix <= 0 or iy <= 0:
+        return 0.0
+    return ix * iy / float(min((a.x1 - a.x0) * (a.y1 - a.y0), (b.x1 - b.x0) * (b.y1 - b.y0)))
 
 
 class _Shift:
