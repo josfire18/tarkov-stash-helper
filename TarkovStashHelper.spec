@@ -23,7 +23,7 @@ being read).  data/ is NOT bundled: it lives next to the exe (identify/config.py
 """
 import os
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 FLAVOUR = os.environ.get('TSH_FLAVOUR', 'lean').strip().lower()
 if FLAVOUR not in ('lean', 'dino'):
@@ -57,6 +57,13 @@ else:
 #                     winreg is its only non-obvious import (stdlib, startup registration)
 import importlib.util
 
+# UnityPy: one-time extraction of the game's label font (identify/fontlabel.py, Anchor 2). It reads
+# type trees from its bundled resources (.tpk) and imports its parsers by name.
+unity_datas = []
+if importlib.util.find_spec('UnityPy'):
+    hidden += collect_submodules('UnityPy')
+    unity_datas = collect_data_files('UnityPy')
+
 hidden += ['lifecycle', 'winreg']
 for mod in ('sellcalc',):
     if os.path.exists(os.path.join(SPECPATH, mod + '.py')):
@@ -71,7 +78,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('templates', 'templates'),
-           (os.path.join('identify', 'assets'), os.path.join('identify', 'assets'))],
+           (os.path.join('identify', 'assets'), os.path.join('identify', 'assets'))] + unity_datas,
     hiddenimports=hidden,
     hookspath=[],
     runtime_hooks=[],

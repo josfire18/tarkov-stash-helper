@@ -62,12 +62,28 @@ class LearnedNames:
             return 0
         with _lock:
             e = self.data.get(key)
+            if e and e.get('certain'):
+                return e['seen'] if e['id'] == item_id else 0      # certain bindings are final
             if e and e['id'] == item_id:
                 e['seen'] = e.get('seen', 1) + 1
             else:
                 e = self.data[key] = {'id': item_id, 'name': name, 'seen': 1, 'at': int(time.time())}
             self._save()
             return e['seen']
+
+    def bind_certain(self, key: str | None, item_id: str, name: str, confirmations: int = 2) -> None:
+        """Permanent binding from a *certain* identification (an exact game-font label match on a
+        tile that exactly matches this render): usable at once, and never overwritten by an
+        ordinary read."""
+        if not key or not item_id:
+            return
+        with _lock:
+            e = self.data.get(key)
+            if e and e.get('certain') and e['id'] != item_id:
+                return                               # two certain sources disagree: keep the first
+            self.data[key] = {'id': item_id, 'name': name, 'seen': max(confirmations, (e or {}).get('seen', 0)),
+                              'certain': True, 'at': int(time.time())}
+            self._save()
 
     def _save(self) -> None:
         tmp = self.path + '.tmp'

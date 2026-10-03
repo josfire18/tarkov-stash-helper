@@ -47,6 +47,10 @@ from .grid import GridResult, detect_grid
 from .match import Cand, Tile, normalize_tile, stage1
 from .match import enable_torch as match_enable_torch, disable_torch as match_disable_torch
 from .segment import segment_panel
+from . import anchors as anchors_mod
+from . import fontlabel as fontlabel_mod
+from . import tilecache
+from .catalog import default_cache_dir
 
 # fusion weights (tuned on data/eval/stash1.truth.full.json, see test_scan.py --score)
 W_RES = 1.0
@@ -59,6 +63,7 @@ LABEL_PARTIAL_CAP = 94.0   # best score a non-exact label match can get (exact =
 LABEL_RIVAL_GAP = 5.0      # a label this much better than the chosen item's gets a say
 LITERAL_RES = 5.0          # a stage-1 residual this low with LITERAL_DINO is a near pixel-exact match
 LITERAL_DINO = 0.85
+ANCHOR_SHORTLIST = 6       # icon-cache renders checked exactly per tile (Anchor 1)
 TIE_MARGIN = 0.1           # fused-score gap below which two differently named items are indistinguishable
 TIE_CONF_CAP = 0.5         # ...and the answer is a coin flip, so it may not be reported as certain
 LEARN_MAX_RES = 4.0        # stage-1 residual of a near-literal match to a cached icon
@@ -164,6 +169,192 @@ class Engine:
         self.learned = LearnedNames(self.s.extra.get('learned_path', LEARNED_PATH))
         self._row_key: dict = {}
         self._apply_learned()
+        self.tile_cache = tilecache.TileCache()
+        self.anchor_idx = None
+        self.labeler = None
+        self._fp_rows: dict = {}
+        self._vis_cache: dict = {}
+        self._phases: dict = {}
+        self._init_anchors()
+
+    # ------------------------------------------------------------------
+    def _init_anchors(self) -> None:
+        """Anchor 1 (icon-cache renders) and Anchor 2 (the game's label font).  Either may be
+        unavailable (no game cache / font): it is then simply off."""
+        ex = self.s.extra
+        if not ex.get('anchors', True):
+            return
+        canon = {k: str(self.cat.ids[v]) for k, v in self.preset_base.items()}
+        self._canon = canon
+        try:
+            cdir = ex.get('cache_dir') or default_cache_dir()
+            if cdir:
+                self.anchor_idx = anchors_mod.CacheIndex(cdir, self.cat.meta.get('cache_assoc') or {},
+                                                         _CertainBindings(self.learned), canon)
+        except Exception as e:                     # pragma: no cover - never fatal
+            print(f'[anchors] icon-cache index unavailable: {e}')
+        try:
+            self.labeler = fontlabel_mod.LabelRenderer.create(log=lambda *a: None)
+        except Exception as e:                     # pragma: no cover
+            print(f'[anchors] label font unavailable: {e}')
+
+    def reset_anchors(self) -> None:
+        """Forget certain bindings made in memory and the tile cache (eval: clean state)."""
+        self.tile_cache.clear()
+        if self.anchor_idx is not None:
+            self.anchor_idx.reset_bindings()
+
+    def _fp_candidates(self, W: int, H: int) -> list:
+        """api rows (no presets) whose item can occupy a W x H tile."""
+        k = (W, H)
+        if k not in self._fp_rows:
+            t = Tile(np.zeros((1, 1, 3), np.uint8), W, H)
+            self._fp_rows[k] = [int(r) for r in self._api_rows() if self._footprint_ok(int(r), t, False)]
+        return self._fp_rows[k]
+
+    def _visible(self, short: str, w: int, pitch: float) -> str:
+        k = (short, w, round(pitch, 2))
+        v = self._vis_cache.get(k)
+        if v is None:
+            v = self.labeler.visible_text(short, w, pitch)
+            if len(self._vis_cache) > 200000:
+                self._vis_cache.clear()
+            self._vis_cache[k] = v
+        return v
+
+    def _certify(self, img_bgr, w, det) -> None:
+        """Anchors 1 + 2 (docs/accuracy.md).  A tile is CERTAIN when its pixels exactly match a
+        game render of a known item, or its label exactly matches the game-font rendering of one
+        item's short name among every item that fits the footprint (and the two never disagree).
+        A label-certified tile binds its exact render to the item permanently."""
+        it, panel, tile = w['it'], w['panel'], w['tile']
+        ev = det.evidence
+        if it.clipped_top or it.clipped_bottom:
+            return
+        x, y, wpx, hpx = it.rect
+        if x < 0 or y < 0 or x + wpx > img_bgr.shape[1] or y + hpx > img_bgr.shape[0]:
+            return
+        W, H = int(it.w), int(it.h)
+        px, py = float(panel.pitch_x), float(panel.pitch_y)
+        crop = img_bgr[y:y + hpx, x:x + wpx]
+        a1 = None
+        if self.anchor_idx is not None and len(self.anchor_idx):
+            ph = self._phases.get(id(panel))
+            a1 = self.anchor_idx.match(crop, W, H, px, py, phase=ph, k=ANCHOR_SHORTLIST)
+            if a1 is not None and ph is None and a1.score <= anchors_mod.exact_threshold(py):
+                self._phases[id(panel)] = a1.phase
+        id1 = a1.item_id if (a1 is not None and a1.certain) else ''
+        exact1 = a1 is not None and a1.score <= anchors_mod.exact_threshold(py) and \
+            a1.n_px >= anchors_mod.MIN_PIXELS * px * py / (SLOT * SLOT)
+        if a1 is not None:
+            ev['anchor_render'] = {'score': round(a1.score, 2), 'runner': round(a1.runner, 2),
+                                   'id': a1.item_id, 'hint': a1.render.hint_id if a1.render else '',
+                                   'note': a1.note}
+        id2, twins = '', []
+        if self.labeler is not None:
+            st = fontlabel_mod.strip_of(img_bgr, it.rect, py)
+            if st is not None:
+                fits, id2, twins = self._label_anchor(st, w, det, a1, W, H, py)
+                if fits:
+                    ev['anchor_label'] = {'text': fits[0].text, 'total': round(fits[0].total, 2),
+                                          'runner': round(fits[1].total, 2) if len(fits) > 1 else None,
+                                          'runner_text': fits[1].text if len(fits) > 1 else None,
+                                          'certain': bool(id2), 'twins': len(twins)}
+        if id2 == '' and len(twins) > 1 and exact1 and a1.item_id in twins:
+            id2 = a1.item_id                       # label twins ("BP" ammo) settled by the exact render
+        if id1 and id2 and id1 != id2:
+            det.uncertain = True
+            det.confidence = min(det.confidence, 0.5)
+            ev['note'] = 'anchors disagree (exact render vs exact label)'
+            print(f'[anchors] contradiction at {it.rect}: render {id1} vs label {id2}')
+            return
+        cid = id2 or id1
+        if not cid and len(twins) > 1:
+            # the label was matched exactly, and the game prints that text for several items
+            # ("MP5": receiver / magazine / gun, "D3CRX": two colours) that no exact render
+            # separates: whatever the picture prefers is a guess between them
+            guns = {str(self.cat.cats[self._id_row[t_]]) == 'weapon' for t_ in twins if t_ in self._id_row}
+            if not (det.category == 'weapon' and guns == {True}):     # all guns: "a gun" is enough
+                det.uncertain = True
+                det.confidence = min(det.confidence, 0.5)
+                ev['note'] = f'printed label is shared by {len(twins)} items; picture alone decides'
+            return
+        if not cid:
+            if self.s.extra.get('strict_anchors'):
+                det.uncertain = True
+                det.confidence = min(det.confidence, 0.79)
+            return
+        if id2 and exact1 and not id1 and a1.render is not None:
+            self._bind(a1.render, id2)              # C: next time the render alone is certain
+        r = self._id_row.get(cid)
+        if r is None:
+            return
+        c = self.cat
+        if det.item_id != cid:
+            ev['pipeline_choice'] = det.name
+        det.item_id, det.name = cid, str(c.names[r])
+        det.category, det.short = str(c.cats[r]), str(c.shorts[r])
+        det.confidence = 0.995
+        det.uncertain = False
+        ev['certified'] = 'render+label' if (id1 and id2) else ('label' if id2 else 'render')
+
+    def _label_anchor(self, st, w, det, a1, W, H, pitch):
+        """Closed-set label match.  Returns ``(fits, certified item id or '', twin ids)``."""
+        from rapidfuzz import process as rf_process, distance as rf_distance
+        c = self.cat
+        rows = self._fp_candidates(W, H)
+        sw = st.shape[1]
+        by_vis: dict = {}
+        for r in rows:
+            s_ = str(c.shorts[r])
+            if s_:
+                by_vis.setdefault(self._visible(s_, sw, pitch), set()).add(str(c.ids[r]))
+        texts = []
+        seen_ids = set()
+        for c2 in w.get('pool') or []:
+            iid = self._canon.get(str(c.ids[c2.row]), str(c.ids[c2.row]))
+            if iid and iid not in seen_ids:
+                seen_ids.add(iid)
+            if len(seen_ids) >= 12:
+                break
+        for txt in w.get('ocr_all') or []:
+            seen_ids.update(i for i, sc in self._label_hits(txt, W).items() if sc >= 60)
+        for iid in (det.item_id, a1.item_id if a1 else '', a1.render.hint_id if (a1 and a1.render) else ''):
+            if iid:
+                seen_ids.add(iid)
+        for iid in seen_ids:
+            r = self._id_row.get(iid)
+            if r is not None and r in self._fp_set(W, H):
+                texts.append(str(c.shorts[r]))
+        # adversarial neighbours: the printed names closest to the leading guesses
+        keys = list(by_vis)
+        for q in [det.short] + list(w.get('ocr_all') or [])[:2]:
+            if q:
+                texts += [k for k, _, _ in rf_process.extract(q, keys, scorer=rf_distance.Levenshtein.distance,
+                                                              limit=6)]
+        texts = [t_ for t_ in dict.fromkeys(texts) if t_]
+        if not texts:
+            return [], '', []
+        fits = self.labeler.match(st, texts, pitch)
+        if not fontlabel_mod.certain(fits):
+            return fits, '', []
+        # the game prints the winner's text for every one of these items
+        twins = sorted(by_vis.get(fits[0].text, set()))
+        if len(twins) == 1:
+            return fits, twins[0], twins
+        return fits, '', twins
+
+    def _fp_set(self, W, H) -> set:
+        k = ('set', W, H)
+        if k not in self._fp_rows:
+            self._fp_rows[k] = set(self._fp_candidates(W, H))
+        return self._fp_rows[k]
+
+    def _bind(self, render, item_id: str) -> None:
+        r = self._id_row.get(item_id)
+        name = str(self.cat.names[r]) if r is not None else item_id
+        self.learned.bind_certain(render.key, item_id, name)
+        self.anchor_idx.bind(render.key, item_id)
 
     # ------------------------------------------------------------------
     def _icon_key(self, row: int) -> str | None:
@@ -263,13 +454,21 @@ class Engine:
         # exactly (the numpy path prunes with a coarse pass), and OCR needs no stage-1 result.
         t = time.perf_counter()
         work = []
+        cached = []
         for it, panel in items:
             if it.empty:
+                continue
+            key = tilecache.tile_key(img_bgr, it.rect, panel.pitch_x, panel.pitch_y,
+                                     f'{it.w}x{it.h}|{int(it.clipped_top)}{int(it.clipped_bottom)}')
+            hit = self.tile_cache.get(key)
+            if hit is not None:
+                cached.append(_from_cache(hit, it))
                 continue
             tile = normalize_tile(img_bgr, it.rect, it.w, panel.pitch_x, panel.pitch_y,
                                   it.clipped_top, it.clipped_bottom)
             if tile is not None:
-                work.append({'it': it, 'panel': panel, 'tile': tile, 'ocr_all': []})
+                work.append({'it': it, 'panel': panel, 'tile': tile, 'ocr_all': [], 'key': key})
+        T['cache_hits'] = len(cached)
         if self._use_ocr():
             flat, owner = [], []
             for i, w in enumerate(work):
@@ -310,13 +509,23 @@ class Engine:
 
         # ---- fusion + FIR ------------------------------------------------------------
         t = time.perf_counter()
-        dets = []
+        dets = list(cached)
         for w in work:
             d = self._decide(img_bgr, w)
             if d is not None:
                 dets.append(d)
-        dets.sort(key=lambda d: (d.panel, d.row, d.col))
+                w['det'] = d
         T['fuse'] = time.perf_counter() - t
+
+        # ---- anchors: exact game render / exact game-font label --------------------------
+        self._phases = {}
+        t = time.perf_counter()
+        for w in work:
+            if w.get('det') is not None:
+                self._certify(img_bgr, w, w['det'])
+                self.tile_cache.put(w['key'], _to_cache(w['det']))
+        T['anchors'] = time.perf_counter() - t
+        dets.sort(key=lambda d: (d.panel, d.row, d.col))
         T['total'] = time.perf_counter() - t0
         if self.store is not None:
             self.store.save()
@@ -864,6 +1073,35 @@ class Engine:
             # the calibre read only breaks the tie: art can look like text, so never "verified"
             return finalists[0], float(top), max(2, n_before), None
         return finalists[0], float(top), len(finalists), gap
+
+
+class _CertainBindings:
+    """Read-only view of the learned store: only bindings made by a certain anchor."""
+
+    def __init__(self, learned: LearnedNames):
+        self.learned = learned
+
+    def get(self, key):
+        e = self.learned.data.get(key) if key else None
+        return e['id'] if e and e.get('certain') else None
+
+
+_CACHE_FIELDS = ('item_id', 'name', 'confidence', 'uncertain', 'evidence', 'count', 'fir', 'category',
+                 'short', 'rotated', 'w', 'h')
+
+
+def _to_cache(d: 'Detection') -> dict:
+    return {k: getattr(d, k) for k in _CACHE_FIELDS}
+
+
+def _from_cache(c: dict, it) -> 'Detection':
+    x, y, wpx, hpx = it.rect
+    ev = dict(c['evidence'])
+    ev['cached'] = True
+    return Detection(panel=it.panel, col=it.col, row=it.row, w=c['w'], h=c['h'], rotated=c['rotated'],
+                     item_id=c['item_id'], name=c['name'], confidence=c['confidence'], uncertain=c['uncertain'],
+                     evidence=ev, count=c['count'], fir=c['fir'], rect=(x, y, wpx, hpx),
+                     clipped=bool(it.clipped_top or it.clipped_bottom), category=c['category'], short=c['short'])
 
 
 def _at_viewport_edge(it, panel, tile) -> bool:

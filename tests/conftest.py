@@ -30,3 +30,13 @@ def _no_network_no_real_data(monkeypatch, tmp_path):
             monkeypatch.setattr(app, '_log_progress',
                                 {'key': None, 'result': None, 'error': None, 'scanned': False})
             monkeypatch.setattr(eftlogs, 'find_install_dir', lambda override=None: None)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_anchors(monkeypatch):
+    """Engines built in unit tests never read the real EFT icon cache or the game's font (the
+    anchor tests build their own synthetic ones)."""
+    import identify.pipeline as pl
+    import identify.fontlabel as fl
+    monkeypatch.setattr(pl, 'default_cache_dir', lambda: None)
+    monkeypatch.setattr(fl, 'ensure_font', lambda *a, **k: None)
