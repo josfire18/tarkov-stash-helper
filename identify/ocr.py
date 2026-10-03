@@ -294,21 +294,10 @@ def read_strips(strips: list, workers: int = 4, whitelist: str | None = None,
 _CALIBER = re.compile(r'\s*((\d{1,2}\s*g)|(\d+[.,]?\d*\s*[xX×]\s*\d{2})|([.,]\d{2,3}\b))', re.I)
 
 
-_CAL_FOLD = str.maketrans({'S': '9', 's': '5', 'i': '1', 'l': '1', 'I': '1', '|': '1', 'O': '0',
-                           'o': '0', 'X': 'x', 'B': '8', 'Z': '2'})
-
-
 def looks_like_caliber(text: str) -> bool:
-    """True for a weapon's bottom-left calibre text ("20ga", "12g", "5.45x39", "9x19PARA", ".366").
-    The label of a narrow gun is cut ("20g").  Glyphs the font draws alike are folded to digits
-    in the leading 5 characters only ("Sx1SPARA" is 9x19PARA; "MP5" stays text)."""
-    if not text:
-        return False
-    t = text.strip()
-    if _CALIBER.match(t):
-        return True
-    head = t[:5].translate(_CAL_FOLD)
-    return bool(re.match(r'(\d{1,2}\s*g)|(\d+[.,]?\d*\s*x\s*\d{1,2})', head))
+    """True for a weapon's bottom-left calibre text ("20ga", "12g", "5.45x39", "9x19", ".366").
+    The label of a narrow gun is cut ("20g")."""
+    return bool(text) and bool(_CALIBER.match(text))
 
 
 def parse_count(text: str) -> int | None:

@@ -274,6 +274,7 @@ def build_catalog(prices_path: str = PRICES_PATH, tmpl_dir: str = TMPL_SRC_DIR,
 
     # ---- EFT icon cache: re-associate every build ---------------------------
     n_cache = n_build = n_amb = 0
+    assoc: dict[str, list] = {}        # cache file name -> [item id, best dist, runner-up dist]
     cdir = cache_dir if cache_dir is not None else default_cache_dir()
     if with_cache and cdir:
         by_size: dict[tuple[int, int], list[int]] = {}
@@ -307,6 +308,9 @@ def build_catalog(prices_path: str = PRICES_PATH, tmpl_dir: str = TMPL_SRC_DIR,
             # tarkov.dev icon to within a few levels (measured 2-5 on stash1); it is a
             # *clear* match when it beats the best different item by 1.4x.
             clear = best_r is not None and best_d <= ASSOC_MAX and second_d >= ASSOC_RATIO * best_d
+            if best_r is not None:
+                assoc[os.path.basename(fpath)] = [rows[best_r]['id'] if clear else '',
+                                                  round(best_d, 3), round(min(second_d, 999.0), 3)]
             if clear:
                 if best_d > 0.6:               # genuinely different render => worth keeping
                     r = len(rows)
@@ -344,7 +348,7 @@ def build_catalog(prices_path: str = PRICES_PATH, tmpl_dir: str = TMPL_SRC_DIR,
         tw=np.array([r['W'] for r in rows], np.int16), th=np.array([r['H'] for r in rows], np.int16),
         stacks=stacks,
         meta={'paths': paths, 'built': time.time(), 'n_api': n_api, 'n_cache': n_cache,
-              'n_build': n_build, 'n_ambiguous_cache': n_amb, 'n_missing_src': n_missing})
+              'n_build': n_build, 'n_ambiguous_cache': n_amb, 'cache_assoc': assoc, 'n_missing_src': n_missing})
     log(f'[catalog] {n_api} api + {n_cache} cache + {n_build} build templates '
         f'({n_missing} items without image, {n_amb} ambiguous cache icons) in {time.time() - t0:.1f}s')
     return cat

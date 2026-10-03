@@ -40,65 +40,30 @@ TINT_BGR = {   # EFT rarity backgrounds (BGR), measured by diffing tarkov.dev gr
     'red': (29, 32, 49),
 }
 
-_state: dict = {'tried': False, 'ok': False, 'model': None, 'dev': None, 'err': '', 'backend': None}
-
-# int8 ONNX export of the same model (scripts/export_dino_onnx.py + dynamic quantisation): the
-# packaged exe has no torch, so stage 2 runs on onnxruntime (CPU) from this file instead.
-ONNX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'dino_v2s_int8.onnx')
-ONNX_SHA256 = 'c9b318a97ebd394bb6412a1f8658c29557a509227d1c23608018a5bec1150be2'
+_state: dict = {'tried': False, 'ok': False, 'model': None, 'dev': None, 'err': ''}
 
 
-def _load_torch(device):
-    import torch
-    from transformers import AutoModel
-    dev = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-    try:
-        model = AutoModel.from_pretrained(MODEL_ID, local_files_only=True)
-    except Exception:
-        model = AutoModel.from_pretrained(MODEL_ID)
-    model = model.to(dev).eval()
-    if dev == 'cuda':
-        model = model.half()
-    _state.update(ok=True, model=model, dev=dev, torch=torch, backend='torch')
-
-
-def _load_onnx():
-    import hashlib
-    import onnxruntime as ort
-    if not os.path.exists(ONNX_PATH):
-        raise FileNotFoundError(ONNX_PATH)
-    with open(ONNX_PATH, 'rb') as fh:
-        digest = hashlib.sha256(fh.read()).hexdigest()
-    if digest != ONNX_SHA256:
-        raise ValueError(f'{os.path.basename(ONNX_PATH)} checksum mismatch')
-    so = ort.SessionOptions()
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess = ort.InferenceSession(ONNX_PATH, so, providers=['CPUExecutionProvider'])
-    _state.update(ok=True, model=sess, dev='cpu', backend='onnx')
-
-
-def available(device: str | None = None, backend: str = 'auto') -> bool:
-    """Load the model once; ``False`` if no backend works.  ``backend``: 'torch' (torch +
-    transformers, GPU when present), 'onnx' (onnxruntime + the bundled int8 export) or 'auto'
-    (torch if importable, else onnx).  The first call decides for the whole process."""
+def available(device: str | None = None) -> bool:
+    """Try to load the model once; ``False`` if torch/transformers/weights are missing."""
     if _state['tried']:
         return _state['ok']
     _state['tried'] = True
-    errs = []
-    order = {'torch': ('torch',), 'onnx': ('onnx',)}.get(backend, ('torch', 'onnx'))
-    for b in order:
+    try:
+        import torch
+        from transformers import AutoModel
+        dev = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         try:
-            _load_torch(device) if b == 'torch' else _load_onnx()
-            return True
-        except Exception as e:                   # pragma: no cover - environment dependent
-            errs.append(f'{b}: {type(e).__name__}: {e}')
-    _state['err'] = '; '.join(errs)
-    _state['ok'] = False
-    return False
-
-
-def backend() -> str | None:
-    return _state['backend']
+            model = AutoModel.from_pretrained(MODEL_ID, local_files_only=True)
+        except Exception:
+            model = AutoModel.from_pretrained(MODEL_ID)
+        model = model.to(dev).eval()
+        if dev == 'cuda':
+            model = model.half()
+        _state.update(ok=True, model=model, dev=dev, torch=torch)
+    except Exception as e:                       # pragma: no cover - environment dependent
+        _state['err'] = f'{type(e).__name__}: {e}'
+        _state['ok'] = False
+    return _state['ok']
 
 
 def device() -> str | None:
@@ -125,18 +90,14 @@ def blank_bands(img_bgr: np.ndarray, bg, slot_px: float, clip: str = '') -> np.n
 
 def embed(imgs_bgr: list, batch: int = 64) -> np.ndarray:
     """L2-normalised [n, 768] float32 embeddings (CLS + mean patch token)."""
+    torch = _state['torch']
     model, dev = _state['model'], _state['dev']
     out = []
     for i in range(0, len(imgs_bgr), batch):
         x = np.stack([cv2.resize(cv2.cvtColor(b, cv2.COLOR_BGR2RGB), (RES, RES),
                                  interpolation=cv2.INTER_CUBIC) for b in imgs_bgr[i:i + batch]])
         x = (x.astype(np.float32) / 255.0 - _MEAN) / _STD
-        x = np.ascontiguousarray(x.transpose(0, 3, 1, 2))
-        if _state['backend'] == 'onnx':
-            out.append(model.run(None, {'pixel_values': x})[0].astype(np.float32))
-            continue
-        torch = _state['torch']
-        t = torch.from_numpy(x).to(dev)
+        t = torch.from_numpy(x).permute(0, 3, 1, 2).to(dev)
         if dev == 'cuda':
             t = t.half()
         with torch.no_grad():
@@ -159,14 +120,11 @@ def composite_icon(bgra: np.ndarray, bg, rotate: int = 0) -> np.ndarray:
 class EmbeddingStore:
     """Lazy, disk-cached embeddings of catalog icons (rotation 0, rarity tint bg)."""
 
-    def __init__(self, catalog, path: str | None = None):
+    def __init__(self, catalog, path: str = EMB_PATH):
         self.cat = catalog
-        # embeddings of the two backends differ slightly (int8 weights): never mix them
-        self.path = path or (EMB_PATH if _state['backend'] != 'onnx' else EMB_PATH[:-4] + '_onnx.npz')
+        self.path = path
         self.stamp = float(catalog.meta.get('built', 0.0))
         self.vecs: dict[int, np.ndarray] = {}
-        self.rvecs: dict[tuple, np.ndarray] = {}     # (row, rot) of rotated icons (persisted)
-        self.mem: dict[tuple, np.ndarray] = {}       # anything else (viewport-clipped crops), this run only
         self.dirty = False
         self._load()
 
@@ -177,24 +135,16 @@ class EmbeddingStore:
                 if abs(float(z['stamp']) - self.stamp) < 1e-3:
                     rows, vecs = z['rows'], z['vecs']
                     self.vecs = {int(r): v for r, v in zip(rows, vecs.astype(np.float32))}
-                    if 'rrows' in z.files:
-                        self.rvecs = {(int(r), int(o)): v for r, o, v in
-                                      zip(z['rrows'], z['rrots'], z['rvecs'].astype(np.float32))}
         except Exception:
-            self.vecs, self.rvecs = {}, {}
+            self.vecs = {}
 
     def save(self) -> None:
         if not self.dirty or not self.vecs:
             return
         rows = np.array(sorted(self.vecs), np.int32)
         vecs = np.stack([self.vecs[int(r)] for r in rows]).astype(np.float16)
-        rk = sorted(self.rvecs)
-        extra = {}
-        if rk:
-            extra = dict(rrows=np.array([k[0] for k in rk], np.int32), rrots=np.array([k[1] for k in rk], np.int8),
-                         rvecs=np.stack([self.rvecs[k] for k in rk]).astype(np.float16))
         tmp = self.path + '.tmp.npz'
-        np.savez_compressed(tmp, rows=rows, vecs=vecs, stamp=np.array(self.stamp), **extra)
+        np.savez_compressed(tmp, rows=rows, vecs=vecs, stamp=np.array(self.stamp))
         os.replace(tmp, self.path)
         self.dirty = False
 
@@ -222,30 +172,6 @@ class EmbeddingStore:
                     self.vecs[r] = v
                 self.dirty = True
         return np.stack([self.vecs.get(r, np.zeros(768, np.float32)) for r in rows])
-
-    def get_keyed(self, keys: list, make) -> dict:
-        """Embeddings of derived icon images: ``keys`` are ``(row, rot)`` (rotated icon, persisted)
-        or longer tuples (clipped crops, kept for this run); ``make(key)`` renders the image."""
-        out, need, imgs = {}, [], []
-        for k in keys:
-            src = self.rvecs if len(k) == 2 else self.mem
-            v = src.get(k)
-            if v is not None:
-                out[k] = v
-            elif k not in need:
-                im = make(k)
-                if im is not None:
-                    need.append(k)
-                    imgs.append(im)
-        if imgs:
-            if len(self.mem) > 20000:
-                self.mem.clear()
-            for k, v in zip(need, embed(imgs)):
-                (self.rvecs if len(k) == 2 else self.mem)[k] = v
-                out[k] = v
-                if len(k) == 2:
-                    self.dirty = True
-        return out
 
     def precompute(self, log=print) -> None:
         """Embed every catalog row (about half a minute on a GPU)."""

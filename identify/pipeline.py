@@ -47,7 +47,10 @@ from .grid import GridResult, detect_grid
 from .match import Cand, Tile, normalize_tile, stage1
 from .match import enable_torch as match_enable_torch, disable_torch as match_disable_torch
 from .segment import segment_panel
-from . import verify as verify_mod
+from . import anchors as anchors_mod
+from . import fontlabel as fontlabel_mod
+from . import tilecache
+from .catalog import default_cache_dir
 
 # fusion weights (tuned on data/eval/stash1.truth.full.json, see test_scan.py --score)
 W_RES = 1.0
@@ -60,6 +63,7 @@ LABEL_PARTIAL_CAP = 94.0   # best score a non-exact label match can get (exact =
 LABEL_RIVAL_GAP = 5.0      # a label this much better than the chosen item's gets a say
 LITERAL_RES = 5.0          # a stage-1 residual this low with LITERAL_DINO is a near pixel-exact match
 LITERAL_DINO = 0.85
+ANCHOR_SHORTLIST = 6       # icon-cache renders checked exactly per tile (Anchor 1)
 TIE_MARGIN = 0.1           # fused-score gap below which two differently named items are indistinguishable
 TIE_CONF_CAP = 0.5         # ...and the answer is a coin flip, so it may not be reported as certain
 LEARN_MAX_RES = 4.0        # stage-1 residual of a near-literal match to a cached icon
@@ -68,9 +72,6 @@ LEARN_DISTINCT = 2.0       # learn only if every different look-alike is at leas
 LEARN_CONFIRMATIONS = 2    # independent confirmations before a learned name is used
 TWIN_GAP_OK = 2.0          # fused-score lead that settles same-label twins by picture (see docs/accuracy.md)
 TWIN_GAP_OK_RES = 6.0      # ...when the picture score is the residual alone (no DINO: colour variants differ by little)
-TWIN_GAP_BIG = 3.0         # a label-twin lead this large stands unless the difference pixels object
-TWIN_GAP_BIG_RES = 6.0     # ...on residual alone
-PAIR_OK = 0.7              # verify.pair ratio that confirms a label-twin choice with any positive lead
 LABEL_VERIFIED_CONF = 0.97  # exact, unambiguous label read of an item that fits the footprint
 WEAPON_SURE_CONF = 0.95    # certainly a gun (guns are skipped, the exact gun does not matter)
 # logistic calibration of the reported confidence: p = sigmoid(b + sum(w * feature)); fitted by
@@ -168,6 +169,192 @@ class Engine:
         self.learned = LearnedNames(self.s.extra.get('learned_path', LEARNED_PATH))
         self._row_key: dict = {}
         self._apply_learned()
+        self.tile_cache = tilecache.TileCache()
+        self.anchor_idx = None
+        self.labeler = None
+        self._fp_rows: dict = {}
+        self._vis_cache: dict = {}
+        self._phases: dict = {}
+        self._init_anchors()
+
+    # ------------------------------------------------------------------
+    def _init_anchors(self) -> None:
+        """Anchor 1 (icon-cache renders) and Anchor 2 (the game's label font).  Either may be
+        unavailable (no game cache / font): it is then simply off."""
+        ex = self.s.extra
+        if not ex.get('anchors', True):
+            return
+        canon = {k: str(self.cat.ids[v]) for k, v in self.preset_base.items()}
+        self._canon = canon
+        try:
+            cdir = ex.get('cache_dir') or default_cache_dir()
+            if cdir:
+                self.anchor_idx = anchors_mod.CacheIndex(cdir, self.cat.meta.get('cache_assoc') or {},
+                                                         _CertainBindings(self.learned), canon)
+        except Exception as e:                     # pragma: no cover - never fatal
+            print(f'[anchors] icon-cache index unavailable: {e}')
+        try:
+            self.labeler = fontlabel_mod.LabelRenderer.create(log=lambda *a: None)
+        except Exception as e:                     # pragma: no cover
+            print(f'[anchors] label font unavailable: {e}')
+
+    def reset_anchors(self) -> None:
+        """Forget certain bindings made in memory and the tile cache (eval: clean state)."""
+        self.tile_cache.clear()
+        if self.anchor_idx is not None:
+            self.anchor_idx.reset_bindings()
+
+    def _fp_candidates(self, W: int, H: int) -> list:
+        """api rows (no presets) whose item can occupy a W x H tile."""
+        k = (W, H)
+        if k not in self._fp_rows:
+            t = Tile(np.zeros((1, 1, 3), np.uint8), W, H)
+            self._fp_rows[k] = [int(r) for r in self._api_rows() if self._footprint_ok(int(r), t, False)]
+        return self._fp_rows[k]
+
+    def _visible(self, short: str, w: int, pitch: float) -> str:
+        k = (short, w, round(pitch, 2))
+        v = self._vis_cache.get(k)
+        if v is None:
+            v = self.labeler.visible_text(short, w, pitch)
+            if len(self._vis_cache) > 200000:
+                self._vis_cache.clear()
+            self._vis_cache[k] = v
+        return v
+
+    def _certify(self, img_bgr, w, det) -> None:
+        """Anchors 1 + 2 (docs/accuracy.md).  A tile is CERTAIN when its pixels exactly match a
+        game render of a known item, or its label exactly matches the game-font rendering of one
+        item's short name among every item that fits the footprint (and the two never disagree).
+        A label-certified tile binds its exact render to the item permanently."""
+        it, panel, tile = w['it'], w['panel'], w['tile']
+        ev = det.evidence
+        if it.clipped_top or it.clipped_bottom:
+            return
+        x, y, wpx, hpx = it.rect
+        if x < 0 or y < 0 or x + wpx > img_bgr.shape[1] or y + hpx > img_bgr.shape[0]:
+            return
+        W, H = int(it.w), int(it.h)
+        px, py = float(panel.pitch_x), float(panel.pitch_y)
+        crop = img_bgr[y:y + hpx, x:x + wpx]
+        a1 = None
+        if self.anchor_idx is not None and len(self.anchor_idx):
+            ph = self._phases.get(id(panel))
+            a1 = self.anchor_idx.match(crop, W, H, px, py, phase=ph, k=ANCHOR_SHORTLIST)
+            if a1 is not None and ph is None and a1.score <= anchors_mod.exact_threshold(py):
+                self._phases[id(panel)] = a1.phase
+        id1 = a1.item_id if (a1 is not None and a1.certain) else ''
+        exact1 = a1 is not None and a1.score <= anchors_mod.exact_threshold(py) and \
+            a1.n_px >= anchors_mod.MIN_PIXELS * px * py / (SLOT * SLOT)
+        if a1 is not None:
+            ev['anchor_render'] = {'score': round(a1.score, 2), 'runner': round(a1.runner, 2),
+                                   'id': a1.item_id, 'hint': a1.render.hint_id if a1.render else '',
+                                   'note': a1.note}
+        id2, twins = '', []
+        if self.labeler is not None:
+            st = fontlabel_mod.strip_of(img_bgr, it.rect, py)
+            if st is not None:
+                fits, id2, twins = self._label_anchor(st, w, det, a1, W, H, py)
+                if fits:
+                    ev['anchor_label'] = {'text': fits[0].text, 'total': round(fits[0].total, 2),
+                                          'runner': round(fits[1].total, 2) if len(fits) > 1 else None,
+                                          'runner_text': fits[1].text if len(fits) > 1 else None,
+                                          'certain': bool(id2), 'twins': len(twins)}
+        if id2 == '' and len(twins) > 1 and exact1 and a1.item_id in twins:
+            id2 = a1.item_id                       # label twins ("BP" ammo) settled by the exact render
+        if id1 and id2 and id1 != id2:
+            det.uncertain = True
+            det.confidence = min(det.confidence, 0.5)
+            ev['note'] = 'anchors disagree (exact render vs exact label)'
+            print(f'[anchors] contradiction at {it.rect}: render {id1} vs label {id2}')
+            return
+        cid = id2 or id1
+        if not cid and len(twins) > 1:
+            # the label was matched exactly, and the game prints that text for several items
+            # ("MP5": receiver / magazine / gun, "D3CRX": two colours) that no exact render
+            # separates: whatever the picture prefers is a guess between them
+            guns = {str(self.cat.cats[self._id_row[t_]]) == 'weapon' for t_ in twins if t_ in self._id_row}
+            if not (det.category == 'weapon' and guns == {True}):     # all guns: "a gun" is enough
+                det.uncertain = True
+                det.confidence = min(det.confidence, 0.5)
+                ev['note'] = f'printed label is shared by {len(twins)} items; picture alone decides'
+            return
+        if not cid:
+            if self.s.extra.get('strict_anchors'):
+                det.uncertain = True
+                det.confidence = min(det.confidence, 0.79)
+            return
+        if id2 and exact1 and not id1 and a1.render is not None:
+            self._bind(a1.render, id2)              # C: next time the render alone is certain
+        r = self._id_row.get(cid)
+        if r is None:
+            return
+        c = self.cat
+        if det.item_id != cid:
+            ev['pipeline_choice'] = det.name
+        det.item_id, det.name = cid, str(c.names[r])
+        det.category, det.short = str(c.cats[r]), str(c.shorts[r])
+        det.confidence = 0.995
+        det.uncertain = False
+        ev['certified'] = 'render+label' if (id1 and id2) else ('label' if id2 else 'render')
+
+    def _label_anchor(self, st, w, det, a1, W, H, pitch):
+        """Closed-set label match.  Returns ``(fits, certified item id or '', twin ids)``."""
+        from rapidfuzz import process as rf_process, distance as rf_distance
+        c = self.cat
+        rows = self._fp_candidates(W, H)
+        sw = st.shape[1]
+        by_vis: dict = {}
+        for r in rows:
+            s_ = str(c.shorts[r])
+            if s_:
+                by_vis.setdefault(self._visible(s_, sw, pitch), set()).add(str(c.ids[r]))
+        texts = []
+        seen_ids = set()
+        for c2 in w.get('pool') or []:
+            iid = self._canon.get(str(c.ids[c2.row]), str(c.ids[c2.row]))
+            if iid and iid not in seen_ids:
+                seen_ids.add(iid)
+            if len(seen_ids) >= 12:
+                break
+        for txt in w.get('ocr_all') or []:
+            seen_ids.update(i for i, sc in self._label_hits(txt, W).items() if sc >= 60)
+        for iid in (det.item_id, a1.item_id if a1 else '', a1.render.hint_id if (a1 and a1.render) else ''):
+            if iid:
+                seen_ids.add(iid)
+        for iid in seen_ids:
+            r = self._id_row.get(iid)
+            if r is not None and r in self._fp_set(W, H):
+                texts.append(str(c.shorts[r]))
+        # adversarial neighbours: the printed names closest to the leading guesses
+        keys = list(by_vis)
+        for q in [det.short] + list(w.get('ocr_all') or [])[:2]:
+            if q:
+                texts += [k for k, _, _ in rf_process.extract(q, keys, scorer=rf_distance.Levenshtein.distance,
+                                                              limit=6)]
+        texts = [t_ for t_ in dict.fromkeys(texts) if t_]
+        if not texts:
+            return [], '', []
+        fits = self.labeler.match(st, texts, pitch)
+        if not fontlabel_mod.certain(fits):
+            return fits, '', []
+        # the game prints the winner's text for every one of these items
+        twins = sorted(by_vis.get(fits[0].text, set()))
+        if len(twins) == 1:
+            return fits, twins[0], twins
+        return fits, '', twins
+
+    def _fp_set(self, W, H) -> set:
+        k = ('set', W, H)
+        if k not in self._fp_rows:
+            self._fp_rows[k] = set(self._fp_candidates(W, H))
+        return self._fp_rows[k]
+
+    def _bind(self, render, item_id: str) -> None:
+        r = self._id_row.get(item_id)
+        name = str(self.cat.names[r]) if r is not None else item_id
+        self.learned.bind_certain(render.key, item_id, name)
+        self.anchor_idx.bind(render.key, item_id)
 
     # ------------------------------------------------------------------
     def _icon_key(self, row: int) -> str | None:
@@ -237,7 +424,7 @@ class Engine:
 
     # ------------------------------------------------------------------
     def _use_dino(self) -> bool:
-        return bool(self.s.use_dino and dino_mod.available(self.s.device, self.s.dino_backend))
+        return bool(self.s.use_dino and dino_mod.available(self.s.device))
 
     def _use_ocr(self) -> bool:
         return bool(self.s.use_ocr and ocr_mod.tesseract_available())
@@ -267,13 +454,21 @@ class Engine:
         # exactly (the numpy path prunes with a coarse pass), and OCR needs no stage-1 result.
         t = time.perf_counter()
         work = []
+        cached = []
         for it, panel in items:
             if it.empty:
+                continue
+            key = tilecache.tile_key(img_bgr, it.rect, panel.pitch_x, panel.pitch_y,
+                                     f'{it.w}x{it.h}|{int(it.clipped_top)}{int(it.clipped_bottom)}')
+            hit = self.tile_cache.get(key)
+            if hit is not None:
+                cached.append(_from_cache(hit, it))
                 continue
             tile = normalize_tile(img_bgr, it.rect, it.w, panel.pitch_x, panel.pitch_y,
                                   it.clipped_top, it.clipped_bottom)
             if tile is not None:
-                work.append({'it': it, 'panel': panel, 'tile': tile, 'ocr_all': []})
+                work.append({'it': it, 'panel': panel, 'tile': tile, 'ocr_all': [], 'key': key})
+        T['cache_hits'] = len(cached)
         if self._use_ocr():
             flat, owner = [], []
             for i, w in enumerate(work):
@@ -314,13 +509,23 @@ class Engine:
 
         # ---- fusion + FIR ------------------------------------------------------------
         t = time.perf_counter()
-        dets = []
+        dets = list(cached)
         for w in work:
             d = self._decide(img_bgr, w)
             if d is not None:
                 dets.append(d)
-        dets.sort(key=lambda d: (d.panel, d.row, d.col))
+                w['det'] = d
         T['fuse'] = time.perf_counter() - t
+
+        # ---- anchors: exact game render / exact game-font label --------------------------
+        self._phases = {}
+        t = time.perf_counter()
+        for w in work:
+            if w.get('det') is not None:
+                self._certify(img_bgr, w, w['det'])
+                self.tile_cache.put(w['key'], _to_cache(w['det']))
+        T['anchors'] = time.perf_counter() - t
+        dets.sort(key=lambda d: (d.panel, d.row, d.col))
         T['total'] = time.perf_counter() - t0
         if self.store is not None:
             self.store.save()
@@ -349,36 +554,31 @@ class Engine:
         if not q_imgs:
             return
         qe = dino_mod.embed(q_imgs)
-        direct_rows, fly_keys, tile_key = [], [], {}
+        direct_rows, fly_imgs, fly_keys = [], [], []
         for i in q_idx:
             tile = work[i]['tile']
             for c in work[i]['top']:
                 if c.rot == 0 and not tile.clip:
                     direct_rows.append(c.row)
                     continue
-                k = (c.row, c.rot) if not tile.clip else (c.row, c.rot, tile.clip, int(tile.vis_rows))
-                tile_key[(i, c.row, c.rot)] = k
-                fly_keys.append(k)
-
-        def make(k):
-            full = self.cat.full_icon(k[0])
-            if full is None:
-                return None
-            bg = TINT.get(str(self.cat.tint[k[0]]), TINT['default'])
-            comp = dino_mod.composite_icon(full, bg, k[1])
-            clip = k[2] if len(k) > 2 else ''
-            if clip:
-                vis = int(round(k[3] / 32.0 * 64.0))
-                comp = comp[:vis] if clip == 'bottom' else comp[-vis:]
-            return dino_mod.blank_bands(comp, bg, SLOT, clip)
+                full = self.cat.full_icon(c.row)
+                if full is None:
+                    continue
+                bg = TINT.get(str(self.cat.tint[c.row]), TINT['default'])
+                comp = dino_mod.composite_icon(full, bg, c.rot)
+                if tile.clip:
+                    vis = int(round(tile.vis_rows / 32.0 * 64.0))
+                    comp = comp[:vis] if tile.clip == 'bottom' else comp[-vis:]
+                fly_imgs.append(dino_mod.blank_bands(comp, bg, SLOT, tile.clip))
+                fly_keys.append((i, c.row, c.rot))
         direct_rows = sorted(set(direct_rows))
         demb = dict(zip(direct_rows, self.store.get(direct_rows))) if direct_rows else {}
-        kemb = self.store.get_keyed(fly_keys, make) if fly_keys else {}
+        femb = dict(zip(fly_keys, dino_mod.embed(fly_imgs))) if fly_imgs else {}
         for qi, i in enumerate(q_idx):
             tile = work[i]['tile']
             sims = {}
             for c in work[i]['top']:
-                v = demb.get(c.row) if (c.rot == 0 and not tile.clip) else kemb.get(tile_key.get((i, c.row, c.rot)))
+                v = demb.get(c.row) if (c.rot == 0 and not tile.clip) else femb.get((i, c.row, c.rot))
                 if v is not None:
                     sims[(c.row, c.rot)] = float(qe[qi] @ v)
             work[i]['sims'] = sims
@@ -531,24 +731,10 @@ class Engine:
         # A build template (anonymous cache render of a modded item) or a poor visual match
         # only says what the footprint looks like: the identity comes from the printed label.
         auth = None
-        gun_doubt = False
         edge = _at_viewport_edge(it, panel, tile)
 
-        top3, seen3 = [], set()
-        for _S, c3, _d, _o in scored:
-            if str(cat.names[c3.row]) not in seen3:
-                seen3.add(str(cat.names[c3.row]))
-                top3.append(int(c3.row))
-            if len(top3) == 3:
-                break
-        pic_gun = len(top3) >= 2 and all(self._weapon_like(r) for r in top3)
-
         def gun_probe() -> bool:
-            # guns print their calibre bottom-left ("20ga", "5.45x39"); parts never do.  The
-            # calibre can be hidden by art (an MDR's stock): a picture whose three best different
-            # candidates are all guns says gun regardless.
-            if pic_gun:
-                return True
+            # guns print their calibre bottom-left ("20ga", "5.45x39"); parts never do
             if it.clipped_bottom or not self._use_ocr():
                 return False
             st = ocr_mod.bottom_strip(img_bgr, it.rect, panel.pitch_x, panel.pitch_y, left=True)
@@ -578,15 +764,14 @@ class Engine:
             me = rd.get(str(cat.ids[c.row]))
             close = False
             if guns and me is not None:
-                # the label cannot tell the part from the gun; the picture (gun incl. presets)
-                # and the calibre probe must agree, or the answer is uncertain
+                # only when the picture cannot tell the part from the gun (incl. its presets)
                 rk = self._twin_ranker(w)([me] + sorted(guns))
                 g_best = max((rk[g] for g in guns if g in rk), default=None)
-                close = g_best is None or me not in rk or rk[me] - g_best < TWIN_GAP_OK
-                if gun_probe():
-                    gun = max(guns, key=lambda g: rk.get(g, -1e9))
-                    auth = (gun, float(o), 2, None, None)          # unresolved twin -> uncertain
-                # no calibre printed: not a gun, the part the picture chose stands
+                close = g_best is not None and me in rk and rk[me] - g_best < TWIN_GAP_OK
+            if close and gun_probe():
+                auth = self._label_authority(w.get('ocr_all') or [], tile, prefer_weapon=True,
+                                             res_by_row=_best_res_by_id(cat, cands), at_edge=edge,
+                                             twin_rank=self._twin_ranker(w))
         item_id = str(cat.ids[c.row])
         name = str(cat.names[c.row])
         evidence = {'residual': round(c.score, 3), 'stage1_best': round(best_res, 3),
@@ -596,9 +781,9 @@ class Engine:
                     'visual': f'{cat.names[c.row]} [{cat.src[c.row]} #{c.row}]'}
         chosen_row = c.row
         twins = 1
-        twin_gap = twin_rival = None
+        twin_gap = None
         if auth is not None:
-            row, sc, twins, twin_gap, twin_rival = auth
+            row, sc, twins, twin_gap = auth
             item_id, name = str(cat.ids[row]), str(cat.names[row])
             evidence.update(ocr_authority=True, ocr=round(sc, 1), source='ocr-authority', twins=twins,
                             twin_gap=None if twin_gap is None else round(twin_gap, 2))
@@ -654,11 +839,11 @@ class Engine:
                 break
         evidence['alternatives'] = alts
         pool_rows, seen_n = [], set()
-        for S2, c2, _, o2 in scored:
+        for S2, c2, _, _ in scored:
             nm = str(cat.names[c2.row])
             if nm not in seen_n:
                 seen_n.add(nm)
-                pool_rows.append((int(c2.row), int(c2.rot), nm, round(S2, 2), None if o2 is None else round(o2, 1)))
+                pool_rows.append((int(c2.row), int(c2.rot), nm, round(S2, 2)))
             if len(pool_rows) == 6:
                 break
         evidence['pool_rows'] = pool_rows
@@ -671,25 +856,10 @@ class Engine:
         z = CALIB['b'] + sum(CALIB[k] * v for k, v in feats.items())
         if item_id == '':
             z -= 4.0
-        twin_ok = twin_gap is not None and twin_rival is not None and self._twin_settled(
-            img_bgr, it, tile, cands, chosen_row, twin_rival, twin_gap, have_dino, evidence)
+        twin_ok = twin_gap is not None and twin_gap >= (TWIN_GAP_OK if have_dino else TWIN_GAP_OK_RES)
         if twins > 1 and not twin_ok:
             z -= 1.5 * math.log(twins)
         conf = _sigmoid(z)
-        if auth is None and text and o is not None and o >= 60:
-            # the label reads as well for a differently named pool item (colour variants, "MP5" on a
-            # receiver and a magazine): the picture alone decides between them, so it must settle it
-            riv = [(chosen_S - S2, c2.row) for S2, c2, _, o2 in scored[1:]
-                   if str(cat.names[c2.row]) != name and o2 is not None and o2 >= o - 0.01]
-            if riv:
-                lead, rrow = min(riv)
-                evidence['label_twin_lead'] = round(lead, 2)
-                if not self._twin_settled(img_bgr, it, tile, cands, c.row, rrow, lead, have_dino, evidence):
-                    gun_doubt = True
-                    evidence['note'] = 'label twins not separated by the picture'
-        if gun_doubt:
-            conf = min(conf, TIE_CONF_CAP)
-            evidence.setdefault('note', 'label names a gun and a part; picture and calibre do not settle it')
         if twins > 1 and not twin_ok:
             # same-label twins the picture did not separate: the choice is a coin flip
             conf = min(conf, TIE_CONF_CAP)
@@ -865,25 +1035,26 @@ class Engine:
             return None
         twins = [r for s_, r in sc if s_ >= top - 0.01 or (f0 and self._fold_of.get(r) == f0)]
         W, H = tile.W, tile.H
-        probed, n_before, decided = False, len(twins), False
-        if len({str(cat.cats[r]) == 'weapon' for r in twins}) == 2 and is_gun is not None:
-            # "TOZ-106" / "MP5" name a gun and its parts.  A gun prints its calibre bottom-left, a
-            # part prints none: the probe decides between gun and part.  When it contradicts the
-            # picture's guess the answer is reported uncertain (art can look like text).
-            g = is_gun()
-            if g != bool(prefer_weapon):
-                probed = True
-            prefer_weapon, decided = g, True
-
         def coarse(r):
             weap = str(cat.cats[r]) == 'weapon'
             sizes = self.gun_sizes.get(r) or {(int(cat.tw[r]), int(cat.th[r]))}
             exact = any((a, b) in ((W, H), (H, W)) for a, b in sizes)
-            pref = (prefer_weapon == weap) if decided else (prefer_weapon and weap)
-            return (0 if pref else 1, 0 if exact else 1)
+            return (0 if (prefer_weapon and weap) else 1, 0 if exact else 1)
         c0 = min(coarse(r) for r in twins)
         finalists = [r for r in twins if coarse(r) == c0]
         vis = twin_rank(finalists) if (twin_rank and len(finalists) > 1) else {}
+        kinds = {str(cat.cats[r]) == 'weapon' for r in finalists}
+        probed, n_before = False, len(finalists)
+        if not prefer_weapon and len(kinds) == 2 and is_gun is not None:
+            ranked = sorted(vis.values(), reverse=True)
+            if (len(ranked) < 2 or ranked[0] - ranked[1] < TWIN_GAP_OK) and is_gun():
+                # "TOZ-106" names the gun and its stock and the picture cannot tell: a calibre
+                # printed bottom-left says gun (parts print none)
+                prefer_weapon = True
+                probed, n_before = True, len(finalists)
+                c0 = min(coarse(r) for r in twins)
+                finalists = [r for r in twins if coarse(r) == c0]
+                vis = twin_rank(finalists) if (twin_rank and len(finalists) > 1) else {}
 
         def key(r):
             if vis:
@@ -892,53 +1063,45 @@ class Engine:
                 rr = round(res_by_row.get(r, 99.0), 1) if res_by_row else 0.0
             return coarse(r) + (rr, r)
         finalists.sort(key=key)
-        gap, rival = None, None
+        gap = None
         if len(finalists) > 1 and vis and finalists[0] in vis:
             nm0 = str(cat.names[finalists[0]])
-            others = [(vis.get(r, -99.0), r) for r in finalists[1:] if str(cat.names[r]) != nm0]
+            others = [vis.get(r, -99.0) for r in finalists[1:] if str(cat.names[r]) != nm0]
             if others:
-                best_o, rival = max(others)
-                gap = vis[finalists[0]] - best_o
+                gap = vis[finalists[0]] - max(others)
         if probed:
             # the calibre read only breaks the tie: art can look like text, so never "verified"
-            return finalists[0], float(top), max(2, n_before), None, None
-        return finalists[0], float(top), len(finalists), gap, rival
+            return finalists[0], float(top), max(2, n_before), None
+        return finalists[0], float(top), len(finalists), gap
 
-    def _twin_settled(self, img_bgr, it, tile, cands, row_a, row_b, lead, have_dino, evidence) -> bool:
-        """Is the picture's choice between two label twins (``row_a`` chosen, ``row_b`` the best
-        differently named rival, ``lead`` the fused-score lead) safe to report as certain?
-        Measured on 323 real label-twin pairs (docs/accuracy.md): certain when the lead is
-        positive and the difference-only residual clearly agrees (ratio <= PAIR_OK), or the lead
-        is large and the difference pixels do not object (ratio <= 1)."""
-        if lead is None or lead <= 0:
-            return False
-        r = self._pair_ratio(img_bgr, it, tile, cands, row_a, row_b)
-        evidence['pair_ratio'] = None if r is None else round(r, 3)
-        r = 1.0 if r is None else r
-        big = TWIN_GAP_BIG if have_dino else TWIN_GAP_BIG_RES
-        return r <= PAIR_OK or (lead >= big and r <= 1.0)
 
-    def _pair_ratio(self, img_bgr, it, tile, cands, row_a, row_b):
-        """verify.pair over the best-matching template of each item (a game render when the
-        catalog has one), in the orientation stage 1 found; None when either has no template
-        of the tile's footprint or the tile is cut by the viewport."""
-        if it.clipped_top or it.clipped_bottom:
-            return None
-        cat = self.cat
-        best = {}
-        for c2 in cands:
-            k = str(cat.ids[c2.row]) or f'#{c2.row}'
-            if k not in best:
-                best[k] = c2
-        ca = best.get(str(cat.ids[row_a]) or f'#{row_a}')
-        cb = best.get(str(cat.ids[row_b]) or f'#{row_b}')
-        if ca is None or cb is None:
-            return None
-        th = verify_mod.tile_hi(img_bgr, it.rect, tile.W, tile.H)
-        if th is None:
-            return None
-        res = verify_mod.pair(th, cat.full_icon(ca.row), ca.rot, cat.full_icon(cb.row), cb.rot, tile.bg)
-        return None if res is None else res.ratio
+class _CertainBindings:
+    """Read-only view of the learned store: only bindings made by a certain anchor."""
+
+    def __init__(self, learned: LearnedNames):
+        self.learned = learned
+
+    def get(self, key):
+        e = self.learned.data.get(key) if key else None
+        return e['id'] if e and e.get('certain') else None
+
+
+_CACHE_FIELDS = ('item_id', 'name', 'confidence', 'uncertain', 'evidence', 'count', 'fir', 'category',
+                 'short', 'rotated', 'w', 'h')
+
+
+def _to_cache(d: 'Detection') -> dict:
+    return {k: getattr(d, k) for k in _CACHE_FIELDS}
+
+
+def _from_cache(c: dict, it) -> 'Detection':
+    x, y, wpx, hpx = it.rect
+    ev = dict(c['evidence'])
+    ev['cached'] = True
+    return Detection(panel=it.panel, col=it.col, row=it.row, w=c['w'], h=c['h'], rotated=c['rotated'],
+                     item_id=c['item_id'], name=c['name'], confidence=c['confidence'], uncertain=c['uncertain'],
+                     evidence=ev, count=c['count'], fir=c['fir'], rect=(x, y, wpx, hpx),
+                     clipped=bool(it.clipped_top or it.clipped_bottom), category=c['category'], short=c['short'])
 
 
 def _at_viewport_edge(it, panel, tile) -> bool:

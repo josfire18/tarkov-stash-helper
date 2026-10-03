@@ -46,7 +46,7 @@ _ARRS = ('ids', 'names', 'shorts', 'cats', 'tint', 'src')
 _snap: dict = {}
 
 
-def run_clean(img, use_dino, use_ocr, exe=False):
+def run_clean(img, use_dino, use_ocr):
     """One scan from a clean engine state: the learned-icon store and the in-memory renames it
     causes are reset before every image, so a result never depends on which screenshots (or a
     warm-up scan of the same screenshot) were seen before."""
@@ -54,9 +54,8 @@ def run_clean(img, use_dino, use_ocr, exe=False):
     if key not in T._v2_engines:
         from identify.config import EngineSettings
         from identify.pipeline import Engine
-        kw = dict(dino_backend='onnx', accelerate=False) if exe else {}
         eng = Engine(EngineSettings(use_dino=use_dino, use_ocr=use_ocr,
-                                    extra={'learned_path': T._EVAL_LEARNED}, **kw))
+                                    extra={'learned_path': T._EVAL_LEARNED}))
         eng.learned.data = {}
         T._v2_engines[key] = eng
         _snap[key] = {k: getattr(eng.cat, k).copy() for k in _ARRS}   # before any scan
@@ -65,13 +64,16 @@ def run_clean(img, use_dino, use_ocr, exe=False):
     for k in _ARRS:
         getattr(eng.cat, k)[:] = _snap[key][k]
     eng.learned.data = {}
+    if hasattr(eng, 'reset_anchors'):
+        eng.reset_anchors()              # certain bindings + tile cache: clean state per screenshot
     eng._builds_done = False          # re-run the (deterministic) build association
     return T.run_v2(img, use_dino, use_ocr, warm=False)
 
 
 def grade(truth, dets, cats):
     mt = T.match_rects([t['rect'] for t in truth], [d['rect'] for d in dets])
-    res = {'correct': 0, 'wrong': 0, 'uncertain': 0, 'missed': 0, 'n': 0, 'fail': []}
+    res = {'correct': 0, 'wrong': 0, 'uncertain': 0, 'missed': 0, 'n': 0, 'fail': [],
+           'cert_render': 0, 'cert_label': 0, 'cert_both': 0, 'cert_wrong': 0}
     for i, t in enumerate(truth):
         if t.get('uncertain') or not t.get('item_id'):
             continue
@@ -85,10 +87,16 @@ def grade(truth, dets, cats):
         cat = t.get('category') or cats.get(t['item_id'], 'other')
         ok = is_ok(t, d, cat)
         ev = d['det'].evidence
+        cf = ev.get('certified')
+        if cf:
+            res[{'render': 'cert_render', 'label': 'cert_label', 'render+label': 'cert_both'}[cf]] += 1
+            if not ok:
+                res['cert_wrong'] += 1
         info = {'idx': i, 'rect': t['rect'], 'want': t.get('name'), 'got': d['name'], 'conf': round(d['conf'], 3),
                 'ocr': ev.get('ocr_text'), 'res': ev.get('residual'), 'dino': ev.get('dino'),
                 'src': ev.get('source'), 'note': ev.get('note', ''),
-                'alts': [a['name'] for a in ev.get('alternatives', [])]}
+                'alts': [a['name'] for a in ev.get('alternatives', [])],
+                'cert': ev.get('certified'), 'al': ev.get('anchor_label'), 'ar': ev.get('anchor_render')}
         if d.get('uncertain'):
             res['uncertain'] += 1
             res['fail'].append({'kind': 'uncertain' + ('' if ok else '(wrong)'), **info})
@@ -105,14 +113,13 @@ def main():
     ap.add_argument('images', nargs='*')
     ap.add_argument('--no-dino', action='store_true')
     ap.add_argument('--no-ocr', action='store_true')
-    ap.add_argument('--exe', action='store_true',
-                    help='what the packaged exe runs: stage 2 on onnxruntime (CPU), stage 1 on numpy')
     ap.add_argument('--json')
     ap.add_argument('--quiet', action='store_true', help='no per-failure lines')
     a = ap.parse_args()
     imgs = a.images or eval_images()
     cats = T._categories()
-    tot = {'correct': 0, 'wrong': 0, 'uncertain': 0, 'missed': 0, 'n': 0, 'time': 0.0}
+    tot = {'correct': 0, 'wrong': 0, 'uncertain': 0, 'missed': 0, 'n': 0, 'time': 0.0,
+           'cert_render': 0, 'cert_label': 0, 'cert_both': 0, 'cert_wrong': 0}
     out = {}
     print(f"{'screenshot':<26}{'n':>5}{'correct':>9}{'wrong':>7}{'uncert':>8}{'missed':>8}{'cover':>8}{'s/scan':>8}")
     for p in imgs:
@@ -120,7 +127,7 @@ def main():
         truth, _ = T.load_truth(p, 'full')
         if img is None or truth is None:
             continue
-        dets, dt, _ = run_clean(img, not a.no_dino, not a.no_ocr, a.exe)
+        dets, dt, _ = run_clean(img, not a.no_dino, not a.no_ocr)
         g = grade(truth, dets, cats)
         name = os.path.basename(p)
         cov = (g['correct'] + g['wrong']) / g['n'] if g['n'] else 0.0
@@ -130,7 +137,9 @@ def main():
             for f in g['fail']:
                 print(f"     {f['kind']:<16} #{f['idx']} want '{f.get('want')}' got '{f.get('got', '')}' "
                       f"ocr='{f.get('ocr', '')}' res={f.get('res')} dino={f.get('dino')} conf={f.get('conf')}")
-        for k in ('correct', 'wrong', 'uncertain', 'missed', 'n'):
+        print(f"     certified: render {g['cert_render']} label {g['cert_label']} both {g['cert_both']}"
+              f" | certified-but-wrong {g['cert_wrong']}")
+        for k in ('correct', 'wrong', 'uncertain', 'missed', 'n', 'cert_render', 'cert_label', 'cert_both', 'cert_wrong'):
             tot[k] += g[k]
         tot['time'] += dt
         out[name] = {**{k: v for k, v in g.items()}, 'time': dt}
@@ -138,6 +147,8 @@ def main():
     print(f"{'TOTAL':<26}{tot['n']:>5}{tot['correct']:>9}{tot['wrong']:>7}{tot['uncertain']:>8}{tot['missed']:>8}"
           f"{100 * (tot['correct'] + tot['wrong']) / n:>7.1f}%{tot['time'] / max(1, len(out)):>8.2f}")
     print(f"strict accuracy (correct / labelled): {100 * tot['correct'] / n:.2f}%")
+    print(f"certified: render {tot['cert_render']} label {tot['cert_label']} both {tot['cert_both']} "
+          f"= {tot['cert_render'] + tot['cert_label'] + tot['cert_both']} | CERTIFIED-BUT-WRONG {tot['cert_wrong']}")
     if a.json:
         with open(a.json, 'w', encoding='utf-8') as f:
             json.dump({'total': tot, 'per_image': out}, f, indent=1, default=str)
