@@ -54,3 +54,4 @@ data/eft_hash_status.json
 # per-user: cache icons named from confirmed scans
 data/learned_icons.json
 data/learned_icons.json.tmp
+data/audit/
