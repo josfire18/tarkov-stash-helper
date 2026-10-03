@@ -10,7 +10,7 @@ Usage window 06:40–11:40 UTC (2026-10-03), target ≈ 20 %/h, checked every ~2
 | 2 | Auto-scan saves every settled inventory view (lobby + raid) to `data/scenes/live/` as the scene dataset | orchestrator | done (a07af07) |
 | 3 | UI restructure: Live (home) · Needs · Settings. Header clutter gone, no region/build buttons, Needs = quests + hideout (level steppers) + Kappa + pins in one list | Sonnet | landed (feat/ui) |
 | 4 | Scene layer `identify/scene.py`: split the screen by landmarks (stash filter toolbar, slot headers, floating windows with title bar + red ✕), grids per region, roles own / loot / stash / container window / picker; picker + occluded cells never scanned | Opus | landed on `feat/scene2` (identify/scene.py; real-frame tests in tests/test_scene.py; raid rules unverified - no in-raid frames yet) |
-| 5 | Live pipeline: incremental scan via tile cache, SSE push, in-raid advice (grab by ₽/slot, quest items, drop cheapest own item when full), scene-filtered sell advice | Opus | after 4 |
+| 5 | Live pipeline: incremental scan via tile cache, SSE push, in-raid advice (grab by ₽/slot, quest items, drop cheapest own item when full), scene-filtered sell advice | Opus | landed on `feat/live2`: warm re-scan 1.1 s -> 0.4-0.5 s, 2 changed tiles ~1.1 s, new view still 6-9 s (anchors phase = 60 % of it); SSE, `liveadvice.py`, Live page groups, Settings > Live. Raid rules unverified on real raid frames |
 | 6 | Hideout levels read from the hideout screen by the auto-scan | Sonnet | after 3 |
 | 7 | App icon in the taskbar: own AppUserModelID + window/taskbar icon (shows the Python icon today), exe icon in the spec | orchestrator | queued |
 | 8 | Integrate, full test suite, rebuild exe, release | orchestrator | last |

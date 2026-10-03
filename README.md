@@ -100,7 +100,20 @@ refreshes the picture and action list by itself when a new result arrives, and t
 what the watcher is doing ("Tarkov not running" / "Watching" / "Scanning..." / "Updated 12 s ago"). **Scan now**
 (or the scan hotkey) rescans the view on screen.
 Turn it off in Settings, or `"auto_scan": false` in `data/settings.json`
-(`"auto_scan_exe"` overrides the process name, `"auto_scan_in_raid": true` allows scans of the in-raid inventory).
+(`"auto_scan_exe"` overrides the process name).
+
+**Live view.** The page subscribes to `GET /api/autoscan/stream` (Server-Sent Events: `{"seq", "state", "scene"}`
+on every new result / state change; the 1.5 s status poll stays as the fallback), fetches the lean result
+(`/api/autoscan/result`, ~50 KB) and the frame JPEG separately (`/api/autoscan/frame?seq=N`, encoded on first
+request, cached by seq). A view is scanned ~0.5 s after it stops changing (4 Hz polling, two identical polls); only the
+tiles whose pixels changed are re-identified (`identify/tilecache.py`: key = tile pixel hash + pitch, LRU of 20 000
+results), so scrolling or moving one item re-reads one or two tiles. In a raid (Settings > Live > Work in raid,
+`live_in_raid`, default on) the inventory / loot you open is scanned too and the payload carries `advice`
+(`liveadvice.py`): **grab** = loot ranked by value per slot (best of trader and flea net, flea only when allowed;
+at most `live_top_n`, at least `live_min_value_per_slot`; items an open quest / the hideout needs come first,
+flagged); **drop** = only when the best grab does not fit into the free cells of rig / pockets / backpack: the
+cheapest-per-slot items on you (never the secure container, special slots, quest items, guns or unsure
+identifications) whose removal makes room, and only when the grab is worth more.
 
 **How it works** (`autoscan/`):
 
@@ -123,13 +136,14 @@ Turn it off in Settings, or `"auto_scan": false` in `data/settings.json`
    each run for 2+ cells. A second check looks for the lobby's bottom menu bar (two black hairline rows with lit UI
    between them): an inventory **without** the bar is the in-raid inventory and is never scanned.
 4. `trigger.py` - state machine: scan only when two consecutive polls are near-identical (stability), the view
-   differs from the last scan (32x32 difference hash, so tooltips and the cursor are ignored but a scroll or tab
-   change is not), at least 3 s after the previous scan; scrolling therefore gives one scan per resting position. A
+   differs from the last scan (32x32 difference hash and >0.15 % of the thumbnail pixels, so the cursor is
+   ignored but a scroll, tab change or a moved item is not), at least 0.5 s after the previous scan; scrolling
+   therefore gives one scan per resting position. A
    failed scan is retried only after a view change or 30 s.
 5. `service.py` - the below-normal-priority polling thread and the `/api/autoscan/{status,result,toggle}` routes.
    `app.py` only gained the `auto_scan` setting, a `frame_bgr` argument on `_sell_scan_inner`, and start/stop.
 
-**Cost.** Polling is 2 Hz while an inventory is on screen, 1 Hz otherwise, 0.5 Hz after ~30 s of gameplay and every
+**Cost.** Polling is 4 Hz while an inventory is on screen, 1 Hz otherwise, 0.5 Hz after ~30 s of gameplay and every
 3 s while the game is not running. The thread runs at `THREAD_PRIORITY_BELOW_NORMAL`, the duplication is released when
 the game is gone / the feature is off, and the identify pipeline never runs outside a settled lobby inventory.
 Measured (idle loop at 2 Hz, 2560x1440, dev machine): grab 3 ms + detect 7 ms per poll, ~5 % of one CPU core
