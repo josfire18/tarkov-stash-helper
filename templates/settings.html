@@ -310,15 +310,25 @@ const SECTIONS = [
     rows: [
       { key: 'auto_scan', type: 'switch', label: 'Auto-scan the stash',
         help: 'Watch the game quietly and scan your stash by itself when you open it – no hotkey needed.' },
-      { key: 'auto_scan_in_raid', type: 'switch', label: 'Also scan during a raid',
-        dimWhen: s => !s.auto_scan,
-        help: 'Also scan when you open your inventory in a raid; off by default so the helper stays idle while you play.' },
       { key: 'hotkey', type: 'hotkey', label: 'Scan hotkey',
         help: 'Rescan from inside the game. Use Ctrl/Alt/Shift plus a key.' },
       { key: 'debug_dumps', type: 'switch', label: 'Keep debug captures',
         help: 'Save the screenshots and results of the last few scans to the data/debug folder – handy for a bug report.' },
     ],
     build: buildScanStatus },
+
+  { id: 'live', title: 'Live', intro: 'What the Live page does while you play.',
+    rows: [
+      { key: 'live_in_raid', type: 'switch', label: 'Work in raid',
+        dimWhen: s => !s.auto_scan,
+        help: 'Read your inventory and the loot you open in a raid: what is worth grabbing, and what to drop when your pockets are full. Scans only while an inventory is on screen.' },
+      { key: 'live_top_n', type: 'number', label: 'Items to highlight', min: 1, max: 20,
+        dimWhen: s => !s.auto_scan || !s.live_in_raid,
+        help: 'How many “worth grabbing” items to show at most (items a quest or the hideout needs always come first).' },
+      { key: 'live_min_value_per_slot', type: 'number', label: 'Worth grabbing from', min: 0, max: 1000000000, step: 1000, unit: 'roubles per slot',
+        dimWhen: s => !s.auto_scan || !s.live_in_raid,
+        help: 'Loot worth less than this per slot is not suggested. Quest and hideout items are suggested whatever they are worth.' },
+    ] },
 
   { id: 'selling', title: 'Selling', intro: null,
     cards: [

@@ -2890,7 +2890,7 @@ def run_server():
     on localhost instead of the old port-80/custom-hostname setup. The window
     below is the only thing that changed; nothing about scanning or OCR was touched."""
     from waitress import serve
-    serve(app, host=HOST, port=PORT, _quiet=True)
+    serve(app, host=HOST, port=PORT, _quiet=True, threads=12)   # SSE streams hold a thread each
 
 
 def migrate_settings(path=None):
