@@ -782,6 +782,24 @@ def default_settings():
         'skip_traders': ['Ref'],   # Ref pays GP coins, not roubles
         'trader_levels': {},       # e.g. {'Ref': 4} - only Ref's pay rate changes with loyalty level
         'auto_scan': True,  # watch the game passively and scan the stash when it settles (autoscan/)
+        'auto_scan_in_raid': False,  # also scan the in-raid inventory (off: only the lobby stash)
+        # Owned by lifecycle.py / eftlogs.py - they define what these do; the Settings page and
+        # _validate_settings only edit and shape-check them.
+        'auto_task_progress': True,   # read completed/failed tasks from EFT's log files
+        'eft_install_dir': None,      # None = auto-detect the game folder
+        'game_mode': 'auto',          # 'auto' | 'pvp' | 'pve'
+        'faction': 'auto',            # 'auto' | 'BEAR' | 'USEC'
+        'start_with_windows': True,   # tiny watcher that opens the app when Tarkov launches
+        'follow_tarkov': True,        # open with Tarkov, close when it exits
+        'show_window_on_game_start': True,
+        # Sell advice: skip the hold-back logic (get_protected_plan honours these)
+        'ignore_task_items': False,     # never hold items back for tasks / Kappa
+        'ignore_hideout_items': False,  # never hold items back for hideout upgrades
+        # Live page (identify inventory grids on the fly; the live viewer owns what these do)
+        'live_viewer': True,               # identify inventory grids on the fly and show them on the Live page
+        'live_in_raid': True,              # also work in raid: what is worth grabbing / what to drop
+        'live_top_n': 5,                   # how many 'worth grabbing' items to highlight (1-20)
+        'live_min_value_per_slot': 10000,  # roubles: ignore loot worth less than this per slot
     }
 
 def default_keep_list():
@@ -1863,15 +1881,183 @@ def calibration_screenshot():
     encoded = base64.b64encode(buf.getvalue()).decode()
     return jsonify({'image': encoded, 'width': img.width, 'height': img.height})
 
+# ---------------------------------------------------------------------------
+# Settings API (the Settings page edits every key below; unknown keys are kept as they are)
+# ---------------------------------------------------------------------------
+
+class _BadSetting(ValueError):
+    """A settings value of the wrong type or outside its choices (the message is shown to the user)."""
+
+
+def _s_bool(v):
+    if isinstance(v, bool):
+        return v
+    raise _BadSetting('must be true or false')
+
+
+def _s_bool_or_none(v):
+    return None if v is None else _s_bool(v)
+
+
+def _s_int(lo, hi, nullable=False):
+    """A whole number, clamped into [lo, hi] (a number outside the range is corrected, not refused)."""
+    def check(v):
+        if v is None and nullable:
+            return None
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise _BadSetting('must be a number')
+        if isinstance(v, float):
+            if v != v or v in (float('inf'), float('-inf')) or not v.is_integer():
+                raise _BadSetting('must be a whole number')
+            v = int(v)
+        return max(lo, min(hi, v))
+    return check
+
+
+def _s_enum(choices):
+    """One of ``choices`` (matched case-insensitively, stored in the canonical spelling)."""
+    canon = {c.lower(): c for c in choices}
+    def check(v):
+        if isinstance(v, str) and v.strip().lower() in canon:
+            return canon[v.strip().lower()]
+        raise _BadSetting('must be one of: ' + ', '.join(choices))
+    return check
+
+
+def _s_text(v):
+    """Free text, trimmed; an empty string means 'not set' (None)."""
+    if v is None:
+        return None
+    if not isinstance(v, str) or '\x00' in v or len(v) > 1024:
+        raise _BadSetting('must be text')
+    return v.strip() or None
+
+
+def _s_hotkey(v):
+    if not isinstance(v, str) or not v.strip():
+        raise _BadSetting('must be a key combination such as <ctrl>+<shift>+s')
+    v = v.strip()
+    try:
+        hotkey_manager.validate(v)
+    except Exception as e:
+        raise _BadSetting(f'is not a valid key combination ({e})')
+    return v
+
+
+def _s_name_list(v):
+    if not isinstance(v, list) or len(v) > 64 or not all(isinstance(n, str) for n in v):
+        raise _BadSetting('must be a list of names')
+    out = []
+    for n in (n.strip() for n in v):
+        if n and len(n) <= 40 and n not in out:
+            out.append(n)
+    return out
+
+
+def _s_trader_levels(v):
+    if not isinstance(v, dict) or len(v) > 64:
+        raise _BadSetting('must be an object of trader name to loyalty level')
+    level = _s_int(1, 4)
+    out = {}
+    for name, lv in v.items():
+        try:
+            out[str(name)] = level(lv)
+        except _BadSetting:
+            raise _BadSetting(f'level for {name} must be a number from 1 to 4')
+    return out
+
+
+def _s_region(v):
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise _BadSetting('must be null or {x, y, w, h}')
+    out = dict(v)
+    for k, lo in (('x', 0), ('y', 0), ('w', 1), ('h', 1)):
+        if k not in v:
+            raise _BadSetting(f'is missing "{k}"')
+        out[k] = _s_int(lo, 100000)(v[k])
+    return out
+
+
+# key -> checker returning the clean value (or raising _BadSetting).  A key that is not listed
+# here is not ours to judge (other modules, hand-edited extras) and is stored as given.
+_SETTING_RULES = {
+    'region': _s_region, 'monitor': _s_int(0, 16), 'hotkey': _s_hotkey, 'prestige': _s_int(0, 6),
+    'scan_countdown': _s_int(0, 10), 'kappa_only_tasks': _s_bool, 'debug_dumps': _s_bool,
+    'flea_requires_fir': _s_bool_or_none, 'flea_offer_slots': _s_int(0, 100),
+    'flea_overflow': _s_enum(('queue', 'trader')), 'flea_min_gain': _s_int(0, 10 ** 9),
+    'intel_center_level': _s_int(0, 3, nullable=True), 'hideout_management_level': _s_int(0, 51),
+    'skip_traders': _s_name_list, 'trader_levels': _s_trader_levels,
+    'auto_scan': _s_bool, 'auto_scan_in_raid': _s_bool, 'auto_scan_exe': _s_text,
+    'auto_task_progress': _s_bool, 'eft_install_dir': _s_text,
+    'game_mode': _s_enum(('auto', 'pvp', 'pve')), 'faction': _s_enum(('auto', 'BEAR', 'USEC')),
+    'start_with_windows': _s_bool, 'follow_tarkov': _s_bool, 'show_window_on_game_start': _s_bool,
+    'ignore_task_items': _s_bool, 'ignore_hideout_items': _s_bool,
+    'live_viewer': _s_bool, 'live_in_raid': _s_bool, 'live_top_n': _s_int(1, 20),
+    'live_min_value_per_slot': _s_int(0, 10 ** 9),
+}
+
+# Modules that must react when a setting changes (lifecycle: the Windows start-up entry, ...)
+# append ``fn(old_settings, new_settings)`` here; a failing hook never fails the save.
+SETTINGS_CHANGED_HOOKS = []
+
+
+def _validate_settings(incoming, current):
+    """``current`` (the stored settings) updated with ``incoming``.  Returns ``(merged, errors)``;
+    ``errors`` maps a key to what is wrong with it and ``merged`` is only good when it is empty.
+    Keys that are not in ``incoming`` are left alone (a partial update never drops a setting) and
+    a value equal to the stored one is not judged again, so a hand-edited oddity in settings.json
+    cannot block every later save."""
+    merged = dict(current)
+    errors = {}
+    for key, value in incoming.items():
+        if key in current and type(current[key]) is type(value) and current[key] == value:
+            continue
+        check = _SETTING_RULES.get(key)
+        try:
+            merged[key] = check(value) if check else value
+        except _BadSetting as e:
+            errors[key] = f'{key} {e}'
+    return merged, errors
+
+
 @app.route('/api/settings', methods=['GET'])
 def get_settings():
-    return jsonify(load_json(SETTINGS_PATH, default_settings))
+    stored = load_json(SETTINGS_PATH, default_settings)
+    if request.args.get('full') in ('1', 'true'):     # the Settings page: stored values over the defaults
+        defaults = default_settings()
+        return jsonify({'settings': {**defaults, **stored}, 'defaults': defaults})
+    return jsonify(stored)
 
 @app.route('/api/settings', methods=['POST'])
 def save_settings():
-    settings = request.json
-    save_json(SETTINGS_PATH, settings)
-    return jsonify({'ok': True})
+    """Merge the posted keys into data/settings.json.  Any bad value refuses the whole request
+    (400, nothing is written); on success the response carries the settings as saved."""
+    incoming = request.get_json(silent=True)
+    if not isinstance(incoming, dict):
+        return jsonify({'ok': False, 'error': 'Expected a JSON object of settings.'}), 400
+    old = load_json(SETTINGS_PATH, default_settings)
+    new, errors = _validate_settings(incoming, old)
+    if errors:
+        return jsonify({'ok': False, 'error': '; '.join(errors.values()), 'errors': errors}), 400
+    if new.get('hotkey') != old.get('hotkey') and hotkey_manager.current is not None:
+        try:
+            hotkey_manager.register(new['hotkey'])      # a changed hotkey takes effect at once
+        except Exception as e:
+            return jsonify({'ok': False, 'error': f'Invalid hotkey: {e}',
+                            'errors': {'hotkey': str(e)}}), 400
+    save_json(SETTINGS_PATH, new)
+    try:
+        autoscanner.poke()                              # Auto-scan on/off and friends: re-evaluate now
+    except Exception:
+        pass
+    for hook in list(SETTINGS_CHANGED_HOOKS):
+        try:
+            hook(old, new)
+        except Exception as e:
+            print(f'[settings] change hook failed: {e}')
+    return jsonify({'ok': True, 'settings': new})
 
 @app.route('/api/reset', methods=['POST'])
 def reset_keep_list():
@@ -2138,6 +2324,10 @@ def api_prestige_advance():
 @app.route('/sell')
 def sell_page():
     return render_template('sell.html')
+
+@app.route('/settings')
+def settings_page():
+    return render_template('settings.html')
 
 def _cache_status(path, kind, count_key):
     """Status of one cache for /api/prices/status: age since last confirmed current, when it was
