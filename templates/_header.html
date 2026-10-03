@@ -1,0 +1,69 @@
+<header class="app-header">
+  <a class="brand" href="/">Tarkov</a>
+  <nav class="tabs" aria-label="Pages">
+    <a class="tab{% if active == 'live' %} active{% endif %}" href="/"{% if active == 'live' %} aria-current="page"{% endif %}>Live</a>
+    <a class="tab{% if active == 'needs' %} active{% endif %}" href="/needs"{% if active == 'needs' %} aria-current="page"{% endif %}>Needs</a>
+    <a class="tab{% if active == 'settings' %} active{% endif %}" href="/settings"{% if active == 'settings' %} aria-current="page"{% endif %}>Settings</a>
+  </nav>
+  <span class="spacer"></span>
+  <span class="pill" id="pill" tabindex="0" role="status"><i class="dot"></i><span id="pill-text">Connecting</span></span>
+</header>
+<div id="toast" role="status" aria-live="polite"></div>
+<script>
+// Shared by every page: JSON helper, toast, money formatting and the one status pill
+// (it polls /api/autoscan/status and tells the page through the 'tsh:status' event).
+window.TSH = (() => {
+  const T = { status: null };
+  T.api = async (method, path, body) => {
+    const r = await fetch(path, { method, cache: 'no-store', headers: { 'Content-Type': 'application/json' },
+                                  body: body === undefined ? undefined : JSON.stringify(body) });
+    let data = null;
+    try { data = await r.json(); } catch (_) {}
+    return Object.assign({ _ok: r.ok, _status: r.status }, data);
+  };
+  let toastTimer;
+  T.toast = (msg, kind, ms) => {
+    const t = document.getElementById('toast');
+    t.textContent = msg; t.className = 'show ' + (kind || '');
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.className = ''; }, ms || 2000);
+  };
+  T.esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  // exact: ₽1 840 000 (thin spaces) · short: ₽1.84M
+  T.rub = n => (n === null || n === undefined) ? '–' : '₽' + Math.round(n).toLocaleString('en-US').replace(/,/g, ' ');
+  T.rubShort = n => {
+    n = Math.round(n || 0);
+    if (n >= 1e6) return '₽' + (n / 1e6).toFixed(2).replace(/\.?0+$/, '') + 'M';
+    if (n >= 1e4) return '₽' + Math.round(n / 1e3) + 'K';
+    return T.rub(n);
+  };
+  T.ago = sec => sec < 90 ? Math.max(0, Math.round(sec)) + ' s ago' : sec < 5400 ? Math.round(sec / 60) + ' min ago' : Math.round(sec / 3600) + ' h ago';
+
+  const pill = document.getElementById('pill'), text = document.getElementById('pill-text');
+  function paint() {
+    const st = T.status;
+    let cls = 'ok', msg = 'Watching', tip = '';
+    if (!st) { cls = 'bad'; msg = 'App not responding'; }
+    else if (!st.enabled) { cls = ''; msg = 'Auto-scan off'; tip = 'Turn it on in Settings.'; }
+    else switch (st.state) {
+      case 'no_game': cls = ''; msg = 'Tarkov not running'; break;
+      case 'minimized': cls = ''; msg = 'Tarkov minimized'; break;
+      case 'covered': cls = 'warn'; msg = 'Window covers the game'; tip = 'Move this window off the game.'; break;
+      case 'scanning': case 'busy': cls = 'busy'; msg = 'Scanning…'; break;
+      case 'raid_inventory': cls = 'warn'; msg = 'Raid inventory not scanned'; tip = 'Settings > Scanning > Also scan during a raid.'; break;
+      case 'failed': case 'error': case 'blank': cls = 'bad'; msg = 'Scan failed'; tip = st.detail || st.message || ''; break;
+      case 'scanned': if (st.last_scan_ts) msg = 'Updated ' + T.ago(Date.now() / 1000 - st.last_scan_ts); break;
+    }
+    if (st && st.game && !tip) tip = `Tarkov ${st.game.size[0]}×${st.game.size[1]}, capture: ${st.backend || '?'}`;
+    pill.className = 'pill ' + cls; text.textContent = msg; pill.title = tip || (st && st.message) || '';
+  }
+  async function poll() {
+    try { T.status = await T.api('GET', '/api/autoscan/status'); } catch (_) { T.status = null; }
+    paint();
+    document.dispatchEvent(new CustomEvent('tsh:status', { detail: T.status }));
+    setTimeout(poll, 1500);
+  }
+  setInterval(paint, 1000);
+  document.addEventListener('DOMContentLoaded', poll);
+  return T;
+})();
+</script>

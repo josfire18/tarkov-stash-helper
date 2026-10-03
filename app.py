@@ -20,7 +20,7 @@ from io import BytesIO
 import re
 import requests as http_requests
 
-from flask import Flask, jsonify, request, render_template
+from flask import Flask, jsonify, request, render_template, redirect
 import mss
 from PIL import Image, ImageDraw
 import pytesseract
@@ -706,7 +706,13 @@ def scan_with_v2(img_bgr, settings, warnings):
                      'x0': 0, 'y0': 0, 'x1': img_bgr.shape[1], 'y1': img_bgr.shape[0]}], True
     print(f"[v2] {len(res.detections)} items in {res.timings.get('total', 0):.2f}s "
           f"({', '.join(f'{k} {v:.2f}' for k, v in res.timings.items() if k != 'total')})")
-    return [d.to_record() for d in res.detections], panels, False
+    records = []
+    for d in res.detections:
+        rec = d.to_record()
+        if d.uncertain:
+            rec['alternatives'] = [a['name'] for a in (d.evidence.get('alternatives') or ())][:3]
+        records.append(rec)
+    return records, panels, False
 
 
 def tesseract_path_override():
@@ -1799,7 +1805,10 @@ class HotkeyManager:
 
     def _on_activate(self):
         print(f"Hotkey {self.current} triggered — scanning...")
-        threading.Thread(target=do_scan, daemon=True).start()
+        if autoscanner.enabled():
+            rescan_now()
+        else:
+            threading.Thread(target=do_scan, daemon=True).start()
 
     def register(self, hotkey_str):
         self.validate(hotkey_str)
@@ -1842,8 +1851,25 @@ def start_hotkey_listener():
 # ---------------------------------------------------------------------------
 
 @app.route('/')
-def index():
-    return render_template('index.html')
+@app.route('/live')
+def live_page():
+    return render_template('live.html')
+
+
+@app.route('/needs')
+def needs_page():
+    return render_template('needs.html')
+
+
+@app.route('/tasks')          # old pages
+@app.route('/keep')
+def tasks_redirect():
+    return redirect('/needs')
+
+
+@app.route('/sell')
+def sell_redirect():
+    return redirect('/')
 
 @app.route('/api/last-scan', methods=['GET'])
 def last_scan():
@@ -1927,6 +1953,8 @@ def add_item():
                 'acquired': False,
                 'source': 'custom',   # wiki sync must never remove user-added items
             }
+            if data.get('tdev_id'):
+                new_item['tdev_id'] = data['tdev_id']
             if 'task' in data:
                 new_item['task'] = data['task']
             if 'count' in data:
@@ -2334,10 +2362,6 @@ def update_apply():
 # Tasks & hideout page
 # ---------------------------------------------------------------------------
 
-@app.route('/tasks')
-def tasks_page():
-    return render_template('tasks.html')
-
 @app.route('/api/tasks', methods=['GET'])
 def api_tasks():
     try:
@@ -2420,6 +2444,48 @@ def api_tasks_have():
     return jsonify({'ok': True, 'have': have[item_id]})
 
 
+@app.route('/api/hideout/level', methods=['POST'])
+def api_hideout_level():
+    """Set a station's level in one call: every level <= `level` counts as built, the rest not."""
+    data = request.get_json(silent=True) or {}
+    station_id = data.get('station_id')
+    try:
+        level = int(data.get('level'))
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'error': 'level must be an integer'}), 400
+    try:
+        cache = get_tasks()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 502
+    station = next((s for s in cache.get('hideoutStations', []) if s.get('id') == station_id), None)
+    if station is None:
+        return jsonify({'ok': False, 'error': 'unknown station'}), 404
+    progress = load_json(PROGRESS_PATH, default_progress)
+    done = set(progress.get('completed_hideout', []))
+    for lv in station.get('levels', []):
+        (done.add if lv['level'] <= level else done.discard)(lv['id'])
+    progress['completed_hideout'] = sorted(done)
+    save_json(PROGRESS_PATH, progress)
+    return jsonify({'ok': True, 'level': level})
+
+
+@app.route('/api/items/search', methods=['GET'])
+def api_items_search():
+    """Autocomplete for the Needs page's "Add item": best name / short-name matches first."""
+    q = (request.args.get('q') or '').strip().lower()
+    if len(q) < 2:
+        return jsonify({'items': []})
+    hits = []
+    for it in _usable_prices(_load_cache(PRICES_PATH) or {}).get('items', []):
+        name, short = it['name'].lower(), (it.get('shortName') or '').lower()
+        if q in name or q in short:
+            rank = 0 if name.startswith(q) or short.startswith(q) else 1
+            hits.append((rank, len(name), it))
+    hits.sort(key=lambda h: h[:2])
+    return jsonify({'items': [{'id': it['id'], 'name': it['name'], 'shortName': it.get('shortName')}
+                              for _, _, it in hits[:12]]})
+
+
 @app.route('/api/prestige', methods=['GET'])
 def api_prestige():
     settings = load_json(SETTINGS_PATH, default_settings)
@@ -2457,10 +2523,6 @@ def api_prestige_advance():
 # ---------------------------------------------------------------------------
 # Sell page
 # ---------------------------------------------------------------------------
-
-@app.route('/sell')
-def sell_page():
-    return render_template('sell.html')
 
 @app.route('/settings')
 def settings_page():
@@ -2635,7 +2697,7 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
                 img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
             else:
                 img, img_bgr = capture_for_scan(settings, from_calibration,
-                                                require_region=True, warnings=warnings)
+                                                require_region=False, warnings=warnings)
         except ScanError as e:
             return jsonify({'image': None, 'results': [], 'grid': None,
                             'grid_failed': False, 'error': str(e)})
@@ -2669,58 +2731,37 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
         if settings.get('debug_dumps', True):
             _save_debug_bundle(img_bgr, panels, raw_detections, 'sell')
 
-        # --- Build every entry, then number them in SELL order ---------------
-        # The list and the badges on the image share one numbering, so badge 1
-        # is the first row to sell: trader items grouped in the game's trader
-        # order (one visit per trader), then the flea offers that fit in the
-        # player's slots by margin, then the flea queue, then KEEP items.
-        # Everything is outlined on the image in its own colour.  The decisions
-        # themselves are sellcalc.plan_entries (pure); this only draws them.
-        draw    = ImageDraw.Draw(img, 'RGBA')
-        skipped_weapons = 0
-
+        # --- Build every entry, numbered in SELL order ---------------------------
+        # The picture goes out untouched: the Live page outlines every tile in its action's
+        # colour client-side.  The decisions themselves are sellcalc.plan_entries (pure).
+        skipped = []          # guns/dogtags: recognised but never priced
         sellable = []
         for d in sorted(raw_detections, key=lambda r: (r['panel'], r['row'], r['col'])):
             badge = skip_badge(id_to_item.get(d['item_id']), d.get('category'))
             if badge:
-                # Guns are never priced (a build can use any of hundreds of parts) and
-                # dogtags come in dozens of identically named themed variants.  Mark them so
-                # the player sees they were recognised, and leave them out of the sell list.
-                draw.rectangle([d['px'], d['py'], d['px'] + d['pw'], d['py'] + d['ph']],
-                               outline=(110, 110, 110, 255), width=2)
-                draw_badge(draw, d['px'] + 2, d['py'] + 2, badge, bg=(80, 80, 80, 220))
-                skipped_weapons += 1
+                skipped.append({'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph'],
+                                'label': badge, 'matched_name': d.get('name')})
             else:
                 sellable.append(d)
+        skipped_weapons = len(skipped)
 
         ctx = build_sell_context(settings, prices)
         results, keep_results = sellcalc.plan_entries(sellable, id_to_item, protected, settings, ctx, any_of)
 
-        for r in results:
-            if r['recommend'] == 'flea':
-                rgb = FLEA_QUEUE_RGB if r.get('flea_queue') else FLEA_RGB
-            else:
-                rgb = TRADER_COLORS_RGB.get(r['trader_name'], DEFAULT_TRADER_BADGE_RGB)
-            draw.rectangle([r['px'], r['py'], r['px'] + r['pw'], r['py'] + r['ph']],
-                           fill=rgb + (40,), outline=rgb + (255,), width=3)
-            draw_badge(draw, r['x'], r['y'], str(r['num']), bg=rgb + (230,))
-
+        alts = {(d['px'], d['py']): d['alternatives'] for d in raw_detections if d.get('alternatives')}
         for k in keep_results:
-            if k.pop('drawn'):
-                # Cyan = KEEP: unmistakably different from flea-green and
-                # trader-gold so "do not sell" reads at a glance.  A stack that
-                # is only partly needed is drawn by its sell row instead.
-                draw.rectangle([k['px'], k['py'], k['px'] + k['pw'], k['py'] + k['ph']],
-                               fill=(0, 180, 220, 60), outline=(0, 220, 255, 255), width=3)
-                draw_badge(draw, k['x'], k['y'], 'CHECK' if k.get('check') else 'KEEP', bg=(0, 140, 180, 230))
+            if k.get('check') and alts.get((k['px'], k['py'])):
+                k['candidates'] = alts[(k['px'], k['py'])]
 
         results.extend(keep_results)   # KEEP items always at the end
 
         buf = BytesIO()
-        img.save(buf, format='PNG')
+        img.save(buf, format='JPEG', quality=88)
         encoded = base64.b64encode(buf.getvalue()).decode()
         return jsonify({
             'image':       encoded,
+            'image_mime':  'image/jpeg',
+            'skipped':     skipped,
             'results':     results,
             'grid':        grid,
             'grid_failed': grid_failed,
@@ -2751,6 +2792,20 @@ autoscanner = autoscan.AutoScanner(_autoscan_scan, _load_settings,
                                    collect_dir=os.path.join(DATA, 'scenes', 'live'))
 app.register_blueprint(autoscan.make_blueprint(
     autoscanner, _load_settings, lambda s: save_json(SETTINGS_PATH, s)))
+def rescan_now():
+    """Scan the view on screen again, even if it has not changed since the last scan."""
+    autoscanner.trigger.reset_view()
+    autoscanner.poke()
+
+
+@app.route('/api/autoscan/rescan', methods=['POST'])
+def autoscan_rescan():
+    if not autoscanner.enabled():
+        return jsonify({'ok': False, 'error': 'Auto-scan is off'}), 409
+    rescan_now()
+    return jsonify({'ok': True})
+
+
 # GET /api/lifecycle/status, POST /api/lifecycle/show (a second launch by hand brings this window up)
 app.register_blueprint(lifecycle.make_blueprint(_load_settings, lambda: _show_window()))
 
