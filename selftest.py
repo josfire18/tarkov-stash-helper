@@ -63,7 +63,7 @@ def run(app_mod) -> dict:
     def ui():
         client = app_mod.app.test_client()
         out = {}
-        for route in ('/', '/sell', '/api/health'):
+        for route in ('/', '/needs', '/settings', '/api/health'):
             r = client.get(route)
             assert r.status_code == 200, f'GET {route} -> {r.status_code}'
             out[route] = len(r.data)

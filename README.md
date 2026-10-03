@@ -24,12 +24,10 @@ sent anywhere except public item-price lookups against [tarkov.dev](https://tark
    (or the Settings toggles `start_with_windows` / `follow_tarkov`) turns that off.
    Launching the app by hand while Tarkov is not running keeps it open until the game
    has started and exited.
-4. First run: build the icon database (button in the app) so it can recognize
-   items. This pulls the item catalog + icons from tarkov.dev and reads EFT's
-   local icon cache if it can find your game install — it can take a few
-   minutes the first time and is cached afterward.
-5. Open your stash with Tarkov running: Auto-scan (below) scans it by itself. Or set a capture
-   region/hotkey in Settings and press the hotkey in-game to scan manually.
+4. Open Tarkov and your stash. The **Live** page shows the captured screen with every item outlined by what to
+   do with it (sell on flea, sell to a trader, keep, check) and updates by itself. **Needs** lists what your
+   quests (read from the game logs), hideout, Kappa and pins still require; **Settings** has the rest. On the very
+   first run the item database builds itself (a few minutes, needs internet; a banner on Live shows progress).
 
 Windows may show a SmartScreen warning on first run because the exe isn't
 code-signed — click "More info" → "Run anyway". This is a local, open-source
@@ -78,8 +76,7 @@ branch.)
 3. `identify/catalog.py` - one `.npz` template catalog of **every** item (ammo, guns, presets
    and containers included) from tarkov.dev base images plus EFT's icon cache (re-associated
    to items on every build; unmatched cache renders are kept as anonymous "build" templates).
-   `data/identify_catalog_v2.npz` is rebuilt automatically when a source changes. The Sell
-   Advisor's **Build Icon DB** button downloads the tarkov.dev base image of every item into
+   `data/identify_catalog_v2.npz` is rebuilt automatically when a source changes. Settings > Data > **Rebuild the item catalog** downloads the tarkov.dev base image of every item into
    `data/tmpl_src/` and then rebuilds this catalog (first run: a few minutes, needs internet).
 4. `identify/match.py` + `ocr.py` + `dino.py` - stage 1 masked pixel residual against
    same-footprint templates (overlay bands only down-weighted, background measured from the
@@ -98,10 +95,11 @@ Other pieces: the UI (`templates/`) is served locally and hosted in a native win
 
 Hands-free mode (default on): the app finds `EscapeFromTarkov.exe`, watches its screen, and when you open an
 inventory screen (stash, container window, trader / flea sell screen) and leave it alone for about a second it runs
-the normal sell scan on the **whole frame** - no capture region, no hotkey, no screenshots to send. The sell page
-shows an **Auto** toggle, a status line ("Waiting for stash" / "Inventory found - waiting for it to settle" /
-"Auto: last scan 3 s ago") and refreshes the picture and list by itself when a new result arrives.
-Turn it off with the Auto checkbox on the Sell page, or `"auto_scan": false` in `data/settings.json`
+the normal sell scan on the **whole frame** - no capture region, no hotkey, no screenshots to send. The Live page
+refreshes the picture and action list by itself when a new result arrives, and the status pill in the header says
+what the watcher is doing ("Tarkov not running" / "Watching" / "Scanning..." / "Updated 12 s ago"). **Scan now**
+(or the scan hotkey) rescans the view on screen.
+Turn it off in Settings, or `"auto_scan": false` in `data/settings.json`
 (`"auto_scan_exe"` overrides the process name, `"auto_scan_in_raid": true` allows scans of the in-raid inventory).
 
 **How it works** (`autoscan/`):
@@ -183,13 +181,13 @@ counted for segmentation). See `identify/evaltools.py` for the format.
 
 Prices, items, tasks and hideout requirements come from tarkov.dev's static JSON documents
 (`https://json.tarkov.dev/regular/...`, the ones tarkov.dev's own site uses) via `tarkovdata.py`;
-its GraphQL API is only the fallback, then the last good cache (the Sell Advisor then shows the
+its GraphQL API is only the fallback, then the last good cache (the Live page then shows the
 prices as stale). While the app runs a background thread checks items/prices every 15 minutes
 (an unchanged data set is a cheap `304 Not Modified`) and tasks/hideout/traders every 3 hours, and
 immediately at startup when a cache is older than that. A refresh never replaces a good cache with
 an empty or partial one. When new item ids appear, their base images are downloaded and the item
 catalog is rebuilt in the background and swapped into the engine (after a running scan finishes) -
-no need to press Build Icon DB again. `GET /api/prices/status` reports the source, age, item count
-and last error; the Sell Advisor header shows the same. `data/tarkovdev_meta.json` holds the ETags
+no need to rebuild the catalog by hand. `GET /api/prices/status` reports the source, age, item count
+and last error; Settings > Data shows the same. `data/tarkovdev_meta.json` holds the ETags
 and bookkeeping (safe to delete).
 

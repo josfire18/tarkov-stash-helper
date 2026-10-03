@@ -1,0 +1,113 @@
+/* Shared by Live, Needs and Settings (pulled in inline by Jinja include). */
+:root {
+  --bg: #0d0f10; --panel: #131618; --panel-2: #161a1b; --raise: #1b2022;
+  --line: #1e2224; --line-2: #2a2e30;
+  --text: #c8c0b0; --strong: #e8e0d0; --dim: #8f897c; --faint: #6f6a60;
+  --gold: #c4a040; --green: #8fcc5a; --amber: #e0a030; --red: #e07070; --blue: #5aaae0;
+  --flea: #3fae4a; --keep: #2fc4e8; --check: #e8a33d; --trader: #b48014;
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px;
+  --r: 3px; --fs: 13px; --fs-s: 12px; --fs-xs: 11px;
+  --header-h: 44px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--bg); color: var(--text);
+  font: var(--fs)/1.4 'Segoe UI', system-ui, sans-serif;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+a { color: var(--blue); }
+:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+[hidden] { display: none !important; }
+
+/* Header: logo, three tabs, one status pill */
+.app-header {
+  height: var(--header-h); flex: none; display: flex; align-items: stretch;
+  padding: 0 var(--s4); background: var(--panel-2); border-bottom: 1px solid var(--line-2);
+}
+.brand {
+  display: flex; align-items: center; padding-right: var(--s4); margin-right: var(--s2);
+  border-right: 1px solid var(--line-2); text-decoration: none;
+  color: var(--gold); font-size: 14px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
+}
+.tabs { display: flex; align-items: stretch; }
+.tab {
+  display: flex; align-items: center; padding: 0 var(--s4); color: var(--dim); text-decoration: none;
+  font-size: var(--fs-s); border-bottom: 2px solid transparent; transition: color .15s, border-color .15s;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--gold); border-bottom-color: var(--gold); }
+.spacer { flex: 1; }
+.pill {
+  align-self: center; display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px;
+  border: 1px solid var(--line-2); border-radius: 12px; background: var(--panel);
+  font-size: var(--fs-xs); color: var(--dim); white-space: nowrap; cursor: default;
+}
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: #444; flex: none; }
+.pill.ok { color: var(--text); } .pill.ok .dot { background: #4a9a2a; }
+.pill.busy { color: var(--text); } .pill.busy .dot { background: var(--amber); animation: pulse 1s ease-in-out infinite; }
+.pill.warn { color: var(--amber); } .pill.warn .dot { background: var(--amber); }
+.pill.bad { color: var(--red); } .pill.bad .dot { background: #b03a3a; }
+@keyframes pulse { 50% { opacity: .25; } }
+
+/* Controls */
+button {
+  background: #252a2b; color: var(--text); border: 1px solid #3a3e40; padding: 6px 14px; border-radius: var(--r);
+  font: inherit; font-size: var(--fs-s); cursor: pointer; white-space: nowrap; transition: background .15s, border-color .15s;
+}
+button:hover { background: #2e3335; border-color: #555; }
+button:disabled { opacity: .4; cursor: default; }
+button.primary { background: #2a3a1e; border-color: #4a7a2a; color: var(--green); }
+button.primary:hover { background: #334a22; }
+button.quiet { background: none; border-color: var(--line-2); color: var(--dim); padding: 4px 10px; }
+button.quiet:hover { color: var(--text); border-color: #555; }
+button.link { background: none; border: 0; padding: 2px 4px; color: var(--dim); font-size: var(--fs-xs); }
+button.link:hover { color: var(--text); text-decoration: underline; }
+button.step { width: 24px; height: 24px; padding: 0; line-height: 1; font-size: 15px; }
+input[type=text], input[type=search], input[type=number], select {
+  background: var(--bg); border: 1px solid var(--line-2); color: var(--text); padding: 6px 10px;
+  font: inherit; font-size: var(--fs-s); border-radius: var(--r); max-width: 100%;
+}
+input:focus, select:focus { outline: none; border-color: var(--gold); }
+input:focus-visible, select:focus-visible { outline: 2px solid var(--gold); outline-offset: 1px; }
+::placeholder { color: var(--faint); }
+
+.seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: var(--r); overflow: hidden; }
+.seg button { border: 0; border-radius: 0; background: var(--panel); color: var(--dim); padding: 5px 12px; }
+.seg button + button { border-left: 1px solid var(--line-2); }
+.seg button:hover { background: var(--raise); color: var(--text); }
+.seg button[aria-pressed=true] { background: #2b2614; color: var(--gold); }
+
+.badge {
+  display: inline-block; padding: 0 6px; border-radius: 2px; font-size: 10px; font-weight: 700; letter-spacing: .5px;
+  line-height: 16px; text-transform: uppercase; border: 1px solid var(--line-2); color: var(--dim); vertical-align: 1px;
+}
+.badge.fir { color: var(--check); border-color: #6a4a10; background: #241a08; }
+.badge.kappa { color: var(--gold); border-color: #5a4a20; }
+
+.banner {
+  flex: none; display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s4);
+  background: #231c08; border-bottom: 1px solid #5a4510; color: var(--gold); font-size: var(--fs-s);
+}
+.banner.info { background: #0e1c20; border-color: #1a4a5a; color: #6ad4ee; }
+
+.scroll { overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--line-2) var(--bg); }
+.scroll::-webkit-scrollbar { width: 6px; }
+.scroll::-webkit-scrollbar-track { background: var(--bg); }
+.scroll::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 3px; }
+
+#toast {
+  position: fixed; bottom: var(--s5); right: var(--s5); max-width: calc(100vw - 48px); z-index: 2000;
+  background: var(--panel-2); border: 1px solid #3a3e40; padding: 8px 14px; border-radius: 4px;
+  font-size: var(--fs-s); opacity: 0; transition: opacity .3s; pointer-events: none;
+}
+#toast.show { opacity: 1; }
+#toast.ok { border-color: #3a6a22; color: var(--green); }
+#toast.bad { border-color: #7a2a2a; color: var(--red); }
+
+@media (max-width: 1000px) {
+  .app-header { padding: 0 var(--s3); }
+  .tab { padding: 0 var(--s3); }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }

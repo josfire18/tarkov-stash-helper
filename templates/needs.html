@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Needs — Tarkov Stash Helper</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='4' r='2.5' fill='none' stroke='%23c4a040' stroke-width='1.5'/%3E%3Crect x='4' y='7' width='24' height='22' rx='4' ry='4' fill='%230d0f10' stroke='%23c4a040' stroke-width='1.5'/%3E%3Cline x1='9' y1='14' x2='23' y2='14' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3Cline x1='9' y1='18' x2='23' y2='18' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3Cline x1='9' y1='22' x2='19' y2='22' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3C/svg%3E">
+<style>
+{% include '_base.css' %}
+
+.page { flex: 1; min-height: 0; }
+.wrap { max-width: 860px; margin: 0 auto; padding: 0 var(--s4) var(--s5); }
+.controls {
+  position: sticky; top: 0; z-index: 5; background: var(--bg); padding: var(--s3) 0 var(--s2);
+  border-bottom: 1px solid var(--line);
+}
+.controls .line { display: flex; gap: var(--s3); align-items: center; flex-wrap: wrap; }
+.controls input[type=search] { flex: 1 1 200px; min-width: 140px; }
+.seg .c { color: var(--faint); margin-left: 5px; font-size: var(--fs-xs); }
+.seg button[aria-pressed=true] .c { color: var(--gold); opacity: .7; }
+.sync { margin-top: var(--s2); font-size: var(--fs-xs); color: var(--dim); }
+.sync.warn { color: var(--amber); }
+
+.card { margin-top: var(--s3); background: var(--panel); border: 1px solid var(--line); border-radius: 4px; }
+.card > header {
+  display: flex; align-items: center; gap: var(--s3); padding: 9px var(--s3); cursor: pointer; user-select: none;
+}
+.card > header h2 { font-size: var(--fs-xs); font-weight: 700; letter-spacing: 1.2px; text-transform: uppercase; color: var(--gold); }
+.card > header .meta { color: var(--dim); font-size: var(--fs-xs); }
+.card > header .chev { margin-left: auto; color: var(--dim); transition: transform .15s; }
+.card.open > header .chev { transform: rotate(90deg); }
+.card > .body { display: none; padding: 0 var(--s3) var(--s3); }
+.card.open > .body { display: block; }
+
+.stations { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 2px var(--s4); }
+.station { display: flex; align-items: center; gap: var(--s2); padding: 4px 0; border-bottom: 1px solid var(--line); }
+.station .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.station.maxed .nm { color: var(--dim); }
+.stepper { display: inline-flex; align-items: center; gap: 6px; }
+.stepper .v { min-width: 44px; text-align: center; font-variant-numeric: tabular-nums; color: var(--strong); }
+.stepper .v i { color: var(--faint); font-style: normal; }
+
+.list { margin-top: var(--s3); border-top: 1px solid var(--line); }
+.item { border-bottom: 1px solid var(--line); }
+.item .main { display: flex; align-items: center; gap: var(--s3); padding: 8px var(--s1); cursor: pointer; }
+.item .main:hover { background: var(--panel); }
+.item .info { flex: 1; min-width: 0; }
+.item .nm { color: var(--strong); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item .sub { color: var(--dim); font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item.done .nm { color: var(--dim); text-decoration: line-through; }
+.item.done .stepper .v { color: var(--green); }
+.item .ctl { display: flex; align-items: center; gap: var(--s2); flex: none; }
+.item .srcs { display: none; padding: 2px var(--s1) var(--s3) var(--s4); }
+.item.open .srcs { display: block; }
+.srcs .s { display: flex; gap: var(--s2); align-items: baseline; font-size: var(--fs-s); color: var(--text); padding: 2px 0; }
+.srcs .s .q { min-width: 44px; color: var(--dim); }
+.check { display: inline-flex; align-items: center; gap: 7px; color: var(--dim); font-size: var(--fs-s); cursor: pointer; }
+.check input { width: 16px; height: 16px; accent-color: #4a9a2a; cursor: pointer; }
+.x { background: none; border: 0; color: var(--faint); padding: 2px 6px; font-size: 16px; line-height: 1; }
+.x:hover { color: var(--red); background: none; }
+
+.group-h { margin-top: var(--s4); padding: 6px var(--s1); font-size: var(--fs-xs); font-weight: 700; letter-spacing: .8px;
+           text-transform: uppercase; color: var(--dim); border-bottom: 1px solid var(--line-2); display: flex; gap: var(--s2); }
+.group-h .r { margin-left: auto; font-weight: 400; letter-spacing: 0; text-transform: none; }
+.qtools { text-align: right; padding-top: 2px; }
+.qrow { display: flex; align-items: center; gap: var(--s3); padding: 6px var(--s1); border-bottom: 1px solid var(--line); }
+.qrow .nm { flex: 1; min-width: 0; }
+.qrow .nm > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qrow .nm .its { color: var(--dim); font-size: var(--fs-xs); }
+.qrow .lv { color: var(--faint); font-size: var(--fs-xs); }
+.qrow.done .nm span:first-child { color: var(--dim); }
+.auto { color: var(--faint); font-size: 10px; }
+
+.add { position: relative; margin-top: var(--s3); }
+.add input { width: 100%; padding: 8px 10px; }
+.ac { position: absolute; left: 0; right: 0; top: 100%; z-index: 6; background: var(--panel-2); border: 1px solid var(--line-2);
+      border-radius: 0 0 var(--r) var(--r); max-height: 280px; overflow-y: auto; }
+.ac div { padding: 7px 10px; cursor: pointer; display: flex; gap: var(--s2); }
+.ac div .sn { color: var(--faint); margin-left: auto; }
+.ac div[aria-selected=true], .ac div:hover { background: var(--raise); color: var(--strong); }
+
+.pres { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: var(--s2) var(--s4); }
+.pres div { font-size: var(--fs-s); }
+.pres b { display: block; color: var(--dim); font-weight: 400; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .6px; }
+.empty { padding: var(--s5) 0; text-align: center; color: var(--dim); }
+</style>
+</head>
+<body>
+{% set active = 'needs' %}{% include '_header.html' %}
+
+<main class="page scroll">
+<div class="wrap">
+  <div class="controls">
+    <div class="line">
+      <input type="search" id="q" placeholder="Search items" aria-label="Search items">
+      <div class="seg" id="seg" role="group" aria-label="Show"></div>
+    </div>
+    <div class="sync" id="sync"></div>
+  </div>
+
+  <section class="card" id="hideout" hidden>
+    <header id="hideout-h" tabindex="0" role="button" aria-expanded="false">
+      <h2>Hideout</h2><span class="meta" id="hideout-meta"></span><span class="chev">&#9656;</span>
+    </header>
+    <div class="body"><div class="stations" id="stations"></div></div>
+  </section>
+
+  <div class="add" id="add" hidden>
+    <input type="text" id="add-q" placeholder="Add item by name" autocomplete="off" role="combobox"
+           aria-expanded="false" aria-controls="ac" aria-label="Add item to pin">
+    <div class="ac" id="ac" role="listbox" hidden></div>
+  </div>
+
+  <section class="card" id="quests" hidden>
+    <header id="quests-h" tabindex="0" role="button" aria-expanded="false">
+      <h2>Hand-in quests</h2><span class="meta" id="quests-meta"></span><span class="chev">&#9656;</span>
+    </header>
+    <div class="body" id="quests-b"></div>
+  </section>
+  <div class="list" id="list"></div>
+  <section class="card" id="prestige" hidden>
+    <header id="prestige-h" tabindex="0" role="button" aria-expanded="false">
+      <h2 id="prestige-t">Prestige</h2><span class="chev">&#9656;</span>
+    </header>
+    <div class="body"><div class="pres" id="prestige-b"></div></div>
+  </section>
+</div>
+</main>
+
+<script>
+const { api, esc, toast } = TSH;
+const $ = id => document.getElementById(id);
+const store = {
+  get: k => { try { return localStorage.getItem(k); } catch (_) { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch (_) {} },
+};
+
+let view = null, keep = null, prestige = null;
+let filter = 'all', query = '';
+let showDoneQuests = false;
+const open = new Set();           // item ids with their sources open
+const touched = new Set();        // rows kept visible after reaching "done" this visit
+const MONEY = new Set(['Roubles', 'Dollars', 'Euros']);
+
+// ---- model ----------------------------------------------------------------------------------
+function buildRows() {
+  const rows = new Map();
+  const row = (id, name) => { if (!rows.has(id)) rows.set(id, { id, name, kinds: new Set(), srcs: [], have: 0, need: 0, fir: 0, step: false }); return rows.get(id); };
+  for (const rec of view.aggregate) {
+    if (MONEY.has(rec.name)) continue;
+    const r = row(rec.item_id, rec.name);
+    Object.assign(r, { have: rec.have, need: rec.total_needed, fir: rec.fir_needed, step: true });
+    for (const s of rec.sources) {
+      const kind = s.type === 'hideout' ? 'hideout' : 'quest';
+      r.kinds.add(kind);
+      r.srcs.push({ kind, count: s.count, fir: s.fir, label: s.name.replace(/^.*? — /, '') });
+    }
+  }
+  for (const cat of keep.categories) for (const e of cat.items) {
+    const kappa = cat.id === 'kappa';
+    if (!kappa && e.source !== 'custom') continue;                   // legacy defaults: still protect, not shown
+    const id = e.tdev_id || 'k:' + e.id;
+    const r = row(id, e.name);
+    r.kinds.add(kappa ? 'kappa' : 'pin');
+    r.srcs.push({ kind: kappa ? 'kappa' : 'pin', count: 1, fir: kappa, label: kappa ? 'Kappa (Collector)' : 'Pinned' });
+    r[kappa ? 'kappaEntry' : 'pinEntry'] = e;
+  }
+  return [...rows.values()];
+}
+const isDone = r => r.step ? r.have >= r.need : false;
+const remaining = r => {            // does the player still need it, as seen from the current filter?
+  if (filter === 'kappa') return r.kinds.has('kappa');
+  if (filter === 'pinned') return r.kinds.has('pin');
+  const open = (r.step && !isDone(r)) || (r.kappaEntry && !r.kappaEntry.acquired) || (r.pinEntry && !r.pinEntry.acquired);
+  return open || touched.has(r.id);
+};
+function visible(rows) {
+  const q = query.toLowerCase();
+  return rows.filter(r => {
+    if (filter === 'quests' && !r.kinds.has('quest')) return false;
+    if (filter === 'hideout' && !r.kinds.has('hideout')) return false;
+    if (filter === 'kappa' && !r.kinds.has('kappa')) return false;
+    if (filter === 'pinned' && !r.kinds.has('pin')) return false;
+    if (q && !r.name.toLowerCase().includes(q)) return false;
+    return remaining(r);
+  }).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// ---- rendering ------------------------------------------------------------------------------
+function firBadge(r) {
+  if (!r.fir) return '';
+  const part = r.step && r.fir < r.need ? ' ×' + r.fir : '';
+  return ` <span class="badge fir" title="Found in Raid">FiR${part}</span>`;
+}
+function subText(r) {
+  const n = k => r.srcs.filter(s => s.kind === k).length;
+  const bits = [];
+  if (n('quest')) bits.push(n('quest') + (n('quest') === 1 ? ' quest' : ' quests'));
+  if (n('hideout')) bits.push(n('hideout') + ' hideout');
+  if (n('kappa')) bits.push('Kappa');
+  if (n('pin')) bits.push('Pinned');
+  return bits.join(' · ');
+}
+function itemEl(r) {
+  const el = document.createElement('div');
+  el.className = 'item' + (isDone(r) ? ' done' : '') + (open.has(r.id) ? ' open' : '');
+  const main = document.createElement('div');
+  main.className = 'main'; main.tabIndex = 0; main.setAttribute('role', 'button');
+  main.setAttribute('aria-expanded', open.has(r.id));
+  main.innerHTML = `<div class="info"><div class="nm">${esc(r.name)}${firBadge(r)}</div><div class="sub">${esc(subText(r))}</div></div><div class="ctl"></div>`;
+  const ctl = main.querySelector('.ctl');
+  const e = r.kappaEntry && filter === 'kappa' ? r.kappaEntry : (!r.step && r.kappaEntry ? r.kappaEntry : null);
+  if (r.step && !(filter === 'kappa' || filter === 'pinned')) {
+    ctl.innerHTML = `<span class="stepper"><button class="step" aria-label="Have one less">&minus;</button><span class="v num"><b>${r.have}</b> <i>/</i> ${r.need}</span><button class="step" aria-label="Have one more">+</button></span>`;
+    const [minus, plus] = ctl.querySelectorAll('button');
+    minus.onclick = ev => { ev.stopPropagation(); bump(r, -1); };
+    plus.onclick = ev => { ev.stopPropagation(); bump(r, +1); };
+  } else if (filter === 'pinned' || (!r.step && r.pinEntry && !r.kappaEntry)) {
+    const p = r.pinEntry;
+    ctl.innerHTML = `<label class="check"><input type="checkbox" ${p.acquired ? 'checked' : ''}> Got it</label><button class="x" aria-label="Remove ${esc(r.name)}" title="Remove">&times;</button>`;
+    ctl.querySelector('input').onchange = () => toggleEntry(p, r);
+    ctl.querySelector('.x').onclick = ev => { ev.stopPropagation(); removePin(p); };
+  } else if (e) {
+    ctl.innerHTML = `<label class="check"><input type="checkbox" ${e.acquired ? 'checked' : ''}> Handed in</label>`;
+    ctl.querySelector('input').onchange = () => toggleEntry(e, r);
+    if (e.acquired) el.classList.add('done');
+  }
+  for (const c of ctl.children) c.addEventListener('click', ev => ev.stopPropagation());
+  const toggle = () => { open.has(r.id) ? open.delete(r.id) : open.add(r.id); el.classList.toggle('open'); main.setAttribute('aria-expanded', open.has(r.id)); };
+  main.onclick = toggle;
+  main.onkeydown = ev => { if (ev.target === main && (ev.key === 'Enter' || ev.key === ' ')) { ev.preventDefault(); toggle(); } };
+  const srcs = document.createElement('div');
+  srcs.className = 'srcs';
+  srcs.innerHTML = r.srcs.map(s => `<div class="s"><span class="q num">×${s.count}</span><span>${esc(s.label)}${s.fir ? ' <span class="badge fir">FiR</span>' : ''}</span></div>`).join('');
+  el.append(main, srcs);
+  return el;
+}
+
+function renderList() {
+  const rows = visible(buildRows());
+  const list = $('list');
+  list.innerHTML = '';
+  if (!rows.length) {
+    const msg = query ? 'No matches' : filter === 'pinned' ? 'Nothing pinned' : 'Nothing needed';
+    list.innerHTML = `<div class="empty">${msg}</div>`;
+  }
+  for (const r of rows) list.append(itemEl(r));
+  renderSeg();
+}
+
+function renderSeg() {
+  const saved = filter;
+  const count = f => { filter = f; const n = visible(buildRows().filter(() => true)).length; return n; };
+  const q = query; query = '';
+  const nums = { all: count('all'), quests: count('quests'), hideout: count('hideout'), kappa: count('kappa'), pinned: count('pinned') };
+  filter = saved; query = q;
+  const labels = { all: 'All', quests: 'Quests', hideout: 'Hideout', kappa: 'Kappa', pinned: 'Pinned' };
+  const seg = $('seg');
+  seg.innerHTML = Object.keys(labels).map(k => `<button data-f="${k}" aria-pressed="${k === filter}">${labels[k]}<span class="c">${nums[k]}</span></button>`).join('');
+  for (const b of seg.children) b.onclick = () => setFilter(b.dataset.f);
+}
+
+function setFilter(f) {
+  filter = f; touched.clear();
+  store.set('needs.filter', f);
+  $('add').hidden = f !== 'pinned';
+  renderList(); renderQuests(); renderHideout(); renderPrestige();
+  if (f === 'pinned') $('add-q').focus();
+}
+
+// ---- quests (under the Quests filter) --------------------------------------------------------
+let questsOpen = false;
+function renderQuests() {
+  const card = $('quests'), box = $('quests-b');
+  card.hidden = filter !== 'quests';
+  if (card.hidden) return;
+  card.classList.toggle('open', questsOpen);
+  $('quests-h').setAttribute('aria-expanded', questsOpen);
+  const q = query.toLowerCase(), auto = new Set(view.auto_done || []);
+  const tasks = view.tasks.filter(t => (showDoneQuests || !t.completed)
+    && (!q || t.name.toLowerCase().includes(q) || t.trader.toLowerCase().includes(q)));
+  $('quests-meta').textContent = `${view.tasks.filter(t => !t.completed).length} open`;
+  box.innerHTML = `<div class="qtools"><button class="link" id="toggle-done">${showDoneQuests ? 'Hide' : 'Show'} completed</button></div>`;
+  $('toggle-done').onclick = () => { showDoneQuests = !showDoneQuests; renderQuests(); };
+  const by = {};
+  for (const t of tasks) (by[t.trader] = by[t.trader] || []).push(t);
+  for (const trader of Object.keys(by).sort()) {
+    const th = document.createElement('div');
+    th.className = 'group-h'; th.style.marginTop = '8px';
+    th.textContent = trader;
+    box.append(th);
+    for (const t of by[trader].sort((a, b) => a.minPlayerLevel - b.minPlayerLevel)) {
+      const el = document.createElement('div');
+      el.className = 'qrow' + (t.completed ? ' done' : '');
+      el.innerHTML = `<label class="check"><input type="checkbox" ${t.completed ? 'checked' : ''} aria-label="${esc(t.name)} completed"></label>
+        <div class="nm"><span>${esc(t.name)}${auto.has(t.id) ? ' <span class="auto" title="Completed according to your game logs">auto</span>' : ''}${t.kappaRequired ? ' <span class="badge kappa">Kappa</span>' : ''}</span>
+        <span class="its">${esc(t.items.map(i => `${i.count}× ${i.name}${i.fir ? ' FiR' : ''}`).join(' · '))}</span></div>
+        <span class="lv num">${t.minPlayerLevel ? 'L' + t.minPlayerLevel : ''}</span>`;
+      el.querySelector('input').onchange = ev => complete('task', t.id, ev.target.checked);
+      box.append(el);
+    }
+  }
+  if (!tasks.length) box.insertAdjacentHTML('beforeend', '<div class="empty">No quests</div>');
+}
+function toggleQuests() { questsOpen = !questsOpen; renderQuests(); }
+$('quests-h').onclick = toggleQuests;
+$('quests-h').onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleQuests(); } };
+
+// ---- hideout ---------------------------------------------------------------------------------
+const curLevel = s => s.levels.reduce((m, l) => l.completed ? Math.max(m, l.level) : m, 0);
+function renderHideout() {
+  const card = $('hideout');
+  const stations = view.stations;
+  card.hidden = !stations.length || !['all', 'hideout'].includes(filter);
+  if (card.hidden) return;
+  const maxOf = s => Math.max(...s.levels.map(l => l.level));
+  const done = stations.reduce((t, s) => t + curLevel(s), 0), total = stations.reduce((t, s) => t + maxOf(s), 0);
+  $('hideout-meta').textContent = `${done} / ${total} levels`;
+  const q = query.toLowerCase();
+  const box = $('stations');
+  box.innerHTML = '';
+  for (const s of stations) {
+    if (q && !s.name.toLowerCase().includes(q)) continue;
+    const cur = curLevel(s), max = maxOf(s);
+    const el = document.createElement('div');
+    el.className = 'station' + (cur >= max ? ' maxed' : '');
+    el.innerHTML = `<span class="nm" title="${esc(s.name)}">${esc(s.name)}</span><span class="stepper">
+      <button class="step" aria-label="Lower ${esc(s.name)} level" ${cur <= 0 ? 'disabled' : ''}>&minus;</button>
+      <span class="v num">${cur} <i>/</i> ${max}</span>
+      <button class="step" aria-label="Raise ${esc(s.name)} level" ${cur >= max ? 'disabled' : ''}>+</button></span>`;
+    const [minus, plus] = el.querySelectorAll('button');
+    minus.onclick = () => setLevel(s, cur - 1);
+    plus.onclick = () => setLevel(s, cur + 1);
+    box.append(el);
+  }
+  if (!box.children.length) box.innerHTML = '<div class="empty">No stations</div>';
+  const pref = store.get('needs.hideout');       // set only when the player opens/closes it by hand
+  setHideoutOpen(pref === null ? (done === 0 || hideoutTouched) : pref === '1', false);
+}
+let hideoutTouched = false;
+function setHideoutOpen(on, remember) {
+  $('hideout').classList.toggle('open', on);
+  $('hideout-h').setAttribute('aria-expanded', on);
+  if (remember) store.set('needs.hideout', on ? '1' : '0');
+}
+$('hideout-h').onclick = () => setHideoutOpen(!$('hideout').classList.contains('open'), true);
+$('hideout-h').onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('hideout-h').click(); } };
+
+async function setLevel(s, level) {
+  const res = await api('POST', '/api/hideout/level', { station_id: s.id, level });
+  if (!res.ok) return toast(res.error || 'Couldn’t save', 'bad');
+  hideoutTouched = true;
+  await load();
+}
+
+// ---- prestige --------------------------------------------------------------------------------
+function renderPrestige() {
+  const card = $('prestige');
+  const cur = prestige && prestige.current;
+  const row = prestige && (prestige.levels || []).find(l => l.level === cur + 1);
+  if (!row || !['all', 'kappa'].includes(filter)) { card.hidden = true; return; }
+  card.hidden = false;
+  $('prestige-t').textContent = `Prestige ${cur + 1}`;
+  const f = [['PMC level', row.pmc_level], ['Quests', row.quests], ['Skills', row.skills], ['Hideout', row.hideout], ['Items', row.items]];
+  $('prestige-b').innerHTML = f.filter(x => x[1] && x[1] !== 'N/A').map(([k, v]) => `<div><b>${k}</b>${esc(v)}</div>`).join('');
+}
+function togglePrestige() {
+  const on = !$('prestige').classList.contains('open');
+  $('prestige').classList.toggle('open', on); $('prestige-h').setAttribute('aria-expanded', on);
+}
+$('prestige-h').onclick = togglePrestige;
+$('prestige-h').onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); togglePrestige(); } };
+
+// ---- sync line -------------------------------------------------------------------------------
+function renderSync() {
+  const tp = view.task_progress, el = $('sync');
+  el.className = 'sync';
+  if (!tp || !tp.enabled) { el.className = 'sync warn'; el.innerHTML = 'Quest sync is off · <a href="/settings">Settings</a>'; }
+  else if (tp.log) el.textContent = `Quests synced from game logs · ${tp.log.completed} done`;
+  else { el.className = 'sync warn'; el.innerHTML = 'Couldn’t read the game logs · <a href="/settings">Settings</a>'; }
+}
+
+// ---- actions ---------------------------------------------------------------------------------
+async function bump(r, delta) {
+  const res = await api('POST', '/api/tasks/have', { item_id: r.id, delta });
+  if (!res.ok) return toast('Couldn’t save', 'bad');
+  r.have = res.have;
+  const rec = view.aggregate.find(a => a.item_id === r.id);
+  if (rec) rec.have = res.have;
+  touched.add(r.id);
+  renderList();
+}
+async function complete(type, id, done) {
+  const res = await api('POST', '/api/tasks/complete', { type, id, done });
+  if (!res.ok) return toast(res.error || 'Couldn’t save', 'bad');
+  await load();
+}
+async function toggleEntry(e, r) {
+  const res = await api('POST', '/api/keep-list/toggle', { id: e.id });
+  if (!res.ok) return toast('Couldn’t save', 'bad');
+  e.acquired = res.acquired; touched.add(r.id);
+  renderList();
+}
+async function removePin(e) {
+  await api('DELETE', '/api/keep-list/remove/' + encodeURIComponent(e.id));
+  await load();
+}
+
+// ---- add item with autocomplete ---------------------------------------------------------------
+let acItems = [], acSel = -1, acTimer = 0;
+function acClose() { $('ac').hidden = true; $('add-q').setAttribute('aria-expanded', 'false'); acItems = []; acSel = -1; }
+function acPaint() {
+  const box = $('ac');
+  box.innerHTML = acItems.map((it, i) => `<div role="option" id="ac${i}" aria-selected="${i === acSel}" data-i="${i}">${esc(it.name)}<span class="sn">${esc(it.shortName || '')}</span></div>`).join('');
+  box.hidden = !acItems.length;
+  $('add-q').setAttribute('aria-expanded', String(!box.hidden));
+  for (const d of box.children) d.onmousedown = ev => { ev.preventDefault(); pick(acItems[+d.dataset.i]); };
+}
+async function pick(it) {
+  acClose(); $('add-q').value = '';
+  const dup = keep.categories.some(c => c.items.some(e => e.tdev_id === it.id || e.name.toLowerCase() === it.name.toLowerCase()));
+  if (dup) return toast('Already on your list');
+  const res = await api('POST', '/api/keep-list/add', { name: it.name, tdev_id: it.id, category: 'tasks' });
+  if (!res.ok) return toast('Couldn’t add', 'bad');
+  await load();
+}
+$('add-q').addEventListener('input', e => {
+  clearTimeout(acTimer);
+  const q = e.target.value.trim();
+  if (q.length < 2) return acClose();
+  acTimer = setTimeout(async () => {
+    const res = await api('GET', '/api/items/search?q=' + encodeURIComponent(q));
+    if ($('add-q').value.trim() !== q) return;
+    acItems = res.items || []; acSel = acItems.length ? 0 : -1; acPaint();
+  }, 150);
+});
+$('add-q').addEventListener('keydown', e => {
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (!acItems.length) return;
+    acSel = (acSel + (e.key === 'ArrowDown' ? 1 : -1) + acItems.length) % acItems.length; acPaint();
+  } else if (e.key === 'Enter' && acItems[acSel]) { e.preventDefault(); pick(acItems[acSel]); }
+  else if (e.key === 'Escape') acClose();
+});
+$('add-q').addEventListener('blur', acClose);
+
+// ---- load ------------------------------------------------------------------------------------
+$('q').addEventListener('input', e => { query = e.target.value.trim(); renderList(); renderQuests(); renderHideout(); });
+
+async function load() {
+  const [v, k] = await Promise.all([api('GET', '/api/tasks'), api('GET', '/api/keep-list')]);
+  if (v.error || !v.aggregate) {
+    $('list').innerHTML = `<div class="empty">Couldn’t load quests and hideout data</div>`;
+    return;
+  }
+  view = v; keep = k;
+  renderSync(); renderHideout(); renderList(); renderQuests(); renderPrestige();
+}
+(async () => {
+  const f = store.get('needs.filter');
+  if (['all', 'quests', 'hideout', 'kappa', 'pinned'].includes(f)) filter = f;
+  $('add').hidden = filter !== 'pinned';
+  await load();
+  api('GET', '/api/prestige').then(p => { prestige = p; renderPrestige(); }).catch(() => {});
+  setInterval(() => { if (!document.hidden && !document.activeElement.matches('input[type=text]')) load(); }, 60000);   // quests move while you play
+})();
+</script>
+</body>
+</html>

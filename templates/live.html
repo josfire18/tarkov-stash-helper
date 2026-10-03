@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Live — Tarkov Stash Helper</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='4' r='2.5' fill='none' stroke='%23c4a040' stroke-width='1.5'/%3E%3Crect x='4' y='7' width='24' height='22' rx='4' ry='4' fill='%230d0f10' stroke='%23c4a040' stroke-width='1.5'/%3E%3Cline x1='9' y1='14' x2='23' y2='14' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3Cline x1='9' y1='18' x2='23' y2='18' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3Cline x1='9' y1='22' x2='19' y2='22' stroke='%23c4a040' stroke-width='1.2' opacity='0.8'/%3E%3C/svg%3E">
+<style>
+{% include '_base.css' %}
+
+.toolbar {
+  flex: none; display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s4);
+  background: var(--panel); border-bottom: 1px solid var(--line); min-height: 44px;
+}
+.summary { flex: 1; min-width: 0; font-size: 14px; color: var(--strong); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.summary b { font-weight: 600; }
+.summary .sep { color: var(--faint); margin: 0 var(--s2); }
+.summary .more { color: var(--dim); font-size: var(--fs-s); }
+.summary .warn { color: var(--amber); font-size: var(--fs-xs); }
+.toolbar input { width: 200px; }
+
+.split { flex: 1; min-height: 0; display: flex; }
+.stage {
+  flex: 1; min-width: 0; position: relative; background: #0a0c0d; border-right: 1px solid var(--line);
+  display: flex; align-items: center; justify-content: center; padding: var(--s3); overflow: hidden;
+}
+.frame { position: relative; flex: none; border: 1px solid var(--line-2); transition: opacity .2s; }
+.frame.stale { opacity: .85; }
+.frame img { display: block; width: 100%; height: 100%; }
+.tile {
+  position: absolute; border: 2px solid var(--acc); background: color-mix(in srgb, var(--acc) 14%, transparent);
+  border-radius: 2px; cursor: pointer; transition: box-shadow .1s, background .1s;
+}
+.tile.check { border-style: dashed; }
+.tile.skip { --acc: #777; border-width: 1px; border-style: dashed; background: none; cursor: default; }
+.tile.dim { opacity: .2; }
+.tile.hl { background: color-mix(in srgb, var(--acc) 38%, transparent); box-shadow: 0 0 0 2px #fff, 0 0 10px 3px var(--acc); z-index: 2; }
+
+.empty { text-align: center; color: var(--dim); display: flex; flex-direction: column; align-items: center; gap: var(--s3); }
+.empty .t { font-size: 16px; color: var(--text); }
+
+.list { width: 420px; flex: none; background: var(--bg); }
+.group-h {
+  position: sticky; top: 0; z-index: 3; display: flex; align-items: baseline; gap: var(--s2);
+  padding: 7px var(--s3) 6px var(--s3); background: var(--panel); border-bottom: 1px solid var(--line-2);
+  border-top: 1px solid var(--line-2); font-size: var(--fs-xs); font-weight: 700; letter-spacing: .8px;
+  text-transform: uppercase; color: var(--acc);
+}
+.group-h:first-child { border-top: 0; }
+.group-h .n { color: var(--dim); font-weight: 400; letter-spacing: 0; }
+.group-h .tot { margin-left: auto; color: var(--text); font-weight: 600; letter-spacing: 0; text-transform: none; font-size: var(--fs-s); }
+.row {
+  display: grid; grid-template-columns: 1fr auto; gap: 1px var(--s3); padding: 7px var(--s3) 7px 11px;
+  border-left: 3px solid var(--acc); border-bottom: 1px solid var(--line); cursor: pointer;
+}
+.row:hover, .row.hl { background: var(--raise); }
+.row .name { color: var(--strong); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .name .q { color: var(--dim); }
+.row .amt { color: var(--strong); }
+.row .sub { color: var(--dim); font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .sub2 { color: var(--dim); font-size: var(--fs-xs); text-align: right; white-space: nowrap; }
+.row .more { grid-column: 1 / -1; display: none; margin-top: var(--s1); padding-top: var(--s1); border-top: 1px dashed var(--line-2);
+             color: var(--dim); font-size: var(--fs-xs); line-height: 1.5; }
+.row.open .more { display: block; }
+.row .more div + div { margin-top: 2px; }
+.row .warn { color: var(--check); }
+.none { padding: var(--s5) var(--s4); text-align: center; color: var(--dim); }
+
+@media (max-width: 1000px) { .list { width: 350px; } .toolbar input { width: 150px; } }
+</style>
+</head>
+<body>
+{% set active = 'live' %}{% include '_header.html' %}
+
+<div class="banner" id="banner" hidden>
+  <span id="banner-text"></span><span class="spacer"></span>
+  <button id="banner-btn" class="primary" hidden></button>
+</div>
+
+<div class="toolbar">
+  <div class="summary" id="summary"></div>
+  <input type="search" id="filter" placeholder="Filter items" aria-label="Filter items">
+  <button id="scan-now" class="quiet">Scan now</button>
+</div>
+
+<div class="split">
+  <section class="stage" id="stage" aria-label="Captured screen">
+    <div class="frame" id="frame" hidden><img id="img" alt="Captured inventory"><div id="tiles"></div></div>
+    <div class="empty" id="empty"><div class="t">Waiting for Tarkov</div></div>
+  </section>
+  <aside class="list scroll" id="list" aria-label="Actions"></aside>
+</div>
+
+<script>
+const { api, esc, rub, rubShort, toast } = TSH;
+
+const TRADER_COLORS = {
+  Prapor: 'rgb(204, 80, 40)', Therapist: 'rgb(0, 150, 136)', Skier: 'rgb(66, 133, 244)',
+  Peacekeeper: 'rgb(120, 118, 240)', Mechanic: 'rgb(154, 205, 50)', Ragman: 'rgb(216, 27, 96)', Jaeger: 'rgb(34, 139, 34)',
+};
+const FALLBACK_TRADER = 'rgb(180, 120, 20)';
+const MONEY = new Set(['Roubles', 'Dollars', 'Euros']);
+
+let scan = null;            // last payload
+let seq = 0;
+let filterText = '';
+let fetching = false;
+let rowsByTile = new Map(); // "px,py" -> [row elements]
+const $ = id => document.getElementById(id);
+
+// ---- data -> groups ------------------------------------------------------------------------
+const tileKey = r => r.px + ',' + r.py;
+function classify(results) {
+  const g = { flea: [], traders: new Map(), none: [], keep: [], check: [] };
+  for (const r of results) {
+    if (MONEY.has(r.matched_name)) continue;                 // cash is not something to sell
+    if (r.recommend === 'keep') (r.check || r.uncertain ? g.check : g.keep).push(r);
+    else if (r.recommend === 'flea') g.flea.push(r);
+    else if (!r.trader_name) g.none.push(r);
+    else { const k = r.trader_name; if (!g.traders.has(k)) g.traders.set(k, []); g.traders.get(k).push(r); }
+  }
+  return g;
+}
+const sum = rows => rows.reduce((t, r) => t + (r.total || 0), 0);
+const units = rows => rows.reduce((t, r) => t + (r.count || 1), 0);
+const matches = r => !filterText || (r.matched_name + ' ' + (r.trader_name || '')).toLowerCase().includes(filterText);
+
+// ---- summary --------------------------------------------------------------------------------
+function renderSummary(g, res) {
+  const el = $('summary');
+  const sellRows = [...g.flea, ...[...g.traders.values()].flat()];
+  const bits = [];
+  if (sellRows.length) bits.push(`<b>Sell ${units(sellRows)} item${units(sellRows) === 1 ? '' : 's'}</b> · <b>${rubShort(sum(sellRows))}</b>`);
+  else bits.push('<b>Nothing to sell</b>');
+  const extra = [];
+  if (g.keep.length) extra.push(`Keep ${units(g.keep)}`);
+  if (g.check.length) extra.push(`Check ${g.check.length}`);
+  if (extra.length) bits.push(`<span class="more">${extra.join(' · ')}</span>`);
+  const w = res.warnings && res.warnings[0];
+  if (w) bits.push(`<span class="warn" title="${esc(res.warnings.join('\n'))}">${esc(w.length > 60 ? w.slice(0, 58) + '…' : w)}</span>`);
+  el.innerHTML = bits.join('<span class="sep">|</span>');
+}
+
+// ---- list -----------------------------------------------------------------------------------
+function rowEl(r, kind, acc) {
+  const el = document.createElement('div');
+  el.className = 'row'; el.tabIndex = 0; el.style.setProperty('--acc', acc);
+  const n = r.count > 1 ? ` <span class="q">×${r.count}</span>` : '';
+  let amt = '', sub = '', sub2 = '', more = [];
+  if (kind === 'flea') {
+    amt = rub(r.total);
+    sub = `List at ${rub(r.flea_list)}` + (r.flea_queue ? ' · queued' : '');
+    sub2 = r.gain != null && r.trader_price ? `${r.gain >= 0 ? '+' : '−'}${rubShort(Math.abs(r.gain))} vs ${esc(r.trader_name || 'trader')}` : '';
+    if (r.flea_queue) more.push(`Waiting for a free offer slot (you have ${r.flea_slots})`);
+    more.push(`Net ${rub(r.flea_net)} after a ${rub(r.flea_fee)} fee`);
+    if (r.trader_price) more.push(`Trader: ${rub(r.trader_price)} at ${esc(r.trader_name || '–')}`);
+    if (r.fir === null) more.push('<span class="warn">FiR unclear — check before listing</span>');
+  } else if (kind === 'none') {
+    sub = r.reason || 'No trader or flea price';
+  } else if (kind === 'trader') {
+    amt = rub(r.total);
+    sub = r.count > 1 ? `${rub(r.trader_price)} each` : '';
+    if (r.flea_list) more.push(`Flea: ${rub(r.flea_list)}`);
+    if (r.trader_currency && r.trader_currency !== 'RUB') more.push(`Paid in ${esc(r.trader_currency)}`);
+  } else if (kind === 'keep') {
+    amt = '×' + (r.count || 1);
+    sub = r.reason || 'On your list';
+  } else {  // check
+    amt = Math.round(r.score) + '%';
+    const alts = (r.candidates || []).filter(a => a !== r.matched_name);
+    sub = alts.length ? 'or ' + alts.join(', ') : 'Not sure — check it yourself';
+    more.push('Never sold automatically.');
+    if (alts.length) more.push('Could also be: ' + alts.map(esc).join(', '));
+  }
+  if (r.keep_n && kind !== 'keep') more.push(`<span class="warn">Keep ${r.keep_n} from this stack</span>`);
+  if (r.non_fir_note) more.push('<span class="warn">Not FiR — can’t be handed in</span>');
+  if (r.price_note) more.push(`<span class="warn">${esc(r.price_note)}</span>`);
+  if (r.reason && kind !== 'keep') more.push(esc(r.reason));
+  if (kind === 'keep' && r.stack > r.count) more.push(`${r.count} of ${r.stack} in this stack`);
+  if (kind === 'keep' && r.reason) more.push(esc(r.reason));
+  el.innerHTML = `<div class="name">${esc(kind === 'check' ? 'Looks like ' + r.matched_name : r.matched_name)}${n}</div>
+    <div class="amt num">${esc(amt)}</div>
+    <div class="sub">${esc(sub)}</div><div class="sub2">${sub2}</div>
+    <div class="more">${more.map(m => `<div>${m}</div>`).join('')}</div>`;
+  const k = tileKey(r);
+  if (!rowsByTile.has(k)) rowsByTile.set(k, []);
+  rowsByTile.get(k).push(el);
+  el.addEventListener('mouseenter', () => hl(k, true));
+  el.addEventListener('mouseleave', () => hl(k, false));
+  el.addEventListener('click', () => { el.classList.toggle('open'); flash(k); });
+  el.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.click(); } });
+  return el;
+}
+
+function groupEl(list, label, rows, kind, acc, total) {
+  const shown = rows.filter(matches);
+  if (!shown.length) return;
+  const h = document.createElement('div');
+  h.className = 'group-h'; h.style.setProperty('--acc', acc);
+  h.innerHTML = `<span>${esc(label)}</span><span class="n">${kind === 'check' ? shown.length : units(shown)}</span>`
+    + (total ? `<span class="tot num">${rubShort(sum(shown))}</span>` : '');
+  list.append(h);
+  for (const r of shown) list.append(rowEl(r, kind, acc));
+}
+
+function renderList(g) {
+  const list = $('list');
+  const open = new Set([...list.querySelectorAll('.row.open .name')].map(n => n.textContent));
+  rowsByTile = new Map();
+  list.innerHTML = '';
+  groupEl(list, 'Sell on flea', g.flea, 'flea', 'var(--flea)', true);
+  for (const [name, rows] of g.traders) groupEl(list, 'Sell to ' + name, rows, 'trader', TRADER_COLORS[name] || FALLBACK_TRADER, true);
+  groupEl(list, 'No buyer', g.none, 'none', 'var(--faint)', false);
+  groupEl(list, 'Keep', g.keep, 'keep', 'var(--keep)', false);
+  groupEl(list, 'Check', g.check, 'check', 'var(--check)', false);
+  if (!list.children.length) {
+    list.innerHTML = `<div class="none">${filterText ? 'No items match' : 'No items found'}</div>`;
+  }
+  for (const n of list.querySelectorAll('.row')) if (open.has(n.querySelector('.name').textContent)) n.classList.add('open');
+}
+
+// ---- picture + tiles ------------------------------------------------------------------------
+function tileColor(r) {
+  if (r.recommend === 'keep') return r.check || r.uncertain ? 'var(--check)' : 'var(--keep)';
+  if (r.recommend === 'flea') return 'var(--flea)';
+  if (!r.trader_name) return '#777';
+  return TRADER_COLORS[r.trader_name] || FALLBACK_TRADER;
+}
+function renderTiles(res) {
+  const img = $('img'), W = img.naturalWidth, H = img.naturalHeight;
+  if (!W) return;
+  const box = (r, cls, acc) => {
+    const t = document.createElement('div');
+    t.className = 'tile ' + cls; t.style.setProperty('--acc', acc);
+    t.style.left = (r.px / W * 100) + '%'; t.style.top = (r.py / H * 100) + '%';
+    t.style.width = (r.pw / W * 100) + '%'; t.style.height = (r.ph / H * 100) + '%';
+    return t;
+  };
+  const tiles = $('tiles'); tiles.innerHTML = '';
+  for (const s of res.skipped || []) tiles.append(box(s, 'skip', '#777'));
+  const done = new Set();
+  for (const r of res.results || []) {
+    if (r.px == null || (r.recommend === 'keep' && r.drawn === false)) continue;   // a partly kept stack is drawn by its sell row
+    const t = box(r, (r.check || r.uncertain) && r.recommend === 'keep' ? 'check' : '', tileColor(r));
+    t.dataset.k = tileKey(r);
+    t.dataset.m = matches(r) ? '' : 'x';
+    t.addEventListener('mouseenter', () => hl(t.dataset.k, true, true));
+    t.addEventListener('mouseleave', () => hl(t.dataset.k, false, true));
+    t.addEventListener('click', () => {
+      const row = (rowsByTile.get(t.dataset.k) || [])[0];
+      if (row) { row.classList.add('open'); row.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
+      flash(t.dataset.k);
+    });
+    tiles.append(t);
+    done.add(t.dataset.k);
+  }
+  applyFilterToTiles();
+}
+function applyFilterToTiles() {
+  for (const t of $('tiles').children) t.classList.toggle('dim', !!filterText && t.dataset.m === 'x');
+}
+function hl(k, on, fromTile) {
+  for (const t of $('tiles').children) if (t.dataset.k === k) t.classList.toggle('hl', on);
+  if (fromTile) for (const r of rowsByTile.get(k) || []) r.classList.toggle('hl', on);
+}
+function flash(k) {
+  hl(k, true);
+  setTimeout(() => hl(k, false), 900);
+}
+
+function fit() {
+  const img = $('img'), frame = $('frame'), stage = $('stage');
+  if (!img.naturalWidth) return;
+  const cw = stage.clientWidth - 24, ch = stage.clientHeight - 24;
+  const s = Math.min(cw / img.naturalWidth, ch / img.naturalHeight);
+  frame.style.width = Math.floor(img.naturalWidth * s) + 'px';
+  frame.style.height = Math.floor(img.naturalHeight * s) + 'px';
+}
+new ResizeObserver(fit).observe($('stage'));
+
+// ---- apply a payload ------------------------------------------------------------------------
+function apply(res) {
+  if (res.error || res.grid_failed || !res.image) {
+    $('summary').innerHTML = `<span class="warn">${esc(res.error || (res.warnings && res.warnings[0]) || 'Stash not found on screen')}</span>`;
+    return;
+  }
+  scan = res;
+  const g = classify(res.results || []);
+  renderSummary(g, res);
+  renderList(g);
+  const img = $('img');
+  const pre = new Image();
+  pre.onload = () => {
+    img.src = pre.src;
+    $('frame').hidden = false; $('empty').hidden = true;
+    fit(); renderTiles(res);
+  };
+  pre.src = `data:${res.image_mime || 'image/png'};base64,${res.image}`;
+}
+
+async function fetchResult() {
+  if (fetching) return;
+  fetching = true;
+  try {
+    const res = await api('GET', '/api/autoscan/result?since=' + seq);
+    if (res.ready) { seq = res.seq; apply(res); }
+    else if (res.seq != null && res.seq < seq) seq = 0;     // server restarted
+  } finally { fetching = false; }
+}
+
+// ---- empty state ---------------------------------------------------------------------------
+function paintEmpty(st) {
+  if (scan) return;
+  const e = $('empty');
+  let t = 'Open your stash or inventory', btn = '';
+  if (!st) t = 'Waiting for the app';
+  else if (!st.enabled) { t = 'Auto-scan is off'; btn = '<button class="primary" id="turn-on">Turn on</button>'; }
+  else if (st.state === 'no_game') t = 'Waiting for Tarkov';
+  else if (st.state === 'minimized') t = 'Tarkov is minimized';
+  e.innerHTML = `<div class="t">${t}</div>${btn}`;
+  const b = $('turn-on');
+  if (b) b.onclick = async () => { await api('POST', '/api/autoscan/toggle', { enabled: true }); };
+  $('summary').innerHTML = '';
+}
+
+document.addEventListener('tsh:status', ev => {
+  const st = ev.detail;
+  if (st && st.seq !== undefined && st.seq !== seq && st.seq > 0) fetchResult();
+  paintEmpty(st);
+  const btn = $('scan-now');
+  if (st && st.state === 'scanning' ) { btn.disabled = true; btn.textContent = 'Scanning…'; }
+  else if (btn.dataset.busy !== '1') { btn.disabled = false; btn.textContent = 'Scan now'; }
+});
+fetchResult();
+
+// ---- toolbar -------------------------------------------------------------------------------
+$('filter').addEventListener('input', e => {
+  filterText = e.target.value.trim().toLowerCase();
+  if (scan) { const g = classify(scan.results || []); renderList(g); applyFilterToTiles(); renderTiles(scan); }
+});
+
+$('scan-now').addEventListener('click', async () => {
+  const btn = $('scan-now');
+  btn.dataset.busy = '1'; btn.disabled = true; btn.textContent = 'Scanning…';
+  try {
+    const r = await api('POST', '/api/autoscan/rescan');
+    if (r._status === 409) {                       // Auto-scan off: scan the screen directly
+      const res = await api('POST', '/api/sell-scan');
+      apply(res);
+    } else if (!r.ok) toast(r.error || 'Scan failed', 'bad');
+  } catch (e) { toast('Scan failed', 'bad'); }
+  setTimeout(() => { btn.dataset.busy = ''; btn.disabled = false; btn.textContent = 'Scan now'; }, 2500);
+});
+
+// ---- first-run banner: one thing at a time, only when relevant ------------------------------
+let bannerTimer;
+async function checkBanner() {
+  let ms = null, h = null;
+  try { [ms, h] = await Promise.all([api('GET', '/api/icons/matcher-status'), api('GET', '/api/health')]); } catch (_) {}
+  const b = $('banner'), txt = $('banner-text'), btn = $('banner-btn');
+  btn.hidden = true; btn.onclick = null;
+  let next = 30000;
+  if (ms && ms.running) {
+    const pct = ms.total ? Math.round(100 * ms.done_count / ms.total) : 0;
+    txt.textContent = ms.phase === 'catalog' ? 'Building the item database…' : `Building the item database… ${pct}%`;
+    b.className = 'banner info'; b.hidden = false; next = 2000;
+  } else if (ms && !ms.ready) {
+    txt.textContent = ms.error ? 'The item database failed to build' : 'The item database isn’t built yet';
+    b.className = 'banner'; b.hidden = false;
+    btn.hidden = false; btn.textContent = ms.error ? 'Retry' : 'Build now';
+    btn.onclick = async () => { btn.disabled = true; await api('POST', '/api/icons/build-index'); checkBanner(); };
+    btn.disabled = false; next = 8000;
+  } else if (h && h.tesseract === false) {
+    txt.textContent = 'Item names can’t be read: Tesseract OCR isn’t installed';
+    b.className = 'banner'; b.hidden = false;
+    btn.hidden = false; btn.textContent = 'Copy install command';
+    btn.onclick = async () => {
+      const cmd = 'winget install UB-Mannheim.TesseractOCR';
+      try { await navigator.clipboard.writeText(cmd); toast('Copied. Run it in a terminal, then restart the app.', 'ok', 4000); }
+      catch (_) { window.prompt('Run this in a terminal:', cmd); }
+    };
+    next = 15000;
+  } else b.hidden = true;
+  clearTimeout(bannerTimer); bannerTimer = setTimeout(checkBanner, next);
+}
+checkBanner();
+</script>
+</body>
+</html>
