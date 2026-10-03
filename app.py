@@ -2515,7 +2515,7 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None):
                 # is only partly needed is drawn by its sell row instead.
                 draw.rectangle([k['px'], k['py'], k['px'] + k['pw'], k['py'] + k['ph']],
                                fill=(0, 180, 220, 60), outline=(0, 220, 255, 255), width=3)
-                draw_badge(draw, k['x'], k['y'], 'KEEP', bg=(0, 140, 180, 230))
+                draw_badge(draw, k['x'], k['y'], 'CHECK' if k.get('check') else 'KEEP', bg=(0, 140, 180, 230))
 
         results.extend(keep_results)   # KEEP items always at the end
 

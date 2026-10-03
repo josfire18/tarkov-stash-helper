@@ -671,3 +671,12 @@ def test_protected_plan_respects_completed_tasks_and_set_aside_copies(monkeypatc
 def test_get_protected_ids_is_still_the_item_keyed_dict(monkeypatch, tmp_path):
     assert set(_plan_for(monkeypatch, tmp_path,
                          {'completed_tasks': [], 'completed_hideout': [], 'have': {}})[0]) == {'d'}
+
+
+def test_uncertain_detection_is_never_routed_to_sell():
+    items = {'salewa': _item(name='Salewa', sellFor=_sf(Therapist=7000))}
+    sure, unsure = _det('salewa', count=2, col=0), dict(_det('salewa', count=3, col=1), uncertain=True)
+    sell, keep = _plan([sure, unsure], items, {})
+    assert [(r['count'], r.get('uncertain')) for r in sell] == [(2, False)]
+    assert len(keep) == 1 and keep[0]['count'] == 3 and keep[0]['check'] and keep[0]['recommend'] == 'keep'
+    assert 'check it yourself' in keep[0]['reason']

@@ -591,7 +591,11 @@ def plan_entries(detections, id_to_item, protected, settings, ctx, any_of=None):
     app.get_protected_plan).  They are allocated after the single-item needs, out of the
     copies those left over, across every scanned stack of every item in the set.
     """
-    dets = sorted((d for d in detections if id_to_item.get(d['item_id'])),
+    # An item the engine could not identify with certainty is NEVER sold: selling the wrong
+    # thing cannot be undone.  It becomes a KEEP row that asks the player to check it.
+    unsure = sorted((d for d in detections if d.get('uncertain') and id_to_item.get(d['item_id'])),
+                    key=lambda r: (r.get('panel', 0), r['row'], r['col']))
+    dets = sorted((d for d in detections if id_to_item.get(d['item_id']) and not d.get('uncertain')),
                   key=lambda r: (r.get('panel', 0), r['row'], r['col']))
 
     by_item = {}
@@ -656,6 +660,15 @@ def plan_entries(detections, id_to_item, protected, settings, ctx, any_of=None):
         sell.append({**base, 'num': None, 'count': left, 'total': (unit or 0) * left,
                      'keep_n': k, 'uncertain': bool(d.get('uncertain')), 'non_fir_note': non_fir,
                      **rec})
+
+    for d in unsure:
+        item = id_to_item[d['item_id']]
+        count = d.get('count') or 1
+        keep.append({'item_id': d['item_id'], 'matched_name': item['name'], **_geometry(d),
+                     'num': 'K', 'count': count, 'stack': count, 'drawn': True, 'check': True,
+                     'uncertain': True, 'recommend': 'keep', 'trader_name': None,
+                     'trader_price': None, 'flea_list': None, 'flea_net': None,
+                     'reason': f"Not sure this is {item['name']} - check it yourself (never auto-sold)"})
 
     assign_flea_slots(sell, ctx['slots'], ctx['overflow'])
     sell = order_for_selling(sell)
