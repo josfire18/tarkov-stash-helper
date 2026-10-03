@@ -31,6 +31,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+import dataclasses
 from dataclasses import dataclass, field, asdict
 
 import cv2
@@ -121,6 +122,7 @@ class ScanResult:
     items: list = field(default_factory=list)       # every segmented footprint (incl. empty)
     timings: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
+    regions: list = field(default_factory=list)     # scene.Region per grid.panels entry ([] = no scene split)
 
 
 def literal_beats_label(residual: float, dino: float | None, label_score: float) -> bool:
@@ -430,16 +432,24 @@ class Engine:
         return bool(self.s.use_ocr and ocr_mod.tesseract_available())
 
     # ------------------------------------------------------------------
-    def scan(self, img_bgr: np.ndarray) -> ScanResult:
+    def scan(self, img_bgr: np.ndarray, scene=None) -> ScanResult:
+        """``scene`` (identify.scene.SceneInfo) cuts the detected panels by role: only stash /
+        own / loot / container-window grids are read, the item picker and occluded cells never."""
         with self._lock:
-            return self._scan(img_bgr)
+            return self._scan(img_bgr, scene)
 
-    def _scan(self, img_bgr: np.ndarray) -> ScanResult:
+    def _scan(self, img_bgr: np.ndarray, scene=None) -> ScanResult:
         T: dict[str, float] = {}
         t0 = time.perf_counter()
         warnings: list[str] = []
         grid = detect_grid(img_bgr, self.s.pitch_hint)
         warnings += grid.warnings
+        regions = []
+        if scene is not None and scene.scene not in ('none', 'unknown'):
+            from .scene import split_panels
+            pieces = split_panels(grid, scene, img_bgr)
+            grid = dataclasses.replace(grid, panels=[p for p, _ in pieces])
+            regions = [r for _, r in pieces]
         T['grid'] = time.perf_counter() - t0
 
         t = time.perf_counter()
@@ -529,7 +539,7 @@ class Engine:
         T['total'] = time.perf_counter() - t0
         if self.store is not None:
             self.store.save()
-        return ScanResult(dets, grid, [it for it, _ in items], T, warnings)
+        return ScanResult(dets, grid, [it for it, _ in items], T, warnings, regions)
 
     # ------------------------------------------------------------------
     def _dino_pass(self, img_bgr, work) -> None:
