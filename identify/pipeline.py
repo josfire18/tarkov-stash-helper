@@ -74,7 +74,13 @@ LEARN_DISTINCT = 2.0       # learn only if every different look-alike is at leas
 LEARN_CONFIRMATIONS = 2    # independent confirmations before a learned name is used
 TWIN_GAP_OK = 2.0          # fused-score lead that settles same-label twins by picture (see docs/accuracy.md)
 TWIN_GAP_OK_RES = 6.0      # ...when the picture score is the residual alone (no DINO: colour variants differ by little)
-LABEL_VERIFIED_CONF = 0.97  # exact, unambiguous label read of an item that fits the footprint
+SHAPE_IOU_MAX = 0.65       # twins whose drawn silhouettes overlap this little are different objects
+SHAPE_GAP_FRAC = 0.5       # ...and then need only this fraction of the twin gap
+WEAPON_LITERAL_RES = 4.0     # a gun build matched this closely, with its own printed calibre, is that gun
+WEAPON_RIVAL_GAP = 3.0       # ...unless a non-weapon is within this of it
+COLOUR_GAP_OK = 12.0       # look-alike twins: colour-only error lead (0-255 levels) that settles them
+COLOUR_MIN_PX = 30         # common opaque pixels (32 px/slot) needed for a colour comparison
+LABEL_VERIFIED_CONF = 0.97 # exact, unambiguous label read of an item that fits the footprint
 WEAPON_SURE_CONF = 0.95    # certainly a gun (guns are skipped, the exact gun does not matter)
 _CAL_TOKEN = re.compile(r'\d+[.,]?\d*x\d{2}|\d{1,2}ga|[.,]\d{3}', re.I)
 # logistic calibration of the reported confidence: p = sigmoid(b + sum(w * feature)); fitted by
@@ -184,6 +190,7 @@ class Engine:
         self.labeler = None
         self._fp_rows: dict = {}
         self._vis_cache: dict = {}
+        self._sil_cache: dict = {}
         self._phases: dict = {}
         self._init_anchors()
 
@@ -284,8 +291,14 @@ class Engine:
             # ("MP5": receiver / magazine / gun, "D3CRX": two colours) that no exact render
             # separates: whatever the picture prefers is a guess between them
             guns = {str(self.cat.cats[self._id_row[t_]]) == 'weapon' for t_ in twins if t_ in self._id_row}
-            if self._twins_settled_by_footprint(det.item_id, twins, tile, _at_viewport_edge(it, panel, tile), w):
+            if self._twins_settled_by_footprint(det.item_id, twins, tile, False, w):
                 ev['note'] = 'printed label is shared; size / picture separate the twins'
+                if not ev.get('label_twins') and det.item_id:
+                    # the game-font label is exact, every item that prints it is a known twin and the
+                    # footprint / picture rules out each of them but this one: label-verified
+                    det.confidence = max(det.confidence, LABEL_VERIFIED_CONF)
+                    det.uncertain = False
+                    ev['verified'] = 'label+twins'
                 return
             if not (det.category == 'weapon' and guns == {True}):     # all guns: "a gun" is enough
                 det.uncertain = True
@@ -844,6 +857,21 @@ class Engine:
                                              twin_rank=self._twin_ranker(w), only_weapons=True)
                 if auth is not None and self._calibre_names_gun(cal_read['txt'], auth[0], w, tile, edge):
                     calibre_gun = True
+        if not calibre_gun:
+            cw = None
+            if auth is not None:
+                # the label named a gun and a same-label part (stock) and only the calibre probe broke the tie
+                if str(cat.cats[auth[0]]) == 'weapon' and auth[3] is None and auth[2] > 1:
+                    cw = auth[0]
+            elif str(cat.cats[c.row]) == 'weapon' and c.score <= WEAPON_LITERAL_RES and (o is None or o < OCR_AUTH) \
+                    and not any(str(cat.cats[c2.row]) != 'weapon' and c2.score <= c.score + WEAPON_RIVAL_GAP
+                                for c2 in cands[:60]):
+                # a near-literal match to a gun's build with the label unreadable (a custom-named
+                # build prints its own name): only the gun's own calibre can vouch for it
+                cw = c.row
+            if cw is not None and (cal_read['txt'] or gun_probe()) \
+                    and self._calibre_names_gun(cal_read['txt'], cw, w, tile, edge):
+                calibre_gun = True
         item_id = str(cat.ids[c.row])
         name = str(cat.names[c.row])
         evidence = {'residual': round(c.score, 3), 'stage1_best': round(best_res, 3),
@@ -1052,8 +1080,91 @@ class Engine:
         if me not in rk:
             return False
         gap = TWIN_GAP_OK if self._use_dino() else TWIN_GAP_OK_RES
-        rivals = [rk[r] for r in others if r in rk]
-        return not rivals or rk[me] - max(rivals) >= gap
+        # A twin whose drawn shape is clearly another object's (a magazine vs a grip, a grenade vs a
+        # improvised grenade) is separated by the silhouette the residual compares, so a smaller
+        # lead is evidence enough; look-alikes (colour variants) need the full gap.
+        for r in others:
+            if r not in rk:
+                continue
+            if self._shape_distinct(w, me, r):
+                if rk[me] - rk[r] < gap * SHAPE_GAP_FRAC:
+                    return False
+            elif rk[me] - rk[r] < gap:
+                # look-alike shape (colour variants, ammo boxes of one art): the residual cannot
+                # separate them, but the item's own pixels can - colour alone, over the pixels both
+                # templates draw opaque (no background, no overlays)
+                cg = self._colour_gap(w, me, r)
+                if rk[me] - rk[r] < 0.0 or cg is None or cg < COLOUR_GAP_OK:
+                    return False
+        return True
+
+    def _colour_gap(self, w, me: int, rival: int):
+        """Mean abs colour error of the tile against the rival's template minus against the picked
+        item's, over the pixels both templates draw fully opaque (positive = the tile is the
+        picked item's colour).  None when there is too little common area or the tile is cut."""
+        tile = w['tile']
+        if tile.clip:
+            return None
+        cm, cr = self._best_cand(w, me), self._best_cand(w, rival)
+        if cm is None or cr is None:
+            return None
+        W, H = int(tile.W), int(tile.H)
+        planes = []
+        for c in (cm, cr):
+            full = self.cat.full_icon(int(c.row))
+            if full is None:
+                return None
+            f = np.ascontiguousarray(np.rot90(full, int(c.rot)))
+            planes.append((cv2.resize(f[:, :, :3], (32 * W, 32 * H), interpolation=cv2.INTER_AREA).astype(np.float32),
+                           cv2.resize(f[:, :, 3], (32 * W, 32 * H), interpolation=cv2.INTER_AREA)))
+        h, wd = tile.img.shape[:2]
+        if (h, wd) != planes[0][1].shape:
+            return None
+        inner = np.zeros((h, wd), bool)
+        inner[8:h - 8, 3:wd - 3] = True
+        m = (planes[0][1] >= 250) & (planes[1][1] >= 250) & inner
+        if int(m.sum()) < COLOUR_MIN_PX:
+            return None
+        t = tile.img.astype(np.float32)[m]
+        return float(np.abs(t - planes[1][0][m]).mean() - np.abs(t - planes[0][0][m]).mean())
+
+    def _best_cand(self, w, row: int):
+        """Best stage-1 candidate among the item's templates (a gun: and its default builds)."""
+        cat = self.cat
+        ids = [str(cat.ids[row])] + list(getattr(self, 'gun_presets', {}).get(row, ()))
+        best = None
+        for c in w['cands']:
+            if str(cat.ids[c.row]) in ids and (best is None or c.score < best.score):
+                best = c
+        return best
+
+    def _shape_distinct(self, w, a: int, b: int) -> bool:
+        """True when the matched templates of items ``a`` and ``b`` have clearly different
+        silhouettes in this tile's orientation (opaque-area IoU <= :data:`SHAPE_IOU_MAX`).  Colour
+        variants and same-art ammo boxes overlap almost completely and are never shape-distinct."""
+        tile = w['tile']
+        if tile.clip:
+            return False
+        ca, cb = self._best_cand(w, a), self._best_cand(w, b)
+        if ca is None or cb is None:
+            return False
+        W, H = int(tile.W), int(tile.H)
+        masks = []
+        for c in (ca, cb):
+            k = (int(c.row), int(c.rot), W, H)
+            m = self._sil_cache.get(k)
+            if m is None:
+                full = self.cat.full_icon(int(c.row))
+                if full is None:
+                    return False
+                al = np.ascontiguousarray(np.rot90(full[:, :, 3], int(c.rot)))
+                m = cv2.resize(al, (32 * W, 32 * H), interpolation=cv2.INTER_AREA) > 127
+                self._sil_cache[k] = m
+            masks.append(m)
+        union = int((masks[0] | masks[1]).sum())
+        if union == 0:
+            return False
+        return float((masks[0] & masks[1]).sum()) / union <= SHAPE_IOU_MAX
 
     def _unresolved_label_twins(self, w, tile: Tile, edge: bool, item_id: str, have_dino: bool) -> bool:
         """True when the item the picture chose shares its exactly-read label with another
