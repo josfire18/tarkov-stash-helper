@@ -74,7 +74,9 @@ LEARN_DISTINCT = 2.0       # learn only if every different look-alike is at leas
 LEARN_CONFIRMATIONS = 2    # independent confirmations before a learned name is used
 TWIN_GAP_OK = 2.0          # fused-score lead that settles same-label twins by picture (see docs/accuracy.md)
 TWIN_GAP_OK_RES = 6.0      # ...when the picture score is the residual alone (no DINO: colour variants differ by little)
-LABEL_VERIFIED_CONF = 0.97  # exact, unambiguous label read of an item that fits the footprint
+SHAPE_IOU_MAX = 0.65       # twins whose drawn silhouettes overlap this little are different objects
+SHAPE_GAP_FRAC = 0.5       # ...and then need only this fraction of the twin gap
+LABEL_VERIFIED_CONF = 0.97 # exact, unambiguous label read of an item that fits the footprint
 WEAPON_SURE_CONF = 0.95    # certainly a gun (guns are skipped, the exact gun does not matter)
 _CAL_TOKEN = re.compile(r'\d+[.,]?\d*x\d{2}|\d{1,2}ga|[.,]\d{3}', re.I)
 # logistic calibration of the reported confidence: p = sigmoid(b + sum(w * feature)); fitted by
@@ -184,6 +186,7 @@ class Engine:
         self.labeler = None
         self._fp_rows: dict = {}
         self._vis_cache: dict = {}
+        self._sil_cache: dict = {}
         self._phases: dict = {}
         self._init_anchors()
 
@@ -1045,8 +1048,54 @@ class Engine:
         if me not in rk:
             return False
         gap = TWIN_GAP_OK if self._use_dino() else TWIN_GAP_OK_RES
-        rivals = [rk[r] for r in others if r in rk]
-        return not rivals or rk[me] - max(rivals) >= gap
+        # A twin whose drawn shape is clearly another object's (a magazine vs a grip, a grenade vs a
+        # improvised grenade) is separated by the silhouette the residual compares, so a smaller
+        # lead is evidence enough; look-alikes (colour variants) need the full gap.
+        for r in others:
+            if r not in rk:
+                continue
+            need = gap * SHAPE_GAP_FRAC if self._shape_distinct(w, me, r) else gap
+            if rk[me] - rk[r] < need:
+                return False
+        return True
+
+    def _best_cand(self, w, row: int):
+        """Best stage-1 candidate among the item's templates (a gun: and its default builds)."""
+        cat = self.cat
+        ids = [str(cat.ids[row])] + list(getattr(self, 'gun_presets', {}).get(row, ()))
+        best = None
+        for c in w['cands']:
+            if str(cat.ids[c.row]) in ids and (best is None or c.score < best.score):
+                best = c
+        return best
+
+    def _shape_distinct(self, w, a: int, b: int) -> bool:
+        """True when the matched templates of items ``a`` and ``b`` have clearly different
+        silhouettes in this tile's orientation (opaque-area IoU <= :data:`SHAPE_IOU_MAX`).  Colour
+        variants and same-art ammo boxes overlap almost completely and are never shape-distinct."""
+        tile = w['tile']
+        if tile.clip:
+            return False
+        ca, cb = self._best_cand(w, a), self._best_cand(w, b)
+        if ca is None or cb is None:
+            return False
+        W, H = int(tile.W), int(tile.H)
+        masks = []
+        for c in (ca, cb):
+            k = (int(c.row), int(c.rot), W, H)
+            m = self._sil_cache.get(k)
+            if m is None:
+                full = self.cat.full_icon(int(c.row))
+                if full is None:
+                    return False
+                al = np.ascontiguousarray(np.rot90(full[:, :, 3], int(c.rot)))
+                m = cv2.resize(al, (32 * W, 32 * H), interpolation=cv2.INTER_AREA) > 127
+                self._sil_cache[k] = m
+            masks.append(m)
+        union = int((masks[0] | masks[1]).sum())
+        if union == 0:
+            return False
+        return float((masks[0] & masks[1]).sum()) / union <= SHAPE_IOU_MAX
 
     def _unresolved_label_twins(self, w, tile: Tile, edge: bool, item_id: str, have_dino: bool) -> bool:
         """True when the item the picture chose shares its exactly-read label with another
