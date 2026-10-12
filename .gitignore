@@ -11,25 +11,11 @@ build/
 *.spec
 !TarkovStashHelper.spec
 
-# Data — downloaded/generated locally, not committed
-data/icons/
-data/tmpl_src/
-data/eval/
-data/debug/
-data/prices_cache.json
-data/icon_db.npz
-data/identify_catalog_v2.npz
-data/identify_dino_v2.npz
-data/icon_model.pt
-data/icon_model_meta.json
-data/icon_index.json
-data/cache_map.json
-data/settings.json
-data/keep_list.json
-data/app.log
-data/lifecycle.log
-
-# Keep the data folder itself
+# data/ is per-machine runtime state: settings and progress, price/task/wiki caches, the item
+# catalog and downloaded images, the game font extracted from the user's install, debug bundles,
+# logs, and screenshots of the user's stash (eval frames, collected scenes). None of it belongs in
+# the repo - the stash screenshots are private - so ignore everything there but the placeholder.
+data/*
 !data/.gitkeep
 
 # Virtual envs
@@ -38,28 +24,14 @@ venv/
 env/
 .buildvenv*/
 
+# Logs and scratch output (eval printouts, worker notes) anywhere in the tree
+*.log
+scratch_*
+
 # IDE
 .vscode/
 .idea/
 *.swp
 
-# Claude Code internal state
+# Claude Code internal state (worktrees, settings)
 .claude/
-data/kappa_wiki.json
-data/tasks_cache.json
-data/tarkovdev_meta.json
-data/progress.json
-data/prestige_wiki.json
-data/eft_hash_status.json
-
-# per-user: cache icons named from confirmed scans
-data/learned_icons.json
-data/learned_icons.json.tmp
-data/eftlogs_cache.json
-data/scenes/
-data/fonts/
-data/identify_dino_v2_onnx.npz
-data/frames/
-data/scene_*.png
-data/live_frames/
-data/app.ico
