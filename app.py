@@ -37,7 +37,7 @@ import lifecycle    # open/close with the game (stdlib + ctypes only)
 from sellcalc import (best_trader_price, calc_flea_fee, price_420, flea_block_reason,  # noqa: F401
                       sell_recommendation, order_for_selling, TRADER_ORDER)
 
-APP_VERSION = '0.4.0'
+APP_VERSION = '0.4.1'
 
 FROZEN = getattr(sys, 'frozen', False)
 
@@ -2742,6 +2742,7 @@ def _sell_payload(raw_detections, panels, grid_failed, warnings, scene_info, set
                   lean, final=True):
     """Everything after identification: prices, protection plan, advice, rows.  Pure of the
     capture; ``final=False`` builds the provisional payload of a progressive scan."""
+    from identify.scene import ADVISED_ROLES
     warnings = list(warnings)
     grid = panels[0]
     print(f"Grid: {len(panels)} panel(s), "
@@ -2769,8 +2770,9 @@ def _sell_payload(raw_detections, panels, grid_failed, warnings, scene_info, set
     if settings.get('debug_dumps', True) and not lean and final:    # the live view saves its frames elsewhere
         _save_debug_bundle(img_bgr, panels, raw_detections, 'sell')
 
-    # Sell advice covers the stash and open container windows only.  What is on the player
-    # (rig / pockets / backpack / pouch), loot and unclear grids are listed apart ("On you").
+    # Sell advice covers the stash, open container windows and incoming items (the receive grid,
+    # the scav's loot being moved to the stash) only.  What is on the player (rig / pockets /
+    # backpack / pouch), loot, the trader's goods and unclear grids are listed apart ("On you").
     on_you = []
     raid = bool(scene_info.get('in_raid')) or str(scene_info.get('scene') or '').startswith('raid')
     live_advice = None
@@ -2786,7 +2788,7 @@ def _sell_payload(raw_detections, panels, grid_failed, warnings, scene_info, set
     if any(d.get('role') for d in raw_detections):
         advice = []
         for d in raw_detections:
-            if d.get('role') in (None, 'stash', 'container_window') and not raid:
+            if d.get('role') in (None, *ADVISED_ROLES) and not raid:
                 advice.append(d)
             else:
                 it = id_to_item.get(d['item_id']) or {}
