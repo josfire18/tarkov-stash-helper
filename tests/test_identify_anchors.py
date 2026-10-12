@@ -82,6 +82,34 @@ def test_certain_only_when_the_render_is_named(tmp_path):
     assert idx3.match(_on_bg(rb), 1, 1, 63.0, 63.0).certain
 
 
+def test_renders_named_by_the_game_icon_hash(tmp_path):
+    from identify import eft_hash as E
+    ids = ['590a3efd86f77437d351a25b', '5c0530ee86f774697952d952', '5d0375ff86f774186372f685',
+           '56742c284bdc2d98058b456d', '590c5d4b86f774784e1b9c45']
+    ra, rb, rc = _render(40), _render(41), _render(42)
+    # 1: plain item, 2: learned binding agrees, 3+4: same pixels filed under two items, 5: learned disagrees
+    idx = _index(tmp_path, [ra, rb, rc, rc, _render(43)])
+    d = idx.dir
+    with open(os.path.join(d, 'index.json'), 'w') as f:
+        json.dump({str(E.template_hash(i)): n + 1 for n, i in enumerate(ids)}, f)
+
+    class _L:
+        def __init__(self, m): self.m = m
+        def get(self, key): return self.m.get(key)
+    k5 = A.content_key_of(cv2.imread(os.path.join(d, '5.png'), cv2.IMREAD_UNCHANGED))
+    k2 = A.content_key_of(cv2.imread(os.path.join(d, '2.png'), cv2.IMREAD_UNCHANGED))
+    items = {i: 'barter' for i in ids}
+    hidx = A.CacheIndex(d, {}, _L({k2: ids[1], k5: 'someone-else'}), hash_items=items, log=lambda *a: None)
+    by = {r.fname: r for r in hidx.renders}
+    assert (by['1.png'].item_id, by['1.png'].id_src) == (ids[0], 'hash')
+    assert (by['2.png'].item_id, by['2.png'].id_src) == (ids[1], 'hash')
+    assert by['3.png'].item_id == ''                           # two items draw these pixels
+    assert by['5.png'].item_id == '' and hidx.n_hash_conflict == 1
+    assert hidx.match(_on_bg(ra), 1, 1, 63.0, 63.0).certain
+    # without hash_items (gate closed) nothing is named by the hash
+    assert all(not r.item_id for r in A.CacheIndex(d, {}).renders)
+
+
 def test_two_items_with_the_same_render_are_never_certain(tmp_path):
     ra = _render(20)
     rb = ra.copy()

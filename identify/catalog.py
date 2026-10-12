@@ -17,6 +17,10 @@ EFT Icon Cache ``<n>.png``        pixel-exact renders by the game of every icon 
                                   template of that item; one that matches nothing is a
                                   weapon *build*, stored as an anonymous ``build`` template
                                   (its identity is later decided from the printed label).
+                                  Before any of that, the game's own icon hash names
+                                  every plain item's render exactly (``index.json`` +
+                                  :mod:`identify.eft_hash`, validation-gated); the picture
+                                  comparison only decides the rest.
 
 Representation
 --------------
@@ -44,7 +48,9 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from .config import (CATALOG_PATH, CATALOG_SCHEMA, PRICES_PATH, SLOT, STAGE1_SLOT,
+from . import eft_hash
+from .anchors import ASSOC_TRUST_D, ASSOC_TRUST_RATIO
+from .config import (CATALOG_PATH, CATALOG_SCHEMA, DATA_DIR, PRICES_PATH, SLOT, STAGE1_SLOT,
                      TMPL_SRC_DIR)
 
 ASSOC_MAX = 8.0       # max composite distance for a cache icon to be assigned to an item
@@ -273,8 +279,9 @@ def build_catalog(prices_path: str = PRICES_PATH, tmpl_dir: str = TMPL_SRC_DIR,
     n_api = len(rows)
 
     # ---- EFT icon cache: re-associate every build ---------------------------
-    n_cache = n_build = n_amb = 0
-    assoc: dict[str, list] = {}        # cache file name -> [item id, best dist, runner-up dist]
+    n_cache = n_build = n_amb = n_hash = 0
+    assoc: dict[str, list] = {}        # cache file name -> [item id, best dist, runner-up dist(, 'hash')]
+    hash_status: dict = {'provider': eft_hash.PROVIDER, 'enabled': False}
     cdir = cache_dir if cache_dir is not None else default_cache_dir()
     if with_cache and cdir:
         by_size: dict[tuple[int, int], list[int]] = {}
@@ -282,8 +289,17 @@ def build_catalog(prices_path: str = PRICES_PATH, tmpl_dir: str = TMPL_SRC_DIR,
             by_size.setdefault((rows[r]['W'], rows[r]['H']), []).append(r)
         comp = {k: _composites([stage[r] for r in v]) for k, v in by_size.items()}
         files = sorted(glob.glob(os.path.join(cdir, '*.png')))
+        # exact ids from the game's own icon hash (identify/eft_hash.py); index.json is read on
+        # both sides of the file scan and only entries it kept are trusted (the game renumbers)
+        item_cat = {it['id']: category_of(it.get('types')) for it in items}
+        idx0 = eft_hash.read_index(cdir)
         with ThreadPoolExecutor(max_workers=8) as ex:
             cimgs = list(ex.map(_read, files))
+        idx1 = eft_hash.read_index(cdir)
+        exact = eft_hash.exact_ids({h: n for h, n in idx1.items() if idx0.get(h) == n}, item_cat)
+        api_row = {rows[r]['id']: r for r in range(n_api)}
+        item_by_id = {it['id']: it for it in items}
+        visual = []
         for fpath, img in zip(files, cimgs):
             if img is None or img.ndim != 3 or img.shape[2] != 4:
                 continue
@@ -304,13 +320,55 @@ def build_catalog(prices_path: str = PRICES_PATH, tmpl_dir: str = TMPL_SRC_DIR,
                     if rows[ids[int(j)]]['id'] != rows[best_r]['id']:
                         second_d = float(d[j])
                         break
+            visual.append((fpath, W, H, prem, al, best_r, best_d, second_d))
+
+        # validation gate: the exact ids must agree with the unambiguous picture associations
+        evidence = {}
+        for fpath, W, H, prem, al, best_r, best_d, second_d in visual:
+            if best_r is not None and best_d <= ASSOC_TRUST_D and second_d >= ASSOC_TRUST_RATIO * max(best_d, 0.3):
+                evidence[os.path.basename(fpath)] = rows[best_r]['id']
+        hash_status = eft_hash.validate(exact, evidence)
+        if not hash_status['enabled']:
+            exact = {}
+
+        for fpath, W, H, prem, al, best_r, best_d, second_d in visual:
+            fname = os.path.basename(fpath)
             # A cache icon is the game's own render of the item, so it matches its
             # tarkov.dev icon to within a few levels (measured 2-5 on stash1); it is a
             # *clear* match when it beats the best different item by 1.4x.
             clear = best_r is not None and best_d <= ASSOC_MAX and second_d >= ASSOC_RATIO * best_d
+            hit = exact.get(fname)
+            if hit is not None and (hit[0] in api_row or hit[0] in item_by_id):
+                # the game's hash names this render: certain, whatever the picture comparison says
+                iid = hit[0]
+                assoc[fname] = [iid, round(best_d, 3), round(min(second_d, 999.0), 3), 'hash']
+                n_hash += 1
+                if clear and rows[best_r]['id'] == iid and best_d <= 0.6:
+                    continue                   # the tarkov.dev template already is this picture
+                if not clear and best_r is not None and best_d <= ASSOC_MAX:
+                    # a look-alike of several items (ammo, colour variants): the api templates cover
+                    # the picture; an extra near-twin template only blurs stage 1 (measured: w04
+                    # "PP gs" turned Check).  Anchor 1 still names this render exactly.
+                    n_amb += 1
+                    continue
+                if iid in api_row:
+                    base = rows[api_row[iid]]
+                    row = dict(id=iid, name=base['name'], short=base['short'], tint=base['tint'],
+                               cat=base['cat'], preset=base['preset'])
+                else:
+                    it = item_by_id[iid]
+                    row = dict(id=iid, name=it.get('name') or '', short=it.get('shortName') or '',
+                               tint=it.get('backgroundColor') or 'default', cat=category_of(it.get('types')),
+                               preset='preset' in (it.get('types') or ()))
+                r = len(rows)
+                rows.append(dict(row, src='cache', W=W, H=H))
+                stage[r] = (prem, al, W, H)
+                paths[r] = fpath
+                n_cache += 1
+                continue
             if best_r is not None:
-                assoc[os.path.basename(fpath)] = [rows[best_r]['id'] if clear else '',
-                                                  round(best_d, 3), round(min(second_d, 999.0), 3)]
+                assoc[fname] = [rows[best_r]['id'] if clear else '',
+                                round(best_d, 3), round(min(second_d, 999.0), 3)]
             if clear:
                 if best_d > 0.6:               # genuinely different render => worth keeping
                     r = len(rows)
@@ -348,9 +406,11 @@ def build_catalog(prices_path: str = PRICES_PATH, tmpl_dir: str = TMPL_SRC_DIR,
         tw=np.array([r['W'] for r in rows], np.int16), th=np.array([r['H'] for r in rows], np.int16),
         stacks=stacks,
         meta={'paths': paths, 'built': time.time(), 'n_api': n_api, 'n_cache': n_cache,
-              'n_build': n_build, 'n_ambiguous_cache': n_amb, 'cache_assoc': assoc, 'n_missing_src': n_missing})
+              'n_build': n_build, 'n_ambiguous_cache': n_amb, 'cache_assoc': assoc, 'n_missing_src': n_missing,
+              'n_hash': n_hash, 'eft_hash': {k: v for k, v in hash_status.items() if k != 'disagree'}})
     log(f'[catalog] {n_api} api + {n_cache} cache + {n_build} build templates '
-        f'({n_missing} items without image, {n_amb} ambiguous cache icons) in {time.time() - t0:.1f}s')
+        f'({n_missing} items without image, {n_amb} ambiguous cache icons, {n_hash} cache icons named by '
+        f'the game hash [gate {"open" if hash_status["enabled"] else "closed"}]) in {time.time() - t0:.1f}s')
     return cat
 
 
@@ -425,4 +485,6 @@ def load_catalog(path: str = CATALOG_PATH, prices_path: str = PRICES_PATH,
             log(f'[catalog] cannot load {path}: {e}')
     cat = build_catalog(prices_path, tmpl_dir, cdir, log=log)
     save_catalog(cat, path, sig, n_cache)
+    if os.path.abspath(path) == os.path.abspath(CATALOG_PATH) and cat.meta.get('eft_hash'):
+        eft_hash.save_status(DATA_DIR, cat.meta['eft_hash'])
     return cat
