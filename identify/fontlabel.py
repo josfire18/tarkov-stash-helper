@@ -339,7 +339,10 @@ class LabelRenderer:
         return fits
 
 
-SHIFTS = [(0.0, 0.0), (0.25, 0.0), (-0.25, 0.0), (0.0, 0.25), (0.0, -0.25), (0.5, 0.0), (-0.5, 0.0)]
+# The strip's right edge is an integer pixel while the panel pitch is not (63.09 px/slot, 84.6 ...), so the
+# text's right-aligned pen position can sit up to a pixel off the calibrated one: x shifts reach +-1 px.
+SHIFTS = [(0.0, 0.0), (0.25, 0.0), (-0.25, 0.0), (0.0, 0.25), (0.0, -0.25), (0.5, 0.0), (-0.5, 0.0),
+          (0.75, 0.0), (-0.75, 0.0), (1.0, 0.0), (-1.0, 0.0)]
 UNEXPLAINED_W = 60.0
 FAR_DISCOUNT = 0.8            # unrefined candidates are scored optimistically (conservative for certainty)
 LABEL_EXACT = 24.0            # total of an exact label rendering (calibrated, docs/accuracy.md)

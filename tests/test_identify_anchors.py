@@ -197,3 +197,18 @@ def test_label_anchor_scales_to_1440p():
     st = _strip_with(lr, 'Matches', w=85, pitch=84.0)
     fits = lr.match(st, ['Matches', 'Match', 'Watches', 'Patches'], 84.0)
     assert fits[0].text == 'Matches' and FL.certain(fits)
+
+
+def test_label_with_the_pen_a_pixel_off_is_still_certain():
+    """The strip's right edge is an integer pixel, the pitch is not: the text can sit up to a pixel
+    left or right of the calibrated pen position (w01 'Analgin' at 63.09 px/slot)."""
+    lr = _real_renderer()
+    for dx in (-1.0, -0.75, 0.75, 1.0):
+        h = int(np.ceil(17 * 63.0 / 63)) + 1
+        rng = np.random.default_rng(7)
+        base = np.full((h, 65, 3), (38, 34, 31), np.float32) + rng.normal(0, 2.0, (h, 65, 3))
+        base[0, :] = base[:, 0] = base[:, -1] = (84, 81, 73)
+        rgb, al = lr.render('Analgin', 65, h, 63.0, dx=dx)
+        st = np.clip(base * (1 - al[..., None]) + rgb * 255, 0, 255).astype(np.uint8)
+        fits = lr.match(st, ['Analgin', 'UV Lamp', 'Analog', 'Tape'], 63.0)
+        assert fits[0].text == 'Analgin' and FL.certain(fits), dx
