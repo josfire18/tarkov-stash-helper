@@ -287,7 +287,7 @@ class Engine:
             # ("MP5": receiver / magazine / gun, "D3CRX": two colours) that no exact render
             # separates: whatever the picture prefers is a guess between them
             guns = {str(self.cat.cats[self._id_row[t_]]) == 'weapon' for t_ in twins if t_ in self._id_row}
-            if self._twins_settled_by_footprint(det.item_id, twins, tile, _at_viewport_edge(it, panel, tile), w):
+            if self._twins_settled_by_footprint(det.item_id, twins, tile, False, w):
                 ev['note'] = 'printed label is shared; size / picture separate the twins'
                 return
             if not (det.category == 'weapon' and guns == {True}):     # all guns: "a gun" is enough
