@@ -59,7 +59,7 @@ W_RES = 1.0
 W_DINO = 18.0
 W_OCR = 5.0
 OCR_POOL_DELTA = 7.0       # OCR may consider items whose residual is within this of the best
-RES_PLAUSIBLE = 8.5        # mean level error above which a visual match needs the label's support
+RES_PLAUSIBLE = 7.5        # mean level error above which a visual match needs the label's support
 OCR_AUTH = 90.0            # fuzzy score at/above which a label is considered a real read
 LABEL_PARTIAL_CAP = 94.0   # best score a non-exact label match can get (exact = 100)
 LABEL_RIVAL_GAP = 5.0      # a label this much better than the chosen item's gets a say
@@ -975,6 +975,13 @@ class Engine:
         count, count_text = digits_mod.read_count(hi) if not clipped else (None, '')
         if count_text:
             evidence['count_text'] = count_text
+        if clipped and not label_ok:
+            # cut by the scroll edge with no readable label: when most of the item is out of
+            # view, the visible sliver (often just background) cannot vouch for it
+            vis = hpx / max(1.0, c.H * float(w['panel'].pitch_y))
+            if vis < 0.6:
+                conf = min(conf, 0.5)
+                evidence['note'] = 'mostly hidden by the scroll edge'
         H_det = c.H if it.clipped_bottom else it.h
         return Detection(
             panel=it.panel, col=it.col, row=it.row, w=it.w, h=H_det, rotated=bool(c.rotated),
