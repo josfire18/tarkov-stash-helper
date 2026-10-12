@@ -358,10 +358,14 @@ class CacheIndex:
                 for rot in rots:
                     R = rgb if rot == 0 else np.rot90(rgb, rot, axes=(1, 2))
                     A = al if rot == 0 else np.rot90(al, rot, axes=(1, 2))
-                    sl = slice(0, tr) if clip == 'bottom' else slice(R.shape[1] - tr, None)
-                    wgt = A[:, sl] & m[None]
+                    # a tile whose visible rows exceed the candidate's height by the tolerance only
+                    # (a bottom-row item that is in fact complete) is compared on the rows both have
+                    nr = min(tr, R.shape[1])
+                    sl = slice(0, nr) if clip == 'bottom' else slice(R.shape[1] - nr, None)
+                    ts = slice(0, nr) if clip == 'bottom' else slice(tr - nr, None)
+                    wgt = A[:, sl] & m[None, ts]
                     n = wgt.sum(axis=(1, 2))
-                    d = (np.abs(R[:, sl] - th[None]).mean(axis=3) * wgt).sum(axis=(1, 2)) / np.maximum(n, 1)
+                    d = (np.abs(R[:, sl] - th[None, ts]).mean(axis=3) * wgt).sum(axis=(1, 2)) / np.maximum(n, 1)
                     d[n < 8] = 999.0
                     for j in np.argsort(d)[:k]:
                         cand.append((float(d[j]), idx[int(j)], rot, Hc))
