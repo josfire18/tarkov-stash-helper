@@ -212,3 +212,39 @@ def test_label_with_the_pen_a_pixel_off_is_still_certain():
         st = np.clip(base * (1 - al[..., None]) + rgb * 255, 0, 255).astype(np.uint8)
         fits = lr.match(st, ['Analgin', 'UV Lamp', 'Analog', 'Tape'], 63.0)
         assert fits[0].text == 'Analgin' and FL.certain(fits), dx
+
+
+# ---------------------------------------------------------------- viewport-cut tiles
+def test_cut_tile_is_certified_on_its_visible_rows(tmp_path):
+    r = _render(40, W=1, H=2)
+    idx = _index(tmp_path, [r, _render(41, W=1, H=2), _render(42, W=1, H=3)])
+    idx.bind(idx.renders[0].key, 'tall-item')
+    full = _on_bg(r)
+    top = full[:96]                                        # bottom cut off: 1.5 of 2 slots visible
+    res = idx.match_clipped(top, 1, 'bottom', 63.0, 63.0)
+    assert res.certain and res.item_id == 'tall-item'
+    bottom = full[-96:]                                    # top cut off
+    res = idx.match_clipped(bottom, 1, 'top', 63.0, 63.0)
+    assert res.certain and res.item_id == 'tall-item'
+
+
+def test_cut_tile_with_too_little_visible_is_never_certain(tmp_path):
+    r = _render(50, W=1, H=3)
+    idx = _index(tmp_path, [r])
+    idx.bind(idx.renders[0].key, 'tall-item')
+    full = _on_bg(r)
+    assert idx.match_clipped(full[:64], 1, 'bottom', 63.0, 63.0) is None   # 1 of 3 slots: under half
+    res = idx.match_clipped(full[:96], 1, 'bottom', 63.0, 63.0)            # 1.5 of 3: half is enough
+    assert res is not None and res.item_id == 'tall-item'
+    other = _on_bg(_render(51, W=1, H=3))[:128]
+    res = idx.match_clipped(other, 1, 'bottom', 63.0, 63.0)
+    assert res is None or not res.certain
+
+
+def test_cut_tile_cannot_be_a_shorter_item(tmp_path):
+    r = _render(60, W=1, H=1)                              # a 1x1 item can never fill 1.5 slots
+    idx = _index(tmp_path, [r])
+    idx.bind(idx.renders[0].key, 'small-item')
+    tile = np.vstack([_on_bg(r), _on_bg(r)[1:50]])
+    res = idx.match_clipped(tile, 1, 'bottom', 63.0, 63.0)
+    assert res is None or not res.certain
