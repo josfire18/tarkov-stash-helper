@@ -43,6 +43,7 @@ from . import digits as digits_mod
 from . import ocr as ocr_mod
 from .catalog import Catalog, load_catalog
 from .config import EngineSettings, LEARNED_PATH, SLOT
+from . import eft_hash
 from .learned import LearnedNames, content_key
 from .fir import detect_fir
 from .grid import GridResult, detect_grid
@@ -206,8 +207,15 @@ class Engine:
         try:
             cdir = ex.get('cache_dir') or default_cache_dir()
             if cdir:
+                hash_items = None
+                if eft_hash.gate_open(self.cat.meta.get('eft_hash')) and ex.get('icon_hash', True):
+                    # the game's icon hash names every plain item's render exactly (identify/eft_hash.py)
+                    c = self.cat
+                    hash_items = {str(c.ids[r]): str(c.cats[r]) for r in range(len(c))
+                                  if c.src[r] == 'api' and c.ids[r]}
                 self.anchor_idx = anchors_mod.CacheIndex(cdir, self.cat.meta.get('cache_assoc') or {},
-                                                         _CertainBindings(self.learned), canon)
+                                                         _CertainBindings(self.learned), canon,
+                                                         hash_items=hash_items)
         except Exception as e:                     # pragma: no cover - never fatal
             print(f'[anchors] icon-cache index unavailable: {e}')
         try:

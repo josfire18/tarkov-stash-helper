@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from . import eft_hash
 from .config import SLOT
 from .masks import BOTTOM_PX, LABEL_PX
 
@@ -67,7 +68,7 @@ class Render:
     H: int
     key: str
     item_id: str = ''
-    id_src: str = ''           # 'learned' | 'assoc' | ''
+    id_src: str = ''           # 'learned' | 'hash' | 'assoc' | ''
     hint_id: str = ''          # untrusted picture association (never certifies)
 
 
@@ -195,19 +196,30 @@ class CacheIndex:
     shortlisting and an LRU of full-resolution images for the exact check."""
 
     def __init__(self, cache_dir: str | None, assoc: dict | None = None, learned=None, canon: dict | None = None,
-                 log=print):
+                 log=print, hash_items: dict | None = None):
+        """``hash_items`` = ``{item id: catalog category}``: name renders by the game's own icon hash
+        (:mod:`identify.eft_hash`; pass it only while that hash's validation gate is open)."""
         self.dir = cache_dir
         self.renders: list[Render] = []
         self.by_fp: dict[tuple[int, int], list[int]] = {}
         self._thumb: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
         self._full: OrderedDict = OrderedDict()
         self._lock = threading.Lock()
+        self.n_hash = self.n_hash_conflict = 0
         if not cache_dir or not os.path.isdir(cache_dir):
             return
         files = sorted(glob.glob(os.path.join(cache_dir, '*.png')))
+        idx0 = eft_hash.read_index(cache_dir) if hash_items else {}
         with ThreadPoolExecutor(max_workers=8) as ex:
             imgs = list(ex.map(lambda p: cv2.imread(p, cv2.IMREAD_UNCHANGED), files))
+        exact: dict = {}
+        if hash_items:
+            # only index entries unchanged across the file scan (the game renumbers files)
+            idx1 = eft_hash.read_index(cache_dir)
+            exact = eft_hash.exact_ids({h: n for h, n in idx1.items() if idx0.get(h) == n}, hash_items)
+        canon = canon or {}
         seen: dict[str, int] = {}
+        key_hash_ids: dict[str, set] = {}             # pixel content -> every hash id it is filed under
         thumbs: dict[tuple[int, int], list] = {}
         for p, img in zip(files, imgs):
             if img is None or img.ndim != 3 or img.shape[2] != 4:
@@ -218,11 +230,13 @@ class CacheIndex:
             if img.shape[:2] != (SLOT * fp[1] + 1, SLOT * fp[0] + 1):
                 continue                              # odd size: not a stash render
             key = content_key_of(img)
+            fname = os.path.basename(p)
+            hit = exact.get(fname)
+            if hit is not None:
+                key_hash_ids.setdefault(key, set()).add(canon.get(hit[0], hit[0]))
             if key in seen:
                 continue                              # same pixels under another file number
-            fname = os.path.basename(p)
             r = Render(fname, p, fp[0], fp[1], key)
-            canon = canon or {}
             if learned is not None:
                 iid = learned.get(key)
                 if iid:
@@ -230,12 +244,32 @@ class CacheIndex:
             a = (assoc or {}).get(fname)
             if a and a[0]:
                 r.hint_id = canon.get(a[0], a[0])
-                if not r.item_id and a[1] <= ASSOC_TRUST_D and a[2] >= ASSOC_TRUST_RATIO * max(a[1], 0.3):
+                if not r.item_id and a[1] <= ASSOC_TRUST_D and a[2] >= ASSOC_TRUST_RATIO * max(a[1], 0.3) \
+                        and not (len(a) > 3 and a[3] == 'hash'):
                     r.item_id, r.id_src = r.hint_id, 'assoc'
             seen[key] = len(self.renders)
             self.by_fp.setdefault(fp, []).append(len(self.renders))
             thumbs.setdefault(fp, []).append(_thumb(img, fp[0], fp[1]))
             self.renders.append(r)
+        n_hash = n_conflict = 0
+        for r in self.renders:
+            ids = key_hash_ids.get(r.key)
+            if not ids:
+                continue
+            if len(ids) > 1:
+                # several items are drawn with exactly these pixels: the render cannot tell them apart
+                if r.id_src != 'learned':
+                    r.item_id, r.id_src = '', ''
+                continue
+            hid = next(iter(ids))
+            if r.id_src == 'learned' and r.item_id != hid:
+                log(f'[anchors] {r.fname}: icon hash says {hid}, learned binding {r.item_id} - left unnamed')
+                r.item_id, r.id_src = '', ''
+                n_conflict += 1
+                continue
+            r.item_id, r.id_src = hid, 'hash'
+            n_hash += 1
+        self.n_hash, self.n_hash_conflict = n_hash, n_conflict
         for fp, lst in thumbs.items():
             self._thumb[fp] = (np.stack([t[0] for t in lst]), np.stack([t[1] for t in lst]))
         self.key_index = {r.key: i for i, r in enumerate(self.renders)}
