@@ -20,7 +20,7 @@ LIVE_FRAMES = {
     'trader': '1791730400469-lobby.png', 'handover': '1791731210892-lobby.png',
     'picker': '1791731263265-lobby.png', 'showcase': '1791731298039-raid.png',
     'scav': '1791734087953-lobby.png', 'scav_empty_rig': '1791734092427-lobby.png',
-    'scav_items': '1791734081088-lobby.png',
+    'scav_items': '1791734081088-lobby.png', 'trader_dim': '1791730353083-lobby.png',
 }
 live = pytest.mark.skipif(not all(os.path.exists(os.path.join(LIVE, f)) for f in LIVE_FRAMES.values()),
                           reason='live lobby frames not present')
@@ -84,6 +84,30 @@ def test_trader_goods_are_never_the_players():
     assert 'trader_goods' not in S.ADVISED_ROLES and 'trader_goods' not in S.SCANNED_ROLES
     assert pieces and all(r.role == 'stash' for _, r in pieces)           # goods + deal panel are cut away
     assert all(p.x0 >= roles['stash'].bbox[0] for p, _ in pieces)
+
+
+@live
+@pytest.mark.parametrize('name', ['trader_dim', 'trader'])
+def test_dimmed_trader_stash_is_found_whole(name):
+    """The sell tab dims the stash items the trader does not buy (border ~(38, 38, 36)): the whole 10 x 12
+    lattice must still be found (frame 1 had no stash cell, frame 6 only the bright half), and the
+    dimmed items must not be called empty."""
+    from identify.segment import segment_panel
+    im, sc, pieces = _lv(name, None)
+    st = [(p, r) for p, r in pieces if r.role == 'stash']
+    assert sum(p.n_cols * p.n_rows for p, _ in st) >= 120 and all(p.n_cols == 10 for p, _ in st)
+    assert all(p.x0 >= sc.stash_bbox[0] and p.x1 <= sc.stash_bbox[0] + sc.stash_bbox[2] + 4 for p, _ in st)
+    items = [it for i, (p, _) in enumerate(st) for it in segment_panel(im, p, i)]
+    assert sum(1 for it in items if not it.empty) >= 20          # frame 1: ~22 items, 8 empty blobs
+
+
+@live
+def test_scav_backpack_found_whole():
+    im, sc, pieces = _lv('scav_items', None)
+    bp = [p for p, r in pieces if r.role == 'incoming' and r.title == 'BACKPACK']
+    assert [(p.n_cols, p.n_rows) for p in bp] == [(4, 5)]      # the dark 4th column used to be cut off
+    im2, sc2, pieces2 = _lv('scav', None)
+    assert [(p.n_cols, p.n_rows) for p, r in pieces2 if r.title == 'BACKPACK'] == [(4, 5)]
 
 
 @live

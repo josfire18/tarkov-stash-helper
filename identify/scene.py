@@ -52,6 +52,8 @@ HEADERS = {
 _SIDE = {'stash': 'stash', 'loot': 'loot', 'container_window': 'stash', 'incoming': 'stash',
          'picker': 'other', 'trader_goods': 'other', 'offer_window': 'other', 'handover': 'other',
          'unknown': 'other'}
+# screens that draw the stash items the deal cannot use dimmed (trader sell tab, flea offer)
+DIMMING_SCENES = ("trader", "flea_offer", "flea_handover", "showcase")
 # roles whose items are the player's own to sell: the sell advice covers exactly these (app.py)
 SCAV_GRID_ROLES = ('own_rig', 'own_pockets', 'own_backpack', 'own_pouch', 'own_special')
 ADVISED_ROLES = ('stash', 'container_window', 'incoming')
@@ -455,7 +457,7 @@ def _ocr_strips(strips: list, psm: int = 6) -> list:
     return [o or '' for o in out]
 
 
-def _grid_extent(frame: np.ndarray, zone: Region, windows: list, pitch: float):
+def _grid_extent(frame: np.ndarray, zone: Region, windows: list, pitch: float, neutral_frames: bool = False):
     """Tight bbox of the drawn cell/slot borders in a header zone, or None when there are none
     (no such equipment, or hidden).  Border runs are grouped (9 px gaps between rig slots are
     bridged) and only groups whose top sits under the header (or touches a window, which may hide
@@ -470,10 +472,20 @@ def _grid_extent(frame: np.ndarray, zone: Region, windows: list, pitch: float):
     for w in windows:
         wx, wy, ww, wh = w.bbox
         lm[max(0, wy - 2 - zy):max(0, wy + wh + 3 - zy), max(0, wx - 2 - zx):max(0, wx + ww + 3 - zx)] = False
-    m = lm.astype(np.uint8)
+    rv = rh = np.zeros_like(lm)
+    if neutral_frames:
+        # on the scav loot-transfer screen a grid's outer frame is a bright *neutral* line that misses
+        # the border-colour box ((83, 83, 83) on the backpack, whose right column was lost): count
+        # strong thin ridges as lines too
+        from .owngrid import STRONG, _ridges
+        rv, rh = _ridges(cv2.cvtColor(frame[zy:zy + zh, zx:zx + zw], cv2.COLOR_BGR2GRAY).astype(np.int16), STRONG)
+        for w in windows:
+            wx, wy, ww, wh = w.bbox
+            for r_ in (rv, rh):
+                r_[max(0, wy - 2 - zy):max(0, wy + wh + 3 - zy), max(0, wx - 2 - zx):max(0, wx + ww + 3 - zx)] = False
     k = max(8, int(0.5 * pitch))
-    hr = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1)))
-    vr = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, k)))
+    hr = cv2.morphologyEx((lm | rh).astype(np.uint8), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1)))
+    vr = cv2.morphologyEx((lm | rv).astype(np.uint8), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, k)))
     both = cv2.dilate(hr | vr, cv2.getStructuringElement(cv2.MORPH_RECT, (int(0.22 * pitch), int(0.22 * pitch))))
     n, lab, st, _ = cv2.connectedComponentsWithStats(both, connectivity=8)
     top_ok = (zone.bbox[1] + 0.2 * pitch) - zy          # header bottom in crop coordinates
@@ -697,7 +709,7 @@ def analyze_scene(frame_bgr: np.ndarray, *, in_raid=None) -> SceneInfo:
     for z in info.zones:
         if z.role in ('own_other',):
             continue
-        bb = _grid_extent(frame_bgr, z, info.windows, pitch)
+        bb = _grid_extent(frame_bgr, z, info.windows, pitch, neutral_frames=raid_ended)
         if bb is not None:
             info.regions.append(Region(bb, z.role, z.side, z.title, 0.85))
 
@@ -829,7 +841,13 @@ def split_panels(grid_result: GridResult, scene: SceneInfo, frame_bgr: np.ndarra
         heads.append({'name': name, 'role': role, 'kind': kind, 'x0': x - 5, 'ybot': y + h + 5, 'y': y, 'x': x})
     out = []
     lm_cache = {}
-    for panel in grid_result.panels:
+    refit = None
+    if lobby and scene.stash_bbox is not None and frame_bgr is not None:
+        refit = _stash_refit(grid_result, scene, frame_bgr)
+    for panel in list(grid_result.panels) + ([refit] if refit is not None else []):
+        only_stash = panel is refit
+        if only_stash:
+            n_orig = len(out)
         nc, nr = panel.n_cols, panel.n_rows
         labels = np.empty((nr, nc), object)           # key per cell or None
         for r in range(nr):
@@ -845,6 +863,8 @@ def split_panels(grid_result: GridResult, scene: SceneInfo, frame_bgr: np.ndarra
         for key in {k for k in labels.ravel() if k is not None}:
             m = np.array([[k == key for k in row] for row in labels])
             role, side, conf, title, wi = key
+            if only_stash and not (role == 'stash' and wi == -1):
+                continue
             if role not in SCANNED_ROLES and not role.startswith(('own', 'loot', 'unknown')):
                 continue
             if _needs_line_evidence(role, title) and frame_bgr is not None:
@@ -868,13 +888,48 @@ def split_panels(grid_result: GridResult, scene: SceneInfo, frame_bgr: np.ndarra
                 p = Panel(x0=int(xs[0]), y0=int(ys[0]), x1=int(xs[-1]) + 1, y1=int(ys[-1]) + 1,
                           ox=float(xs[0]), oy=float(ys[0]), pitch_x=panel.pitch_x, pitch_y=panel.pitch_y,
                           n_cols=c1 - c0 + 1, n_rows=r1 - r0 + 1, xs=list(xs), ys=list(ys),
-                          clip_top=bool(ct), clip_bottom=bool(cb), strength=panel.strength)
+                          clip_top=bool(ct), clip_bottom=bool(cb), strength=panel.strength,
+                          dim=panel.dim or (role == 'stash' and scene.scene in DIMMING_SCENES))
                 reg = Region((p.x0, p.y0, p.x1 - p.x0, p.y1 - p.y0), role, side, title, conf)
                 out.append((p, reg))
+    if refit is not None:                  # the fitted stash replaces whatever detect_grid found there
+        out = [(p, r) for p, r in out[:n_orig] if not (r.role == 'stash' and r.title is None)] + out[n_orig:]
     if frame_bgr is not None:
         out = _own_gear_pieces(out, grid_result, scene, frame_bgr)
     out.sort(key=lambda t: (t[0].y0, t[0].x0))
     return out
+
+
+def _stash_cells(panels, bbox) -> int:
+    """Number of cells of ``panels`` whose centre lies in the stash ``bbox``."""
+    n = 0
+    for p in panels:
+        for r in range(p.n_rows):
+            for c in range(p.n_cols):
+                cx, cy = (p.xs[c] + p.xs[c + 1]) / 2.0, (p.ys[r] + p.ys[r + 1]) / 2.0
+                if bbox[0] <= cx <= bbox[0] + bbox[2] and bbox[1] <= cy <= bbox[1] + bbox[3]:
+                    n += 1
+    return n
+
+
+def _stash_refit(grid_result: GridResult, scene: SceneInfo, frame_bgr: np.ndarray):
+    """The stash lattice fitted inside the known stash region (:mod:`identify.stashfit`) when
+    ``detect_grid`` found clearly fewer stash cells than that lattice holds (the trader screens dim
+    the items the trader does not buy: their borders fall outside the line-colour box).  ``None``
+    keeps the ordinary path."""
+    from .stashfit import fit_stash_panel
+    sb = scene.stash_bbox
+    pitch = scene.pitch
+    mp = grid_result.pitch_x
+    if mp and 0.9 * pitch <= mp <= 1.1 * pitch:
+        pitch = float(mp)
+    fit = fit_stash_panel(frame_bgr, sb, pitch)
+    if fit is None:
+        return None
+    have = _stash_cells(grid_result.panels, sb)
+    if have >= 0.9 * fit.n_cols * fit.n_rows:
+        return None
+    return fit
 
 
 def _needs_line_evidence(role: str, title) -> bool:

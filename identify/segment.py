@@ -41,6 +41,7 @@ class Item:
     empty: bool = False
     suspect: bool = False  # component was not a clean rectangle (line detection doubt)
     panel: int = 0
+    dim: bool = False      # drawn dimmed (trader screen: an item the trader does not buy): never confidently named
 
     @property
     def cells(self) -> int:
@@ -140,17 +141,67 @@ def _otsu_1d(vals: np.ndarray, lo: float, hi: float) -> tuple[float, float]:
     return min(max(best_t, lo), hi), best_j
 
 
-def cell_is_empty(img_bgr: np.ndarray, rect: tuple, inset: int = 4) -> bool:
-    """Flat, dark interior => empty slot."""
+def cell_is_empty(img_bgr: np.ndarray, rect: tuple, inset: int = 4, dim: bool = False) -> bool:
+    """Flat, dark interior => empty slot.  ``dim``: the cell may belong to a dimmed stash (trader
+    screens darken every item the trader does not buy to ~0.45-0.7 of its brightness): a dimmed
+    item's art (std 16.7+ normally) falls to 7-10, so only the near-uniform backdrop (std ~3, mean
+    ~22) counts as empty there."""
     x, y, w, h = rect
     sub = img_bgr[max(0, y + inset):y + h - inset, max(0, x + inset):x + w - inset]
     if sub.size == 0:
         return False
     g = cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY).astype(np.float32)
     # real items measured on stash1: interior grey std >= 16.7 (even a flat black-tint tile has art);
-    # an empty slot is a dark backdrop with at most a faint gradient / compression noise (a tall 1x2
-    # rig slot on the scav loot-transfer screen measures 8.1-8.5)
-    return bool(g.std() < 11.0 and g.mean() < 70)
+    # an empty slot is a dark backdrop with at most a faint gradient / compression noise
+    if g.mean() >= 70:
+        return False
+    sd = float(g.std())
+    if dim:
+        return sd < 4.5 and g.mean() < 28
+    if sd < 8.0:
+        return True
+    # a tall 1x2 rig slot on the scav loot-transfer screen measures 8.1-8.5 because of a smooth
+    # vertical gradient; a dark *item* (a black pack, a long thin spacer) of the same std has
+    # structure the gradient does not explain: judge the residual of a plane fit
+    return sd < 11.0 and _plane_residual_std(g) < 4.5
+
+
+DIM_LINE_LEVEL = 68      # border grey of a normally drawn item is ~79-97, a dimmed one 33-59
+
+
+def is_dimmed(img_bgr: np.ndarray, it: 'Item') -> bool:
+    """True when the item's own border lines are darker than the game draws an undimmed border: the
+    weakest of its four edges (top / bottom skipped where the viewport cuts the row) is below
+    :data:`DIM_LINE_LEVEL`.  A neighbour's bright line can hide one dimmed edge but not all four; an
+    edge covered by a tooltip reads dark, which errs on the safe side (not named confidently)."""
+    g = frame_memo(img_bgr, 'gray32', lambda: cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32))
+    H, W = g.shape
+    x, y, w, h = it.rect
+    x1, y1 = x + w - 1, y + h - 1
+    if x < 1 or y < 1 or x1 >= W - 1 or y1 >= H - 1 or w < 12 or h < 12:
+        return True
+
+    def level(vertical: bool, pos: int, a: int, b: int) -> float:
+        best = 0.0
+        for d in (-1, 0, 1):
+            seg = g[a:b, pos + d] if vertical else g[pos + d, a:b]
+            best = max(best, float(np.median(seg)))
+        return best
+    lv = [level(True, x, y + 4, y1 - 3), level(True, x1, y + 4, y1 - 3)]
+    if not it.clipped_top:
+        lv.append(level(False, y, x + 4, x1 - 3))
+    if not it.clipped_bottom:
+        lv.append(level(False, y1, x + 4, x1 - 3))
+    return min(lv) < DIM_LINE_LEVEL
+
+
+def _plane_residual_std(g: np.ndarray) -> float:
+    """Std of ``g`` after removing the best-fit plane a + b*x + c*y (smooth gradients)."""
+    h, w = g.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    A = np.stack([np.ones(h * w, np.float32), xx.ravel() / w, yy.ravel() / h], 1).astype(np.float32)
+    sol = np.linalg.lstsq(A, g.ravel(), rcond=None)[0]
+    return float((g.ravel() - A @ sol).std())
 
 
 # --------------------------------------------------------------------------
@@ -179,6 +230,24 @@ def _hue_ok(img_bgr: np.ndarray) -> np.ndarray:
     bg = im[..., 0] - im[..., 1]
     gr = im[..., 1] - im[..., 2]
     return (bg >= 0) & (bg <= 14) & (gr >= 4) & (gr <= 18)
+
+
+def dim_ridge_masks(img_bgr: np.ndarray, rise: int = 5) -> tuple[np.ndarray, np.ndarray]:
+    """(horizontal, vertical) thin-line masks for a *dimmed* rendering: a trader screen darkens the
+    stash items the trader does not buy to 0.45-0.7 of their brightness, so their border lines
+    (nominally ~(84, 81, 73)) are ~(38, 38, 36) and only ~14 grey levels above the backdrop - below
+    the exact colour box and the ridge model's brightness floor.  A pixel brighter than both
+    neighbours 3 px away by ``rise`` levels, neutral, not too dark / bright."""
+    def build():
+        g = frame_memo(img_bgr, 'gray32', lambda: cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32))
+        H, W = g.shape
+        pad = np.pad(g, 3, mode='edge')
+        left, right = pad[3:3 + H, 0:W], pad[3:3 + H, 6:6 + W]
+        up, down = pad[0:H, 3:3 + W], pad[6:6 + H, 3:3 + W]
+        hsv_s = frame_memo(img_bgr, 'sat', lambda: cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)[:, :, 1])
+        base = (g > 18) & (g < 200) & (hsv_s < 70)
+        return ((g - np.maximum(up, down)) >= rise) & base, ((g - np.maximum(left, right)) >= rise) & base
+    return frame_memo(img_bgr, ('dimridge', rise), build)
 
 
 def _tight_line_mask(img_bgr: np.ndarray) -> np.ndarray:
@@ -226,12 +295,14 @@ def edge_model(img_bgr: np.ndarray, panel: Panel, ridge: bool | None = None) -> 
     rh, rv = ridge_masks(img_bgr)
     cands = []
     lh, lv = ridge_masks(img_bgr, neutral_only=False)      # any hue: orange 'attention' frames
-    models = (('strict', (strict, strict)), ('ridge', (rh, rv)), ('union', (strict | rh, strict | rv)),
-              ('luma', (strict | lh, strict | lv)))
+    models = [('strict', (strict, strict)), ('ridge', (rh, rv)), ('union', (strict | rh, strict | rv)),
+              ('luma', (strict | lh, strict | lv))]
+    if panel.dim and ridge is None:
+        models.append(('dim', dim_ridge_masks(img_bgr)))
     for name, (mh, mv) in models:
         if ridge is not None and (name == 'ridge') != bool(ridge):
             continue
-        fv, fh = fractions(mh, mv, 1 if name == 'strict' else RIDGE_WIDTH)
+        fv, fh = fractions(mh, mv, 1 if name in ('strict', 'dim') else RIDGE_WIDTH)
         vals = np.array(list(fv.values()) + list(fh.values()), np.float64)
         t, j = _otsu_1d(vals, 0.3, 0.9)
         cands.append((j, t, fv, fh, name))
@@ -248,7 +319,7 @@ def edge_model(img_bgr: np.ndarray, panel: Panel, ridge: bool | None = None) -> 
     # orange 'attention' frames the neutral models lose after JPEG
     near = [c for c in plausible if c[0] >= jmax - 0.04]
     strict_c = next((c for c in plausible if c[4] == 'strict'), None)
-    if strict_c is not None and strict_c[0] >= 0.97:         # pristine capture: the exact model is decisive
+    if strict_c is not None and strict_c[0] >= 0.97 and not panel.dim:         # pristine capture: the exact model is decisive
         near = [strict_c]
     j, thr, fv, fh, name = max(near, key=share)
 
@@ -259,7 +330,7 @@ def edge_model(img_bgr: np.ndarray, panel: Panel, ridge: bool | None = None) -> 
     # a thin line clearly brighter than the empty side along the whole edge.
     gray = frame_memo(img_bgr, 'gray32', lambda: cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32))
     hue_ok = frame_memo(img_bgr, 'hue', lambda: _hue_ok(img_bgr))
-    empty = {(c, r): cell_is_empty(img_bgr, panel.rect(c, r, 1, 1)) for r in range(nr) for c in range(nc)}
+    empty = {(c, r): cell_is_empty(img_bgr, panel.rect(c, r, 1, 1), dim=panel.dim) for r in range(nr) for c in range(nc)}
 
     def _step(vertical, pos, a, b, e0, e1):
         # one empty side: the line must stand out from it.  Both sides flat (two empty slots, or
@@ -327,7 +398,9 @@ def segment_panel(img_bgr: np.ndarray, panel: Panel, panel_index: int = 0,
             it = Item(col=c, row=r, w=bw, h=bh, rect=rect, panel=panel_index, suspect=sus,
                       clipped_top=panel.clip_top and r == 0,
                       clipped_bottom=panel.clip_bottom and r + bh == nr)
-            it.empty = cell_is_empty(img_bgr, rect)
+            it.empty = cell_is_empty(img_bgr, rect, dim=panel.dim)
+            if panel.dim and not it.empty:
+                it.dim = is_dimmed(img_bgr, it)
             if it.empty and panel.own and (bw > 1 or bh > 1):
                 # own gear draws no line between empty cells: count them one by one
                 for rr in range(r, r + bh):

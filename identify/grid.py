@@ -76,6 +76,7 @@ class Panel:
     clip_bottom: bool = False
     strength: float = 0.0
     own: bool = False       # a cell group of the player's own gear (rig / pockets / backpack ...)
+    dim: bool = False       # lattice fitted by identify.stashfit: the stash may be drawn dimmed (trader screens)
 
     # --- geometry helpers -------------------------------------------------
     def rect(self, col: int, row: int, w: int = 1, h: int = 1) -> tuple[int, int, int, int]:

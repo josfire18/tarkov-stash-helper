@@ -162,3 +162,27 @@ def test_real_border_next_to_an_empty_slot_still_counts():
     img, _, expected, _ = render_panel(63.0, 6, 3, [(0, 0, 2, 2), (2, 0, 1, 1)])
     _, items = _segment(img)
     assert {(0, 0, 2, 2), (2, 0, 1, 1)} <= _shapes(items)
+
+
+def test_empty_rule_gradient_slot_vs_dark_item():
+    """A smooth-gradient backdrop (std 8-11, like a tall scav rig slot) is empty; a dark item of the same
+    std whose variation is structure, not a gradient, is not; a dimmed stash only empties on the flat backdrop."""
+    import numpy as np
+    from identify.segment import cell_is_empty
+    h, w = 171, 87
+    grad = np.tile(np.linspace(24, 55, h)[:, None], (1, w)).astype(np.float32)        # std ~ 11 over the cell
+    img = np.repeat(np.clip(grad, 0, 255).astype(np.uint8)[:, :, None], 3, 2)
+    img = np.pad(img, ((4, 4), (4, 4), (0, 0)), mode='edge')
+    assert img[4:-4, 4:-4].std() > 8 and cell_is_empty(img, (0, 0, w + 8, h + 8))
+    rng = np.random.RandomState(1)
+    art = np.full((h + 8, w + 8), 25, np.float32)
+    art[30:60, 20:70] = 55                                                            # a dark blob: structure
+    art += rng.normal(0, 1.0, art.shape)
+    img2 = np.repeat(np.clip(art, 0, 255).astype(np.uint8)[:, :, None], 3, 2)
+    assert 8 < img2[4:-4, 4:-4].std() < 11 and not cell_is_empty(img2, (0, 0, w + 8, h + 8))
+    flat = np.full((90, 90, 3), 22, np.uint8)
+    flat[::2] += 3
+    assert cell_is_empty(flat, (0, 0, 90, 90), dim=True)
+    dimmed_item = np.full((90, 90, 3), 25, np.uint8)
+    dimmed_item[10:80, 10:40] = 36                                                    # dimmed art, std ~7
+    assert cell_is_empty(dimmed_item, (0, 0, 90, 90)) and not cell_is_empty(dimmed_item, (0, 0, 90, 90), dim=True)
