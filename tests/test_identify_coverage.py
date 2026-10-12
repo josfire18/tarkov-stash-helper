@@ -104,3 +104,61 @@ def test_colour_variants_are_settled_by_colour_alone(eng):
     w = _w(eng, [(idof(21), 6.5), (idof(23), 4.0)])
     w['tile'] = _tile_of('left', (200, 80, 60))
     assert not eng._twins_settled_by_footprint(idof(21), twins, w['tile'], False, w)
+
+
+# ---------------------------------------------------------------- gun builds proven by their calibre
+GUNS = [  # id, name, short, W, H, types
+    (idof(31), 'YY-1 12ga pump-action shotgun', 'YY-1', 5, 1, ['gun']),
+    (idof(32), 'YY-1 stock', 'YY-1', 4, 1, ['mods']),
+    (idof(33), 'YY-1 12ga barrel', 'YY1 barrel', 5, 1, ['mods']),
+]
+
+
+@pytest.fixture(scope='module')
+def geng(tmp_path_factory):
+    from synth import make_icon
+    tmp = tmp_path_factory.mktemp('guns')
+    (tmp / 'tmpl').mkdir()
+    prices = []
+    for k, (iid, name, short, w, h, types) in enumerate(GUNS):
+        cv2.imwrite(str(tmp / 'tmpl' / f'{iid}.png'), make_icon(900 + k, w, h))
+        prices.append({'id': iid, 'name': name, 'shortName': short, 'width': w, 'height': h,
+                       'backgroundColor': 'blue', 'types': types})
+    (tmp / 'p.json').write_text(json.dumps({'items': prices}), encoding='utf-8')
+    cat = C.build_catalog(str(tmp / 'p.json'), str(tmp / 'tmpl'), str(tmp / 'nc'), with_cache=False,
+                          log=lambda *_: None)
+    return Engine(EngineSettings(use_dino=False, use_ocr=True, accelerate=False), catalog=cat)
+
+
+def _decide_gun(geng, monkeypatch, res_gun, res_barrel, label, calibre):
+    from identify import ocr as O
+    monkeypatch.setattr(geng, '_use_ocr', lambda: True)
+    monkeypatch.setattr(O, 'bottom_strip', lambda *a, **k: np.zeros((8, 40), np.uint8))
+    monkeypatch.setattr(O, 'read_strips', lambda strips: [calibre] * len(strips))
+    pitch = 63.0
+    img = np.full((120, 380, 3), 30, np.uint8)
+    it = SimpleNamespace(rect=(10, 20, 5 * 63 + 1, 64), w=5, h=1, col=0, row=0, panel=0, clipped_top=False,
+                         clipped_bottom=False)
+    panel = SimpleNamespace(pitch_x=pitch, pitch_y=pitch, y0=0, y1=500)
+    tile = SimpleNamespace(W=5, H=1, clip='', img=np.zeros((32, 160, 3), np.uint8))
+    r = geng._id_row
+    cands = sorted([SimpleNamespace(row=r[idof(31)], score=res_gun, rot=0, rotated=False, W=5, H=1),
+                    SimpleNamespace(row=r[idof(33)], score=res_barrel, rot=0, rotated=False, W=5, H=1)],
+                   key=lambda c: c.score)
+    ocr_all = [label] if label else []
+    w = {'it': it, 'panel': panel, 'tile': tile, 'cands': cands, 'qe': None, 'sims': {}, 'ocr_all': ocr_all,
+         'ocr_best': label, 'pool': cands, 'oscores': {c.row: 25.0 for c in cands}}
+    return geng._decide(img, w)
+
+
+def test_gun_build_with_unreadable_label_is_sure_when_its_own_calibre_is_printed(geng, monkeypatch):
+    d = _decide_gun(geng, monkeypatch, 2.5, 12.0, 'YY Tactical', '12g')
+    assert d.name.startswith('YY-1 12ga') and not d.uncertain
+    assert d.evidence.get('verified') == 'weapon+calibre'
+
+
+def test_gun_build_without_a_matching_calibre_stays_unverified(geng, monkeypatch):
+    assert _decide_gun(geng, monkeypatch, 2.5, 12.0, 'YY Tactical', '').evidence.get('verified') != 'weapon+calibre'
+    assert _decide_gun(geng, monkeypatch, 2.5, 12.0, 'YY Tactical', '9x19').evidence.get('verified') != 'weapon+calibre'
+    # a part that looks about as much like the tile as the gun does vetoes it
+    assert _decide_gun(geng, monkeypatch, 2.5, 4.0, 'YY Tactical', '12g').evidence.get('verified') != 'weapon+calibre'

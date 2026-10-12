@@ -76,6 +76,8 @@ TWIN_GAP_OK = 2.0          # fused-score lead that settles same-label twins by p
 TWIN_GAP_OK_RES = 6.0      # ...when the picture score is the residual alone (no DINO: colour variants differ by little)
 SHAPE_IOU_MAX = 0.65       # twins whose drawn silhouettes overlap this little are different objects
 SHAPE_GAP_FRAC = 0.5       # ...and then need only this fraction of the twin gap
+WEAPON_LITERAL_RES = 4.0     # a gun build matched this closely, with its own printed calibre, is that gun
+WEAPON_RIVAL_GAP = 3.0       # ...unless a non-weapon is within this of it
 COLOUR_GAP_OK = 12.0       # look-alike twins: colour-only error lead (0-255 levels) that settles them
 COLOUR_MIN_PX = 30         # common opaque pixels (32 px/slot) needed for a colour comparison
 LABEL_VERIFIED_CONF = 0.97 # exact, unambiguous label read of an item that fits the footprint
@@ -848,6 +850,21 @@ class Engine:
                                              twin_rank=self._twin_ranker(w), only_weapons=True)
                 if auth is not None and self._calibre_names_gun(cal_read['txt'], auth[0], w, tile, edge):
                     calibre_gun = True
+        if not calibre_gun:
+            cw = None
+            if auth is not None:
+                # the label named a gun and a same-label part (stock) and only the calibre probe broke the tie
+                if str(cat.cats[auth[0]]) == 'weapon' and auth[3] is None and auth[2] > 1:
+                    cw = auth[0]
+            elif str(cat.cats[c.row]) == 'weapon' and c.score <= WEAPON_LITERAL_RES and (o is None or o < OCR_AUTH) \
+                    and not any(str(cat.cats[c2.row]) != 'weapon' and c2.score <= c.score + WEAPON_RIVAL_GAP
+                                for c2 in cands[:60]):
+                # a near-literal match to a gun's build with the label unreadable (a custom-named
+                # build prints its own name): only the gun's own calibre can vouch for it
+                cw = c.row
+            if cw is not None and (cal_read['txt'] or gun_probe()) \
+                    and self._calibre_names_gun(cal_read['txt'], cw, w, tile, edge):
+                calibre_gun = True
         item_id = str(cat.ids[c.row])
         name = str(cat.names[c.row])
         evidence = {'residual': round(c.score, 3), 'stage1_best': round(best_res, 3),
