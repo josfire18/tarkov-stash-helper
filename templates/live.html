@@ -295,8 +295,8 @@ function renderTiles(res) {
     t.title = o.matched_name || ''; tiles.append(t);
   }
   for (const g of res.regions || []) {
-    if (g.role === 'picker') continue;
-    const [x, y, w, h] = g.bbox, kind = /^own_/.test(g.role) ? 'own' : g.role === 'loot' ? 'loot' : g.role === 'container_window' ? 'win' : 'stash';
+    if (['picker', 'trader_goods', 'offer_window', 'handover'].includes(g.role)) continue;   // never the player's grids
+    const [x, y, w, h] = g.bbox, kind = /^own_/.test(g.role) ? 'own' : g.role === 'loot' ? 'loot' : (g.role === 'container_window' || g.role === 'incoming') ? 'win' : 'stash';
     const t = box({ px: x, py: y, pw: w, ph: h }, 'region ' + kind, 'var(--faint)');
     t.title = g.title || g.role; tiles.append(t);
   }

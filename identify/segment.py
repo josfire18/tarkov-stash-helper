@@ -148,8 +148,9 @@ def cell_is_empty(img_bgr: np.ndarray, rect: tuple, inset: int = 4) -> bool:
         return False
     g = cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY).astype(np.float32)
     # real items measured on stash1: interior grey std >= 16.7 (even a flat black-tint tile has art);
-    # an empty slot is a dark backdrop with at most a faint gradient / compression noise
-    return bool(g.std() < 8.0 and g.mean() < 70)
+    # an empty slot is a dark backdrop with at most a faint gradient / compression noise (a tall 1x2
+    # rig slot on the scav loot-transfer screen measures 8.1-8.5)
+    return bool(g.std() < 11.0 and g.mean() < 70)
 
 
 # --------------------------------------------------------------------------
