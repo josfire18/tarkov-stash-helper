@@ -226,3 +226,33 @@ cases have leads of -3.8 to +1.6, and every tile settled by a rule has a margin 
 label whose twin set is closed, never to clipped tiles, and not to `label_twins` (MP5-style) cases. Tests:
 `tests/test_identify_coverage.py` (shape / colour twins, calibre-vouched gun builds) and
 `tests/test_identify_anchors.py::test_label_with_the_pen_a_pixel_off_is_still_certain`.
+
+## Viewport-cut tiles are certified on their visible part (2026-10-12, lean, strict)
+
+`_certify` used to return early for any tile cut by the scroll edge. It now certifies them on exact
+evidence about the *visible* rows only:
+
+* **Bottom-cut tile (label intact):** the closed-set game-font label match runs as usual, but the
+  candidate set is every item that can have that footprint *given the visible rows* (width W in either
+  orientation, height >= ceil(visible slots - 0.1); weapons / mods that could be built that wide). The
+  label strip must lie entirely inside the visible rect. Twins that the footprint cannot separate
+  (shared label) are left as they were; nothing is bound for later (`_bind` is skipped).
+* **Render anchor on the visible rows** (`CacheIndex.match_clipped`): every footprint of width W at
+  least as tall as the visible rows is tried (<= 6 slots), the render cropped to the visible rows
+  (top rows for a bottom cut, bottom rows for a top cut, aligned to the rect edge that is real). It
+  needs >= 50 % of the item visible, 2x the opaque area of a whole tile, the same exactness threshold
+  and the same runner-up rule. Top-cut tiles have no label, so this is their only route.
+* A tile cut at both ends is never certified.
+
+Result (`accuracy_report.py --no-dino`): **1027 correct / 0 wrong / 34 uncertain / 2 missed before and
+after**, certified 505 -> 510, certified-but-wrong 0, no screenshot changed. The five newly certified
+tiles were already correct (Saiga-12K, Salewa x3, Day Pack): they are now label-verified rather than
+merely confident. No cut tile was certified by render: the exact render residual on a cut tile is
+4.7-35 here (e.g. the correct Salewa render at 4.76 vs the 4.5 bound), so the render route stays dormant
+on this set.
+
+The "Cut by the scroll edge (4)" bucket above was mis-described; none of the four is a bottom-cut tile with
+a readable label: ADAR is a top-cut custom build (SVD stock, 0.86 slot visible, no exact render exists),
+Ushanka is a 2x2 hat whose left column is hidden by another window (width unknown), and Hawk and the
+Expeditionary fuel tank in RandomStash are not cut at all (their game-font label does not fit; Hawk reads
+"Hawk" by OCR but the strip match fails). Tests: `tests/test_identify_anchors.py::test_cut_tile_*`.

@@ -45,6 +45,10 @@ SHORTLIST = 10                 # renders checked exactly per tile
 OPAQUE = 250                   # render alpha (0-255) that counts as fully opaque
 MIN_PIXELS = 250               # opaque pixels needed (at 63 px/slot) to call a match exact
 EXACT_MAX = {63: 3.0, 0: 4.5}  # mean abs level error of an exact match: native pitch / resampled
+CLIP_MIN_FRAC = 0.5            # a viewport-cut tile needs this fraction of the item visible
+CLIP_TOL = 0.1                 # slots of slack between visible rows and the item's minimum height
+CLIP_HMAX = 6                  # tallest footprint tried for a cut tile
+CLIP_PIXELS_X = 2.0            # a cut tile needs this x the opaque area of a whole one
 WRONG_MIN_RATIO = 2.5          # a different item's render must be this x worse than the exact one
 # A render's identity from the catalog's picture association (render vs tarkov.dev icon) is only
 # trusted when the tarkov.dev icon is (nearly) the same pixels and nothing else comes close:
@@ -119,14 +123,21 @@ def _score(tile: np.ndarray, rend: np.ndarray, mask: np.ndarray) -> tuple[float,
 
 
 def exact_residual(tile: np.ndarray, bgra: np.ndarray, pitch_x: float, pitch_y: float, H: int,
-                   shifts: float = 2.0, interp: int = cv2.INTER_LINEAR, phase=None):
+                   shifts: float = 2.0, interp: int = cv2.INTER_LINEAR, phase=None,
+                   sy_fixed: float | None = None, y0: float = 0.0):
     """Best aligned residual of a tile crop (BGR, frame included) against a render (BGRA at
     63 px/slot, already in the tile's orientation).  Returns ``(score, n_px, (dx, dy))``.
 
-    ``phase`` = a known (dx, dy) to try first (one per panel); the search then stays near it."""
+    ``phase`` = a known (dx, dy) to try first (one per panel); the search then stays near it.
+    A tile cut by the viewport shows only part of the render: ``sy_fixed`` is then the vertical
+    scale (pitch / 63; the visible rows no longer give it) and ``y0`` the render's vertical offset
+    (0 when the top is visible, ``(h - 1) - pitch * H`` when the bottom is)."""
     h, w = tile.shape[:2]
     sx = (w - 1) / max(1, bgra.shape[1] - 1) if abs(pitch_x - SLOT) > 0.5 else 1.0
     sy = (h - 1) / max(1, bgra.shape[0] - 1) if abs(pitch_y - SLOT) > 0.5 else 1.0
+    if sy_fixed is not None:
+        sy = 1.0 if abs(pitch_y - SLOT) <= 0.5 else sy_fixed
+        y0 = float(round(y0)) if sy == 1.0 else float(y0)
     mask = band_mask(h, w, pitch_y, H)
     best = (999.0, 0, (0.0, 0.0))
     native = sx == 1.0 and sy == 1.0
@@ -135,7 +146,7 @@ def exact_residual(tile: np.ndarray, bgra: np.ndarray, pitch_x: float, pitch_y: 
         if phase is not None:
             grid = [phase] + grid
         for dx, dy in grid:
-            s, n = _score(tile, warp_render(bgra, w, h, 1.0, 1.0, dx, dy), mask)
+            s, n = _score(tile, warp_render(bgra, w, h, 1.0, 1.0, dx, dy + y0), mask)
             if s < best[0]:
                 best = (s, n, (dx, dy))
         return best
@@ -146,7 +157,7 @@ def exact_residual(tile: np.ndarray, bgra: np.ndarray, pitch_x: float, pitch_y: 
     else:
         grid = [(phase[0] + a, phase[1] + b) for a in (-0.5, 0, 0.5) for b in (-0.5, 0, 0.5)]
     for dx, dy in grid:
-        s, n = _score(tile, warp_render(bgra, w, h, sx, sy, dx, dy, interp), mask)
+        s, n = _score(tile, warp_render(bgra, w, h, sx, sy, dx, dy + y0, interp), mask)
         if s < best[0]:
             best = (s, n, (dx, dy))
     for step in (0.25, 0.125):
@@ -155,7 +166,7 @@ def exact_residual(tile: np.ndarray, bgra: np.ndarray, pitch_x: float, pitch_y: 
             for b in (-step, 0, step):
                 if a == 0 and b == 0:
                     continue
-                s, n = _score(tile, warp_render(bgra, w, h, sx, sy, cx + a, cy + b, interp), mask)
+                s, n = _score(tile, warp_render(bgra, w, h, sx, sy, cx + a, cy + b + y0, interp), mask)
                 if s < best[0]:
                     best = (s, n, (cx + a, cy + b))
     return best
@@ -308,6 +319,73 @@ class CacheIndex:
                            ranked=[(s, self.renders[i], rot) for s, _, _, i, rot in ranked])
         thr = exact_threshold(pitch_y)
         min_px = MIN_PIXELS * (pitch_x * pitch_y) / (SLOT * SLOT)
+        if s0 > thr:
+            res.note = 'no exact render'
+        elif n0 < min_px:
+            res.note = 'too little opaque area'
+        elif not r0.item_id:
+            res.note = 'exact render of an unnamed item'
+        elif runner <= max(thr, WRONG_MIN_RATIO * s0):
+            res.note = 'another item renders the same'
+        else:
+            res.certain = True
+        return res
+
+    def match_clipped(self, tile: np.ndarray, W: int, clip: str, pitch_x: float, pitch_y: float,
+                      phase=None, k: int = SHORTLIST) -> AnchorResult | None:
+        """Exact check of a tile cut by the viewport (``clip`` = 'bottom': the top shows, 'top': the
+        bottom shows).  The item's height is unknown: every footprint of width ``W`` that is at
+        least as tall as the visible rows is tried, the render compared on the visible rows only.
+        Certain only with at least :data:`CLIP_MIN_FRAC` of the item visible, 2x the opaque area of
+        a whole tile, and the same exactness / runner-up rules."""
+        h = tile.shape[0]
+        vis = (h - 1) / pitch_y                                  # visible height in slots
+        hmin = max(1, int(np.ceil(vis - CLIP_TOL)))
+        hmax = min(CLIP_HMAX, int(vis / CLIP_MIN_FRAC + 1e-6))
+        if hmax < hmin:
+            return None
+        tr = max(4, int(round(vis * THUMB)))
+        th = cv2.resize(tile, (THUMB * W, tr), interpolation=cv2.INTER_AREA).astype(np.float32)
+        m = band_mask(tr, THUMB * W, THUMB, hmin)
+        cand = []
+        for Hc in range(hmin, hmax + 1):
+            for fp, rots in (((W, Hc), (0,)), ((Hc, W), (-1, 1) if W != Hc else ())):
+                st = self._thumb.get(fp)
+                if st is None or not rots:
+                    continue
+                rgb, al = st
+                idx = self.by_fp[fp]
+                for rot in rots:
+                    R = rgb if rot == 0 else np.rot90(rgb, rot, axes=(1, 2))
+                    A = al if rot == 0 else np.rot90(al, rot, axes=(1, 2))
+                    sl = slice(0, tr) if clip == 'bottom' else slice(R.shape[1] - tr, None)
+                    wgt = A[:, sl] & m[None]
+                    n = wgt.sum(axis=(1, 2))
+                    d = (np.abs(R[:, sl] - th[None]).mean(axis=3) * wgt).sum(axis=(1, 2)) / np.maximum(n, 1)
+                    d[n < 8] = 999.0
+                    for j in np.argsort(d)[:k]:
+                        cand.append((float(d[j]), idx[int(j)], rot, Hc))
+        cand.sort(key=lambda t: t[0])
+        ranked = []
+        for _, i, rot, Hc in cand[:k]:
+            img = self.full(i)
+            if img is None:
+                continue
+            y0 = 0.0 if clip == 'bottom' else (h - 1) - pitch_y * Hc
+            s, n, ph = exact_residual(tile, _rot(img, rot), pitch_x, pitch_y, Hc, phase=phase,
+                                      sy_fixed=pitch_y / SLOT, y0=y0)
+            ranked.append((s, n, ph, i, rot))
+        if not ranked:
+            return None
+        ranked.sort(key=lambda t: t[0])
+        s0, n0, ph0, i0, rot0 = ranked[0]
+        r0 = self.renders[i0]
+        runner = next((s for s, _, _, i, _ in ranked[1:]
+                       if self.renders[i].item_id != r0.item_id or not r0.item_id), 999.0)
+        res = AnchorResult(r0.item_id, False, s0, runner, r0, rot0, ph0, n0,
+                           ranked=[(s, self.renders[i], rot) for s, _, _, i, rot in ranked])
+        thr = exact_threshold(pitch_y)
+        min_px = CLIP_PIXELS_X * MIN_PIXELS * (pitch_x * pitch_y) / (SLOT * SLOT)
         if s0 > thr:
             res.note = 'no exact render'
         elif n0 < min_px:

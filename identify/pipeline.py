@@ -221,12 +221,27 @@ class Engine:
         if self.anchor_idx is not None:
             self.anchor_idx.reset_bindings()
 
-    def _fp_candidates(self, W: int, H: int) -> list:
-        """api rows (no presets) whose item can occupy a W x H tile."""
-        k = (W, H)
+    def _fp_candidates(self, W: int, H: int, grow: bool = False) -> list:
+        """api rows (no presets) whose item can occupy a W x H tile.  ``grow``: the tile is cut by
+        the viewport and shows ``H`` rows at least - any item W wide (either orientation) and
+        ``H`` or taller, plus every weapon / mod that could be built that wide."""
+        k = (W, H, grow)
         if k not in self._fp_rows:
-            t = Tile(np.zeros((1, 1, 3), np.uint8), W, H)
-            self._fp_rows[k] = [int(r) for r in self._api_rows() if self._footprint_ok(int(r), t, False)]
+            if grow:
+                cat = self.cat
+                rows = []
+                for r in self._api_rows():
+                    r = int(r)
+                    sizes = self.gun_sizes.get(r) or {(int(cat.tw[r]), int(cat.th[r]))}
+                    ok = any((w_ == W and h_ >= H) or (h_ == W and w_ >= H) for w_, h_ in sizes)
+                    if not ok and str(cat.cats[r]) in ('weapon', 'mod') and 'magazine' not in str(cat.names[r]).lower():
+                        ok = any(min(w_, h_) <= W for w_, h_ in sizes)
+                    if ok:
+                        rows.append(r)
+                self._fp_rows[k] = rows
+            else:
+                t = Tile(np.zeros((1, 1, 3), np.uint8), W, H)
+                self._fp_rows[k] = [int(r) for r in self._api_rows() if self._footprint_ok(int(r), t, False)]
         return self._fp_rows[k]
 
     def _visible(self, short: str, w: int, pitch: float) -> str:
@@ -246,32 +261,41 @@ class Engine:
         A label-certified tile binds its exact render to the item permanently."""
         it, panel, tile = w['it'], w['panel'], w['tile']
         ev = det.evidence
-        if it.clipped_top or it.clipped_bottom:
-            return
+        clip = 'top' if (it.clipped_top and not it.clipped_bottom) else 'bottom' if it.clipped_bottom else ''
+        if it.clipped_top and it.clipped_bottom:
+            return                                  # no edge of the item is visible
         x, y, wpx, hpx = it.rect
         if x < 0 or y < 0 or x + wpx > img_bgr.shape[1] or y + hpx > img_bgr.shape[0]:
             return
         W, H = int(it.w), int(it.h)
         px, py = float(panel.pitch_x), float(panel.pitch_y)
+        if clip:
+            H = max(1, int(np.ceil((hpx - 1) / py - anchors_mod.CLIP_TOL)))    # fewest rows the item has
         crop = img_bgr[y:y + hpx, x:x + wpx]
         a1 = None
         if self.anchor_idx is not None and len(self.anchor_idx):
             ph = self._phases.get(id(panel))
-            a1 = self.anchor_idx.match(crop, W, H, px, py, phase=ph, k=ANCHOR_SHORTLIST)
-            if a1 is not None and ph is None and a1.score <= anchors_mod.exact_threshold(py):
+            if clip:
+                # cut by the viewport: the render is compared on the visible rows only
+                a1 = self.anchor_idx.match_clipped(crop, W, clip, px, py, phase=ph, k=ANCHOR_SHORTLIST)
+            else:
+                a1 = self.anchor_idx.match(crop, W, H, px, py, phase=ph, k=ANCHOR_SHORTLIST)
+            if a1 is not None and ph is None and not clip and a1.score <= anchors_mod.exact_threshold(py):
                 self._phases[id(panel)] = a1.phase
         id1 = a1.item_id if (a1 is not None and a1.certain) else ''
         exact1 = a1 is not None and a1.score <= anchors_mod.exact_threshold(py) and \
-            a1.n_px >= anchors_mod.MIN_PIXELS * px * py / (SLOT * SLOT)
+            a1.n_px >= (anchors_mod.CLIP_PIXELS_X if clip else 1.0) * anchors_mod.MIN_PIXELS * px * py / (SLOT * SLOT)
         if a1 is not None:
             ev['anchor_render'] = {'score': round(a1.score, 2), 'runner': round(a1.runner, 2),
                                    'id': a1.item_id, 'hint': a1.render.hint_id if a1.render else '',
                                    'note': a1.note}
         id2, twins = '', []
-        if self.labeler is not None:
+        if self.labeler is not None and clip != 'top':
             st = fontlabel_mod.strip_of(img_bgr, it.rect, py)
+            if st is not None and st.shape[0] > hpx:
+                st = None                           # the cut comes before the label strip ends
             if st is not None:
-                fits, id2, twins = self._label_anchor(st, w, det, a1, W, H, py)
+                fits, id2, twins = self._label_anchor(st, w, det, a1, W, H, py, grow=bool(clip))
                 if fits:
                     ev['anchor_label'] = {'text': fits[0].text, 'total': round(fits[0].total, 2),
                                           'runner': round(fits[1].total, 2) if len(fits) > 1 else None,
@@ -286,6 +310,8 @@ class Engine:
             print(f'[anchors] contradiction at {it.rect}: render {id1} vs label {id2}')
             return
         cid = id2 or id1
+        if clip and not cid:
+            return                                  # a cut tile is certified or left as it was
         if not cid and len(twins) > 1:
             # the label was matched exactly, and the game prints that text for several items
             # ("MP5": receiver / magazine / gun, "D3CRX": two colours) that no exact render
@@ -310,7 +336,7 @@ class Engine:
                 det.uncertain = True
                 det.confidence = min(det.confidence, 0.79)
             return
-        if id2 and exact1 and not id1 and a1.render is not None:
+        if id2 and exact1 and not id1 and a1.render is not None and not clip:
             self._bind(a1.render, id2)              # C: next time the render alone is certain
         r = self._id_row.get(cid)
         if r is None:
@@ -324,11 +350,11 @@ class Engine:
         det.uncertain = False
         ev['certified'] = 'render+label' if (id1 and id2) else ('label' if id2 else 'render')
 
-    def _label_anchor(self, st, w, det, a1, W, H, pitch):
+    def _label_anchor(self, st, w, det, a1, W, H, pitch, grow=False):
         """Closed-set label match.  Returns ``(fits, certified item id or '', twin ids)``."""
         from rapidfuzz import process as rf_process, distance as rf_distance
         c = self.cat
-        rows = self._fp_candidates(W, H)
+        rows = self._fp_candidates(W, H, grow)
         sw = st.shape[1]
         by_vis: dict = {}
         for r in rows:
@@ -350,7 +376,7 @@ class Engine:
                 seen_ids.add(iid)
         for iid in seen_ids:
             r = self._id_row.get(iid)
-            if r is not None and r in self._fp_set(W, H):
+            if r is not None and r in self._fp_set(W, H, grow):
                 texts.append(str(c.shorts[r]))
         # adversarial neighbours: the printed names closest to the leading guesses
         keys = list(by_vis)
@@ -370,10 +396,10 @@ class Engine:
             return fits, twins[0], twins
         return fits, '', twins
 
-    def _fp_set(self, W, H) -> set:
-        k = ('set', W, H)
+    def _fp_set(self, W, H, grow: bool = False) -> set:
+        k = ('set', W, H, grow)
         if k not in self._fp_rows:
-            self._fp_rows[k] = set(self._fp_candidates(W, H))
+            self._fp_rows[k] = set(self._fp_candidates(W, H, grow))
         return self._fp_rows[k]
 
     def _bind(self, render, item_id: str) -> None:
