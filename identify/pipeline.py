@@ -76,6 +76,8 @@ TWIN_GAP_OK = 2.0          # fused-score lead that settles same-label twins by p
 TWIN_GAP_OK_RES = 6.0      # ...when the picture score is the residual alone (no DINO: colour variants differ by little)
 SHAPE_IOU_MAX = 0.65       # twins whose drawn silhouettes overlap this little are different objects
 SHAPE_GAP_FRAC = 0.5       # ...and then need only this fraction of the twin gap
+COLOUR_GAP_OK = 12.0       # look-alike twins: colour-only error lead (0-255 levels) that settles them
+COLOUR_MIN_PX = 30         # common opaque pixels (32 px/slot) needed for a colour comparison
 LABEL_VERIFIED_CONF = 0.97 # exact, unambiguous label read of an item that fits the footprint
 WEAPON_SURE_CONF = 0.95    # certainly a gun (guns are skipped, the exact gun does not matter)
 _CAL_TOKEN = re.compile(r'\d+[.,]?\d*x\d{2}|\d{1,2}ga|[.,]\d{3}', re.I)
@@ -1060,10 +1062,47 @@ class Engine:
         for r in others:
             if r not in rk:
                 continue
-            need = gap * SHAPE_GAP_FRAC if self._shape_distinct(w, me, r) else gap
-            if rk[me] - rk[r] < need:
-                return False
+            if self._shape_distinct(w, me, r):
+                if rk[me] - rk[r] < gap * SHAPE_GAP_FRAC:
+                    return False
+            elif rk[me] - rk[r] < gap:
+                # look-alike shape (colour variants, ammo boxes of one art): the residual cannot
+                # separate them, but the item's own pixels can - colour alone, over the pixels both
+                # templates draw opaque (no background, no overlays)
+                cg = self._colour_gap(w, me, r)
+                if rk[me] - rk[r] < 0.0 or cg is None or cg < COLOUR_GAP_OK:
+                    return False
         return True
+
+    def _colour_gap(self, w, me: int, rival: int):
+        """Mean abs colour error of the tile against the rival's template minus against the picked
+        item's, over the pixels both templates draw fully opaque (positive = the tile is the
+        picked item's colour).  None when there is too little common area or the tile is cut."""
+        tile = w['tile']
+        if tile.clip:
+            return None
+        cm, cr = self._best_cand(w, me), self._best_cand(w, rival)
+        if cm is None or cr is None:
+            return None
+        W, H = int(tile.W), int(tile.H)
+        planes = []
+        for c in (cm, cr):
+            full = self.cat.full_icon(int(c.row))
+            if full is None:
+                return None
+            f = np.ascontiguousarray(np.rot90(full, int(c.rot)))
+            planes.append((cv2.resize(f[:, :, :3], (32 * W, 32 * H), interpolation=cv2.INTER_AREA).astype(np.float32),
+                           cv2.resize(f[:, :, 3], (32 * W, 32 * H), interpolation=cv2.INTER_AREA)))
+        h, wd = tile.img.shape[:2]
+        if (h, wd) != planes[0][1].shape:
+            return None
+        inner = np.zeros((h, wd), bool)
+        inner[8:h - 8, 3:wd - 3] = True
+        m = (planes[0][1] >= 250) & (planes[1][1] >= 250) & inner
+        if int(m.sum()) < COLOUR_MIN_PX:
+            return None
+        t = tile.img.astype(np.float32)[m]
+        return float(np.abs(t - planes[1][0][m]).mean() - np.abs(t - planes[0][0][m]).mean())
 
     def _best_cand(self, w, row: int):
         """Best stage-1 candidate among the item's templates (a gun: and its default builds)."""

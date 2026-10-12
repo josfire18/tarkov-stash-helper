@@ -68,12 +68,39 @@ def test_shape_distinct_twin_needs_only_a_smaller_lead(eng):
     # lead of 4.5: below the full 6.0 gap, above the shape-distinct 3.0 gap
     w = _w(eng, [(idof(21), 4.0), (idof(22), 8.5)])
     assert eng._twins_settled_by_footprint(idof(21), twins, tile, False, w)
-    # the same lead over a colour variant stays unsettled
+    # the same lead over a colour variant stays unsettled while the tile's colour is in between
     w = _w(eng, [(idof(21), 4.0), (idof(23), 8.5)])
-    assert not eng._twins_settled_by_footprint(idof(21), [idof(21), idof(23)], tile, False, w)
+    w['tile'] = _tile_of('left', (130, 140, 70))
+    assert not eng._twins_settled_by_footprint(idof(21), [idof(21), idof(23)], w['tile'], False, w)
     # too small a lead is never enough, even for a different shape
     w = _w(eng, [(idof(21), 4.0), (idof(22), 6.0)])
     assert not eng._twins_settled_by_footprint(idof(21), twins, tile, False, w)
     # one close colour variant among the rivals vetoes the pick
     w = _w(eng, [(idof(21), 4.0), (idof(22), 12.0), (idof(23), 8.5)])
-    assert not eng._twins_settled_by_footprint(idof(21), [idof(21), idof(22), idof(23)], tile, False, w)
+    w['tile'] = _tile_of('left', (130, 140, 70))
+    assert not eng._twins_settled_by_footprint(idof(21), [idof(21), idof(22), idof(23)], w['tile'], False, w)
+
+
+def _tile_of(kind, colour):
+    """A 1x1 stage-1 tile (32 px/slot) showing the given icon on a dark background."""
+    icon = cv2.resize(_icon(kind, colour), (32, 32), interpolation=cv2.INTER_AREA)
+    a = icon[:, :, 3:4].astype(np.float32) / 255.0
+    img = (icon[:, :, :3] * a + np.float32((30, 30, 30)) * (1 - a)).astype(np.uint8)
+    return SimpleNamespace(W=1, H=1, clip='', img=img)
+
+
+def test_colour_variants_are_settled_by_colour_alone(eng):
+    twins = [idof(21), idof(23)]                        # same silhouette, red-ish vs green
+    w = _w(eng, [(idof(21), 4.0), (idof(23), 6.5)])     # residual lead 2.5: far below the 6.0 gap
+    w['tile'] = _tile_of('left', (200, 80, 60))
+    assert eng._colour_gap(w, eng._id_row[idof(21)], eng._id_row[idof(23)]) > 12.0
+    assert eng._twins_settled_by_footprint(idof(21), twins, w['tile'], False, w)
+    # the tile is the green one: the colour gap points the other way, so the red pick stays unsettled
+    w = _w(eng, [(idof(21), 4.0), (idof(23), 6.5)])
+    w['tile'] = _tile_of('left', (60, 200, 80))
+    assert eng._colour_gap(w, eng._id_row[idof(21)], eng._id_row[idof(23)]) < 0
+    assert not eng._twins_settled_by_footprint(idof(21), twins, w['tile'], False, w)
+    # the picture must not prefer the rival either
+    w = _w(eng, [(idof(21), 6.5), (idof(23), 4.0)])
+    w['tile'] = _tile_of('left', (200, 80, 60))
+    assert not eng._twins_settled_by_footprint(idof(21), twins, w['tile'], False, w)
