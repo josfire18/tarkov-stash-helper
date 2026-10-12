@@ -209,6 +209,16 @@ def _line_projection(sub: np.ndarray, axis: int) -> np.ndarray:
     return cv2.reduce(m, axis, cv2.REDUCE_SUM, dtype=cv2.CV_32S).ravel() / 255.0
 
 
+def resolve_in_raid(log_state, bar_visible: bool) -> bool:
+    """Is this frame from inside a raid?  The game's log (``eftlogs.RaidState.get()``) is the source
+    of truth; the lobby menu bar is only a sanity signal (it is never on screen in a raid) and the
+    fallback when the logs cannot be read.  Full-screen lobby screens (flea offer, trader reward
+    screen) hide the bar yet are not a raid - the log says so."""
+    if not log_state:
+        return not bar_visible
+    return log_state.get('state') == 'in_raid' and not bar_visible
+
+
 def menu_chrome(frame: np.ndarray) -> bool:
     """The main-menu bottom bar (MAIN MENU / HIDEOUT / ... / FLEA MARKET ...) is on screen.
 

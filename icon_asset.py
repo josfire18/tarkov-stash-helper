@@ -1,8 +1,16 @@
 """Generates the app/tray icon in-memory so no binary asset needs to be
-hand-authored or committed as an opaque blob. Run this file directly to
-also bake out assets/icon.ico for the PyInstaller build.
+hand-authored or committed as an opaque blob.
+
+assets/icon.ico is a BUILD INPUT (PyInstaller spec).  Only ``python icon_asset.py`` (build.bat)
+may refresh it, and only when the bytes would change; the running app writes its window icon to
+data/ (gitignored) and ``ensure_ico`` refuses to touch assets/.
 """
 from __future__ import annotations
+
+import os
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(_ROOT, 'assets')
 
 from PIL import Image, ImageDraw
 
@@ -81,10 +89,20 @@ def write_ico(path: str) -> None:
     _draw(max(ICO_SIZES)).save(path, format='ICO', sizes=[(s, s) for s in ICO_SIZES])
 
 
+def _inside_assets(path: str) -> bool:
+    try:
+        return os.path.commonpath([os.path.abspath(path), ASSETS_DIR]) == ASSETS_DIR
+    except ValueError:                     # different drives
+        return False
+
+
 def ensure_ico(path: str) -> str | None:
     """Write the multi-size window icon to ``path`` if it is not there yet (the packaged exe ships
-    no loose .ico; data/ is writable).  Returns the path, or None when it cannot be written."""
-    import os
+    no loose .ico; data/ is writable).  Returns the path, or None when it cannot be written.
+    Never writes into assets/ (a tracked build input)."""
+    if _inside_assets(path):
+        print(f'[icon] refusing to write into assets/: {path}')
+        return None
     try:
         if not os.path.isfile(path):
             os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
@@ -95,10 +113,23 @@ def ensure_ico(path: str) -> str | None:
         return None
 
 
+def bake_build_icon(out_path: str | None = None) -> bool:
+    """Build-time only: refresh assets/icon.ico, leaving the file alone when the bytes match."""
+    import io
+    out_path = out_path or os.path.join(ASSETS_DIR, 'icon.ico')
+    buf = io.BytesIO()
+    _draw(max(ICO_SIZES)).save(buf, format='ICO', sizes=[(s, s) for s in ICO_SIZES])
+    try:
+        with open(out_path, 'rb') as fh:
+            if fh.read() == buf.getvalue():
+                return False
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, 'wb') as fh:
+        fh.write(buf.getvalue())
+    return True
+
+
 if __name__ == '__main__':
-    import os
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, 'icon.ico')
-    write_ico(out_path)
-    print(f"Wrote {out_path}")
+    print('Wrote' if bake_build_icon() else 'Unchanged', os.path.join(ASSETS_DIR, 'icon.ico'))
