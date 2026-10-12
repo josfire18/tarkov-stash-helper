@@ -180,13 +180,13 @@ below was a full report run; the gain is what that step alone added.
 
 | bucket (of the 66) | before | after | what resolves it |
 |---|---|---|---|
-| exact label shared with a differently *shaped* item (M9A3 mag vs side grips / pistol, MP5 20-round mag vs MP5 gun, VOG-25 vs Khattabka) | 17 | 0 | `_shape_distinct`: the matched templates' silhouettes overlap <= 0.65 (IoU), so half the twin gap (3.0 residual) is enough |
+| exact label shared with a differently *shaped* item (M9A3 mag vs side grips / pistol, MP5 20-round mag vs MP5 gun, VOG-25 vs Khattabka) | 15 | 0 | `_shape_distinct`: the matched templates' silhouettes overlap <= 0.65 (IoU), so half the twin gap (3.0 residual) is enough |
 | same, but the tile sits on the panel edge without being clipped (ammo packs, G28, Gatorz glasses, Hawk, Stich carrier) | 6 | 0 | an unclipped tile is measured whole: `_certify` no longer treats "touches the panel border" as "may be cut" |
 | settled twins whose calibrated confidence was low (ammo packs whose tarkov.dev art differs from the render: res 11-17) | 3 | 0 | settled twins under an exact game-font label are label-verified (`verified: label+twins`) |
 | label strip pixel offset ("Analgin" at 63.09 px/slot) | 1 | 0 | label anchor x shifts reach +-1 px (the strip edge is an integer pixel, the pitch is not); also certified 490 -> 505 tiles |
 | look-alike twins (colour variants, loose rounds of two calibres, suppressor vs its dust cover): EXFIL cover, PP gs, NT4, Vityaz | 4 | 0 | `_colour_gap`: mean colour error over the pixels *both* templates draw opaque, rival minus pick >= 12 levels, and the picture must not prefer the rival |
 | gun builds: TOZ-106 gun vs stock (exact label), custom-named builds (MP-133 Tactical, KS-23M Drozd; label unreadable) | 4 | 0 | the printed calibre (`20g`, `12g`) is the gun's own and no same-footprint part names it (`_calibre_names_gun`); for an unreadable label also a near-literal gun match (res <= 4) with no part within 3.0 |
-| not resolvable on this evidence (see below) | 31 | 33 | |
+| not resolvable on this evidence (see below) | 33 | 33 | |
 
 The remaining 33 (+4 missed), by cause:
 
