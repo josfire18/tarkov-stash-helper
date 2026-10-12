@@ -136,6 +136,8 @@ class Fit:
     unexplained: float = 0.0     # observed face-coloured pixels outside the candidate's ink (count / ink px)
     total: float = 0.0
     n_ink: int = 0
+    unexplained_strict: float = 0.0   # the same with the plain (narrow, whole-strip) observed-ink test
+    total_strict: float = 0.0
 
 
 def strip_of(img_bgr: np.ndarray, rect: tuple, pitch_y: float) -> np.ndarray | None:
@@ -293,6 +295,26 @@ class LabelRenderer:
         m[:, -1:] = False
         return m
 
+    def wide_ink(self, obs: np.ndarray, pitch: float) -> np.ndarray:
+        """bool: a looser test than :meth:`observed_ink` - neutral grey strokes of any brightness
+        (a selected / dimmed tile draws its label darker, and a thin stroke that covers part of a
+        pixel never reaches the face colour) next to the dark outline.  Only used next to a
+        candidate's own rendering (:data:`NEAR_EM`), never on its own."""
+        o = obs.astype(np.float32)
+        mx, mn = o.max(axis=2), o.min(axis=2)
+        dark = cv2.erode(obs.max(axis=2), np.ones((3, 3), np.uint8)) < 60
+        m = (mx >= WIDE_MIN) & (mx <= WIDE_MAX) & ((mx - mn) <= WIDE_CHROMA) & dark
+        # strokes have height: a one-pixel-high horizontal line is an item's edge, not a glyph
+        m = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_OPEN, np.ones((2, 1), np.uint8)) > 0
+        s = pitch / SLOT
+        top = int(np.floor((self.p.baseline - 0.75 * self.p.size) * s))
+        bot = int(np.ceil((self.p.baseline + 0.5) * s))
+        m[:max(0, top)] = False
+        m[bot:] = False
+        m[:, :1] = False
+        m[:, -1:] = False
+        return m
+
     def match(self, obs: np.ndarray, texts: list, pitch: float, shifts=None) -> list:
         """Score every candidate text (deduplicated by what the game would print) against the
         strip; best first.  ``total`` = ink residual + a penalty for observed label ink the
@@ -300,6 +322,7 @@ class LabelRenderer:
         h, w = obs.shape[:2]
         shifts = shifts or SHIFTS
         ink = self.observed_ink(obs, pitch)
+        wide = self.wide_ink(obs, pitch)
         n_obs = int(ink.sum())
         seen, fits = {}, []
         for t in texts:
@@ -329,12 +352,35 @@ class LabelRenderer:
             bg = self.background(obs, al)
             f.score, f.n_ink = self.residual(obs, f.text, pitch, f.shift[0], f.shift[1], bg)
         for f in fits:                           # unrefined: a lower bound of what a shift could reach
-            f.total = FAR_DISCOUNT * f.score
+            f.total = f.total_strict = FAR_DISCOUNT * f.score
         for f in near:
             _, al = self.render(f.text, w, h, pitch, *f.shift)
             cover = cv2.dilate((al > 0.05).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
-            f.unexplained = float((ink & ~cover).sum()) / max(1, n_obs)
+            cols = np.where(cover.any(axis=0))[0]
+            cl = int(cols[0]) if len(cols) else 0
+            # observed label ink the candidate leaves out: only what could be part of this text -
+            # ink that runs on from the rendering without a gap wider than a word space (an
+            # item's edge across the tile is not) - and, right beside the rendering, the looser
+            # grey-stroke test (a dimmed 'H' left of "DD")
+            gap = int(np.ceil(GAP_EM * self.size(pitch)))
+            has = (ink | wide).any(axis=0)
+            reach, run = cl, 0
+            for c_ in range(cl - 1, -1, -1):
+                if has[c_]:
+                    reach, run = c_, 0
+                else:
+                    run += 1
+                    if run >= gap:
+                        break
+            near_ink = ink.copy()
+            near_ink[:, :reach] = False
+            lo = wide.copy()
+            lo[:, :reach] = False
+            lo[:, :max(0, cl - int(np.ceil(WIDE_EM * self.size(pitch))))] = False
+            f.unexplained = float(((near_ink | lo) & ~cover).sum()) / max(1, n_obs)
             f.total = f.score + UNEXPLAINED_W * f.unexplained
+            f.unexplained_strict = float((ink & ~cover).sum()) / max(1, n_obs)
+            f.total_strict = f.score + UNEXPLAINED_W * f.unexplained_strict
         fits.sort(key=lambda f: f.total)
         return fits
 
@@ -344,6 +390,9 @@ class LabelRenderer:
 SHIFTS = [(0.0, 0.0), (0.25, 0.0), (-0.25, 0.0), (0.0, 0.25), (0.0, -0.25), (0.5, 0.0), (-0.5, 0.0),
           (0.75, 0.0), (-0.75, 0.0), (1.0, 0.0), (-1.0, 0.0)]
 UNEXPLAINED_W = 60.0
+GAP_EM = 0.55                 # ink separated from the rendering by a gap this wide (ems) is not its text
+WIDE_EM = 1.0                 # the looser grey-stroke test applies within this many ems of the rendering
+WIDE_MIN, WIDE_MAX, WIDE_CHROMA = 85, 215, 28
 FAR_DISCOUNT = 0.8            # unrefined candidates are scored optimistically (conservative for certainty)
 LABEL_EXACT = 24.0            # total of an exact label rendering (calibrated, docs/accuracy.md)
 LABEL_MARGIN = 1.6            # the runner-up must score this x worse ...
@@ -351,14 +400,19 @@ LABEL_GAP = 8.0               # ... and at least this much worse
 LABEL_MAX_UNEXPLAINED = 0.10
 
 
-def certain(fits: list) -> bool:
-    """Anchor 2 decision over a closed candidate set (``match`` output)."""
+def certain(fits: list, strict: bool = False) -> bool:
+    """Anchor 2 decision over a closed candidate set (``match`` output).  ``strict``: judged with
+    the plain observed-ink test (no gap rule, no grey-stroke test) - the decision before the
+    dimmed-label / item-edge refinements."""
     if not fits:
         return False
+    tot = (lambda f: f.total_strict) if strict else (lambda f: f.total)
+    une = (lambda f: f.unexplained_strict) if strict else (lambda f: f.unexplained)
+    fits = sorted(fits, key=tot)
     b = fits[0]
-    if b.total > LABEL_EXACT or b.unexplained > LABEL_MAX_UNEXPLAINED:
+    if tot(b) > LABEL_EXACT or une(b) > LABEL_MAX_UNEXPLAINED:
         return False
     if len(fits) == 1:
         return True
-    r = fits[1].total
-    return r >= LABEL_MARGIN * b.total and r - b.total >= LABEL_GAP
+    r = tot(fits[1])
+    return r >= LABEL_MARGIN * tot(b) and r - tot(b) >= LABEL_GAP

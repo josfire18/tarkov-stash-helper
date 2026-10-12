@@ -248,3 +248,63 @@ def test_cut_tile_cannot_be_a_shorter_item(tmp_path):
     tile = np.vstack([_on_bg(r), _on_bg(r)[1:50]])
     res = idx.match_clipped(tile, 1, 'bottom', 63.0, 63.0)
     assert res is None or not res.certain
+
+
+# ---------------------------------------------------------------- label reads on dimmed / busy strips
+def _grey_edge_strip(lr, text, w=127, pitch=63.0, dim_left=None):
+    """A 2-slot wide strip: the label plus (optionally) a dimmed leading glyph (a selected tile draws
+    its label darker) and bright item edges across the tile, far left of the text."""
+    h = int(np.ceil(17 * pitch / 63)) + 1
+    rng = np.random.default_rng(3)
+    base = np.full((h, w, 3), (38, 34, 31), np.float32) + rng.normal(0, 2.0, (h, w, 3))
+    base[0, :] = base[:, 0] = base[:, -1] = (84, 81, 73)
+    rgb, al = lr.render(text, w, h, pitch)
+    out = base * (1 - al[..., None]) + rgb * 255
+    if dim_left:
+        _, al_t = lr.render(dim_left, w, h, pitch)
+        cols = np.where((al_t > 0.01).any(axis=0))[0]
+        x0 = int(cols[0])
+        sel = np.arange(w) < x0
+        out[:, sel] = base[:, sel] + 0.7 * (out[:, sel] - base[:, sel])
+    return out, base
+
+
+def test_dimmed_leading_glyph_is_not_read_as_a_shorter_label():
+    """'HDD' with a dimmed 'H': the brightest-ink test saw only 'DD', which then won."""
+    lr = _real_renderer()
+    out, _ = _grey_edge_strip(lr, 'HDD', dim_left='DD')
+    st = np.clip(out, 0, 255).astype(np.uint8)
+    fits = lr.match(st, ['DD', 'HDD', 'DP', 'Tape'], 63.0)
+    assert fits[0].text == 'HDD' and FL.certain(fits)
+    dd = next(f for f in fits if f.text == 'DD')
+    assert dd.unexplained > FL.LABEL_MAX_UNEXPLAINED
+
+
+def test_item_edges_far_from_the_text_are_not_label_ink():
+    """The white corner of an item across the tile is grey ink next to dark pixels, but it is not
+    part of the label (w01 'Printer paper')."""
+    lr = _real_renderer()
+    out, base = _grey_edge_strip(lr, 'Paper')
+    out[6, 65:71] = (205, 206, 205)                     # a bright one-row edge, ~2 ems left of the text
+    out[7, 13] = out[8, 13] = out[7, 26] = (200, 204, 203)
+    out[5:9, 60:80] = np.where(out[5:9, 60:80] > 150, out[5:9, 60:80], 25)
+    st = np.clip(out, 0, 255).astype(np.uint8)
+    fits = lr.match(st, ['Paper', 'Car', 'Teapot', 'Tape'], 63.0)
+    assert fits[0].text == 'Paper' and fits[0].unexplained == 0.0 and FL.certain(fits)
+
+
+def test_ink_run_on_from_the_text_still_counts_against_a_shorter_candidate():
+    lr = _real_renderer()
+    out, _ = _grey_edge_strip(lr, 'Matches')
+    st = np.clip(out, 0, 255).astype(np.uint8)
+    fits = lr.match(st, ['Matches', 'ches', 'Tape'], 63.0)
+    short = next(f for f in fits if f.text == 'ches')
+    assert fits[0].text == 'Matches' and short.unexplained > FL.LABEL_MAX_UNEXPLAINED
+
+
+def test_relaxed_read_never_flags_a_shared_label_on_its_own():
+    """Strict decision = the plain observed-ink test; used so shared (twin) labels are flagged
+    only where they already were."""
+    a = FL.Fit('FMJ', 18.0, total=18.0, unexplained=0.0, total_strict=18.0, unexplained_strict=0.0)
+    b = FL.Fit('M3', 29.0, total=60.0, unexplained=0.5, total_strict=25.0, unexplained_strict=0.0)
+    assert FL.certain([a, b]) and not FL.certain([a, b], strict=True)

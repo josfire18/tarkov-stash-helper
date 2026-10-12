@@ -256,3 +256,14 @@ a readable label: ADAR is a top-cut custom build (SVD stock, 0.86 slot visible, 
 Ushanka is a 2x2 hat whose left column is hidden by another window (width unknown), and Hawk and the
 Expeditionary fuel tank in RandomStash are not cut at all (their game-font label does not fit; Hawk reads
 "Hawk" by OCR but the strip match fails). Tests: `tests/test_identify_anchors.py::test_cut_tile_*`.
+
+## Label reads on dimmed / busy strips (2026-10-12, lean, strict)
+
+Strict lean eval 1027 -> 1030 correct, 0 wrong, 34 -> 31 Check, 2 missed; certified 510 -> 537, certified-but-wrong 0; no screenshot lost a correct tile.
+
+Causes found per tile (a global "wider ink test" certified more but lost correct tiles, so none of this widens the ink test globally):
+
+* **HDD x2 (w01)**: the selected tile draws the label darker and its 'H' strokes are thin, so the face-colour ink test saw only "DD" and the candidate "DD" (score 8.8) beat "HDD" (10.4). `LabelRenderer.wide_ink` (neutral grey strokes 85-215, dark neighbour, at least 2 rows tall) is now counted as unexplained ink, but only within one em left of a candidate's rendering. "DD" now leaves the H unexplained, "HDD" wins.
+* **Printer paper (w01)**: the white item corner across the tile produced "label ink" 20+ px left of the text (unexplained 0.26). Observed ink now only counts when it runs on from the rendering without a gap wider than `GAP_EM` (0.55 em, a word space).
+* **Shared labels are not newly flagged**: a label that became certain only under the relaxed read and is printed by several items ("FMJ", 24 ammo) keeps its earlier outcome (`certain(fits, strict=True)` in `_label_anchor`); the relaxed read only certifies a unique item.
+* **Hawk (w01) and fuel tank (RandomStash), NOT fixed**: the strip match is exact ("Hawk" 16.7 vs 42.9, "Fuel" 15.1 vs 36.8), but the tile is a viewport-cut taller item (Hawk gunpowder is 1x2, the tile is cut by the panel's bottom edge and segmented as 1x1; the fuel tank is a 2x2 cut by the image's bottom edge, 2x1) and `it.clipped_bottom` / `panel.clip_bottom` is False for both, so the footprint filter drops the true item from the candidate texts. The cause is the panel's bottom-clip detection, not the label read. Both also print a label shared with another item ("Hawk": tomahawk, "Fuel": Metal fuel tank) that the picture would still have to settle.

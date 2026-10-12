@@ -394,6 +394,8 @@ class Engine:
         twins = sorted(by_vis.get(fits[0].text, set()))
         if len(twins) == 1:
             return fits, twins[0], twins
+        if not fontlabel_mod.certain(fits, strict=True):
+            return fits, '', []          # a shared label is flagged only where the plain read already was
         return fits, '', twins
 
     def _fp_set(self, W, H, grow: bool = False) -> set:
