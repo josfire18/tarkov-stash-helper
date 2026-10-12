@@ -680,3 +680,167 @@ class LogScanner:
         out['folders'] = len(recs)
         out['scanned_at'] = self.last_scan_at
         return out
+
+
+# ---------------------------------------------------------------------------
+# Live raid state (lobby / matching / loading / in raid) from the running session's log
+# ---------------------------------------------------------------------------
+
+# Lines of the live ``application`` log that move the state machine.  Bytes: the log is tailed raw.
+_RAID_EVENTS = (
+    (b'|application|Matching with group id', 'matching'),
+    (b'|application|MatchingCompleted', 'loading'),
+    (b'|application|LocationLoaded', 'loading'),
+    (b'TRACE-NetworkGameCreate profileStatus', 'loading'),
+    (b'|application|GameStarted', 'in_raid'),
+    (b'TRACE-NetworkGameCreate 6', 'in_raid'),            # the step right after GameStarted
+    (b'|application|BEClient exit', 'lobby'),             # raid over (and once at game launch)
+    (b'|application|Application awaken', 'lobby'),
+)
+_LINE_TS_RE = re.compile(rb'^(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d)(?:\.\d+)?(?: ([+-]\d\d:\d\d))?\|')
+RAID_FIRST_READ_MAX = 4 * 1024 * 1024        # a first look at an old, huge log reads only its tail
+RAID_FOLDER_RECHECK_S = 5.0                  # how often the Logs folder is listed for a newer session
+RAID_HISTORY_MAX = 512
+
+
+class RaidState:
+    """Where the player is, from the game's own live log: ``lobby`` / ``matching`` / ``loading`` /
+    ``in_raid``.  Tails the newest session folder's ``application`` log (only appended bytes are
+    read; a newer folder takes over), so ``get()`` is cheap enough to call on every poll.
+
+    ``install_dir`` is a path or a callable returning one (None = not installed / not found)."""
+
+    def __init__(self, install_dir=None, clock=time.time):
+        self._install = install_dir
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._folder = None            # name of the session folder being tailed
+        self._path = None              # the application log file in it
+        self._offset = 0
+        self._state = 'lobby'
+        self._since = None
+        self._history = []             # [(ts, state)] transitions, oldest first
+        self._checked = -1e9
+        self._ok = False
+
+    # -- public ---------------------------------------------------------------
+    def get(self):
+        """``{'state', 'since', 'source': 'logs'}`` or None when the logs cannot be read."""
+        with self._lock:
+            try:
+                self._poll()
+            except Exception:
+                self._ok = False
+            if not self._ok:
+                return None
+            return {'state': self._state, 'since': self._since, 'source': 'logs'}
+
+    def in_raid(self):
+        """True / False from the logs, None when unknown (callers fall back to the menu-bar check)."""
+        st = self.get()
+        return None if st is None else st['state'] == 'in_raid'
+
+    def state_at(self, ts):
+        """The state at a past time of this session (a session starts in the lobby)."""
+        with self._lock:
+            out = 'lobby'
+            for t, s in self._history:
+                if t > ts:
+                    break
+                out = s
+            return out
+
+    # -- internals --------------------------------------------------------------
+    def _install_dir(self):
+        inst = self._install() if callable(self._install) else self._install
+        return inst or None
+
+    def _reset_session(self):
+        self._path, self._offset = None, 0
+        self._state, self._since, self._history = 'lobby', None, []
+
+    def _newest_folder(self, inst):
+        best, best_ts = None, None
+        with os.scandir(os.path.join(inst, LOG_DIR_NAME)) as it:
+            for e in it:
+                ts = folder_start_time(e.name) if e.is_dir() else None
+                if ts is not None and (best_ts is None or ts > best_ts):
+                    best, best_ts = e.name, ts
+        return best
+
+    def _poll(self):
+        inst = self._install_dir()
+        if not inst:
+            self._ok = False
+            return
+        now = self._clock()
+        if self._folder is None or now - self._checked >= RAID_FOLDER_RECHECK_S:
+            self._checked = now
+            newest = self._newest_folder(inst)
+            if newest is None:
+                self._folder = None
+                self._ok = False
+                return
+            if newest != self._folder:
+                self._folder = newest
+                self._reset_session()
+            elif self._path is not None:                   # the log may have rotated to a newer part
+                files = _log_files(os.path.join(inst, LOG_DIR_NAME, self._folder))['application']
+                if files and files[-1][0] != self._path:
+                    self._path, self._offset = files[-1][0], 0
+        if self._path is None or not os.path.isfile(self._path):
+            files = _log_files(os.path.join(inst, LOG_DIR_NAME, self._folder))['application']
+            if not files:
+                self._ok = True            # session just started: nothing logged yet = lobby
+                return
+            self._path, self._offset = files[-1][0], 0     # (a rotated part, _001, starts fresh)
+        self._tail()
+        self._ok = True
+
+    def _tail(self):
+        size = os.path.getsize(self._path)
+        if size < self._offset:            # truncated / replaced: start over
+            self._reset_session_keep_path()
+        if size == self._offset:
+            return
+        start = self._offset
+        mid_line = False
+        if start == 0 and size > RAID_FIRST_READ_MAX:
+            start, mid_line = size - RAID_FIRST_READ_MAX, True
+        with open(self._path, 'rb') as f:
+            f.seek(start)
+            data = f.read(size - start)
+        end = data.rfind(b'\n')
+        if end < 0:                        # no complete line yet
+            return
+        self._offset = start + end + 1
+        lines = data[:end].split(b'\n')
+        for line in (lines[1:] if mid_line else lines):
+            self._feed(line)
+
+    def _reset_session_keep_path(self):
+        path = self._path
+        self._reset_session()
+        self._path = path
+
+    def _feed(self, line):
+        new = None
+        for mark, state in _RAID_EVENTS:
+            if mark in line:
+                new = state
+                break
+        if new is None or new == self._state:
+            return
+        ts = None
+        m = _LINE_TS_RE.match(line)
+        if m:
+            try:
+                ts = parse_log_time(m.group(1).decode(), m.group(2).decode(),
+                                    m.group(3).decode() if m.group(3) else None)
+            except ValueError:
+                pass
+        if ts is None:
+            ts = self._clock()
+        self._state, self._since = new, ts
+        self._history.append((ts, new))
+        del self._history[:-RAID_HISTORY_MAX]

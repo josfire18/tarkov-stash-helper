@@ -58,6 +58,11 @@ window.TSH = (() => {
       case 'scanned': if (st.last_scan_ts) msg = 'Updated ' + T.ago(Date.now() / 1000 - st.last_scan_ts); break;
     }
     const scene = st && T.sceneLabel(st.scene);
+    const rs = st && st.raid_state && st.raid_state.state;
+    if (rs && st.state !== 'no_game' && st.state !== 'disabled') {
+      const lab = { in_raid: 'In raid', lobby: 'Lobby', matching: 'Matching', loading: 'Loading raid' }[rs];
+      if (lab) tip = tip ? lab + ' · ' + tip : lab;
+    }
     if (scene && !tip) tip = scene;
     else if (scene) tip = scene + ' · ' + tip;
     if (st && st.game && !tip) tip = `Tarkov ${st.game.size[0]}×${st.game.size[1]}, capture: ${st.backend || '?'}`;

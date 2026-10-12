@@ -22,7 +22,7 @@ import time
 import cv2
 
 from .capture import CaptureManager
-from .detect import InventoryDetector
+from .detect import InventoryDetector, resolve_in_raid
 from .collect import SceneCollector
 from .trigger import Observation, Trigger, thumbnail, view_hash
 from .winapi import GAME_EXE, Win32, locate_game
@@ -65,12 +65,15 @@ def _below_normal_priority():
 
 class AutoScanner:
     def __init__(self, scan_fn, get_settings, busy_fn=None, win32=None, capture=None,
-                 detector=None, clock=time.monotonic, wall=time.time, collect_dir=None, progressive=False):
+                 detector=None, clock=time.monotonic, wall=time.time, collect_dir=None, progressive=False,
+                 raid_state_fn=None):
         # frame_bgr -> sell-scan payload dict.  With ``progressive`` the scan runs in a worker thread
         # and is called as ``scan_fn(frame, publish=cb, cancel=fn)``: ``cb(payload)`` publishes a
         # provisional result (own seq), the return value is the final one (next seq); ``fn()`` turns
         # true when a newer view superseded the scan, which then raises / returns and is dropped.
         self.scan_fn = scan_fn
+        self.raid_state_fn = raid_state_fn        # () -> {'state', 'since', 'source'} from the game's log, or None
+        self._raid_state = None
         self.progressive = progressive
         self._job = None                          # (thread, cancel Event) of the running progressive scan
         self.get_settings = get_settings
@@ -138,7 +141,7 @@ class AutoScanner:
             timing = (self._result or {}).get('timing')
         st.update(scene=scene, timing=timing, enabled=self.enabled(), seq=seq, last_scan_ts=ts,
                   last_scan_age=(self.wall() - ts) if ts else None,
-                  message=MESSAGES.get(st.get('state'), ''),
+                  message=MESSAGES.get(st.get('state'), ''), raid_state=self._log_raid_state(),
                   backend=self.capture.backend_name, detect_ms=round(self._last_detect_ms, 1),
                   grab_ms=round(self._last_grab_ms, 1))
         return st
@@ -207,6 +210,17 @@ class AutoScanner:
             with self._cond:
                 self._cond.notify_all()
 
+    def _log_raid_state(self):
+        """The game log's raid state (None when unavailable); kept for the status endpoint."""
+        st = None
+        if self.raid_state_fn is not None:
+            try:
+                st = self.raid_state_fn()
+            except Exception:
+                st = None
+        self._raid_state = st
+        return st
+
     def _locate(self, now: float, exe: str):
         if self._game is None or now - self._game_ts >= RELOCATE_S:
             self._game = locate_game(self.win, exe, os.getpid())
@@ -249,15 +263,16 @@ class AutoScanner:
             return POLL_ACTIVE_S
         det = self.detector.detect(res.frame)
         self._last_detect_ms = det.ms
+        in_raid = resolve_in_raid(self._log_raid_state(), det.menu_chrome)
         thumb = thumbnail(res.frame) if det.is_inventory else None
         if (thumb is not None and self.collector is not None
                 and (self.get_settings() or {}).get('collect_scene_frames', True)):
             try:
-                self.collector.observe(res.frame, view_hash(thumb), in_raid=not det.menu_chrome,
+                self.collector.observe(res.frame, view_hash(thumb), in_raid=in_raid,
                                        meta={'monitor': game.monitor.device})
             except Exception as e:
                 print(f'[collect] {e}')
-        dec = self.trigger.observe(Observation(det.is_inventory, det.menu_chrome, thumb, res.blank), now)
+        dec = self.trigger.observe(Observation(det.is_inventory, not in_raid, thumb, res.blank), now)
         if dec.scan:
             self._scan(res.frame, thumb, now, game_info)
             return POLL_ACTIVE_S
@@ -269,7 +284,7 @@ class AutoScanner:
             self._idle_polls = 0
             return POLL_ACTIVE_S
         self._idle_polls += 1
-        return POLL_RAID_S if self._idle_polls >= RAID_BACKOFF and not det.menu_chrome else POLL_IDLE_S
+        return POLL_RAID_S if self._idle_polls >= RAID_BACKOFF and in_raid else POLL_IDLE_S
 
     def scanning(self) -> bool:
         """A progressive scan (first look published, certification pending) is running."""

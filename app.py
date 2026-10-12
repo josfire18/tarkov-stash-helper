@@ -1233,6 +1233,24 @@ _log_scanner = eftlogs.LogScanner(EFTLOGS_CACHE_PATH)
 _log_progress = {'key': None, 'result': None, 'error': None, 'scanned': False}
 _log_progress_lock = threading.Lock()
 
+_install_cache = {'at': -1e9, 'dir': None}
+
+
+def _eft_install_dir():
+    """The EFT install folder, looked up at most every 30 s (registry + disk probes are not free)."""
+    if time.time() - _install_cache['at'] > 30:
+        try:
+            s = load_json(SETTINGS_PATH, default_settings)
+            _install_cache['dir'] = eftlogs.find_install_dir(s.get('eft_install_dir') or None)
+        except Exception:
+            _install_cache['dir'] = None
+        _install_cache['at'] = time.time()
+    return _install_cache['dir']
+
+
+# lobby / matching / loading / in_raid straight from the live game log (None = unreadable)
+raid_state = eftlogs.RaidState(_eft_install_dir)
+
 
 def scan_task_logs(full=False):
     """Bring the log records up to date (full: re-check every folder; otherwise only new folders
@@ -2851,8 +2869,8 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None, lean=False, publish
         in_raid = None
         if frame_bgr is not None:          # whole game frame: the lobby menu bar tells raid from lobby
             try:
-                from autoscan.detect import menu_chrome
-                in_raid = not menu_chrome(img_bgr)
+                from autoscan.detect import menu_chrome, resolve_in_raid
+                in_raid = resolve_in_raid(raid_state.get(), menu_chrome(img_bgr))
             except Exception:
                 pass
         def first_look(records, prov_panels):
@@ -2890,6 +2908,7 @@ def _load_settings():
 import autoscan  # noqa: E402  (needs app + the helpers above)
 autoscanner = autoscan.AutoScanner(_autoscan_scan, _load_settings,
                                    busy_fn=lambda: _scan_state['running'], progressive=True,
+                                   raid_state_fn=raid_state.get,
                                    collect_dir=os.path.join(DATA, 'scenes', 'live'))
 app.register_blueprint(autoscan.make_blueprint(
     autoscanner, _load_settings, lambda s: save_json(SETTINGS_PATH, s)))
