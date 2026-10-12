@@ -267,3 +267,14 @@ Causes found per tile (a global "wider ink test" certified more but lost correct
 * **Printer paper (w01)**: the white item corner across the tile produced "label ink" 20+ px left of the text (unexplained 0.26). Observed ink now only counts when it runs on from the rendering without a gap wider than `GAP_EM` (0.55 em, a word space).
 * **Shared labels are not newly flagged**: a label that became certain only under the relaxed read and is printed by several items ("FMJ", 24 ammo) keeps its earlier outcome (`certain(fits, strict=True)` in `_label_anchor`); the relaxed read only certifies a unique item.
 * **Hawk (w01) and fuel tank (RandomStash), NOT fixed**: the strip match is exact ("Hawk" 16.7 vs 42.9, "Fuel" 15.1 vs 36.8), but the tile is a viewport-cut taller item (Hawk gunpowder is 1x2, the tile is cut by the panel's bottom edge and segmented as 1x1; the fuel tank is a 2x2 cut by the image's bottom edge, 2x1) and `it.clipped_bottom` / `panel.clip_bottom` is False for both, so the footprint filter drops the true item from the candidate texts. The cause is the panel's bottom-clip detection, not the label read. Both also print a label shared with another item ("Hawk": tomahawk, "Fuel": Metal fuel tank) that the picture would still have to settle.
+
+## Bottom / top clip detection (2026-10-12, lean, strict)
+
+The Hawk and fuel-tank tiles above are fixed: strict lean eval 1030 -> 1032 correct, 0 wrong, 31 -> 29 Check, 2 missed; certified 537 -> 539, certified-but-wrong 0; no screenshot lost a correct tile (w01 198 -> 199, RandomStash 57 -> 58, the rest unchanged).
+
+`grid.mark_cut_edges` runs on every panel after `_extend_sides` and sets `clip_top` / `clip_bottom` for two cuts that leave a complete-looking edge row (`_build_panel` only flags a partial row it can measure):
+
+* the panel runs to the image's edge (`y0 <= 2`, `y1 >= frame_h - 3`): a screenshot that ends mid-stash (RandomStash: the fuel tank is a 2x2 whose second row is not in the image);
+* another window covers the panel and leaves under a fifth of the next row visible (w01: the Medicine window hides all but a 13 px sliver below the Hawk row): the cell borders still run on in the band just beyond the lattice (neutral vertical ridges at >= 50 % of the inner lattice columns over 8 px), where a real panel edge only has chrome. Measured on all 12 eval frames: 0.7 - 1.0 for the covered panels, <= 0.11 everywhere else, and the same test above the first row.
+
+Items of the flagged row then carry `clipped_bottom` / `clipped_top`, so the footprint filter admits taller items, and the cut-tile certification (exact render on the visible rows, label certified on the grown footprint) applies. Geometry is unchanged: the rect stays the visible cell. `AnchorIndex.match_clipped` now compares on the rows a candidate has when a flagged tile is complete (visible height a hair over the candidate's own rows crashed the broadcast).

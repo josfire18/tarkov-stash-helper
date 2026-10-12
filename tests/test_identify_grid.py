@@ -127,3 +127,29 @@ def test_sub_grids_a_few_px_apart_are_both_found():
     assert len(g.panels) == 2, spans
     assert [s[2] for s in spans] == [4, 2] and all(s[3] == 5 for s in spans)
     assert abs(spans[1][0] - (20 + 4 * 63 + 12)) <= 1
+
+
+def test_panel_running_to_the_image_bottom_is_clipped():
+    # a screenshot that ends mid-stash: the last row looks complete but its items run on below
+    img, _, _, _ = render_panel(63.0, 8, 6, ITEMS, origin=(40, 30))
+    cut = img[:30 + 6 * 63 + 1]                     # image ends on the closing line of row 6
+    p = detect_grid(cut).panels[0]
+    assert p.clip_bottom and not p.clip_top
+    p0 = detect_grid(img).panels[0]                 # same panel with room below: not clipped
+    assert not p0.clip_bottom
+
+
+def test_panel_running_to_the_image_top_is_clipped():
+    img, _, _, _ = render_panel(63.0, 8, 6, ITEMS, origin=(40, 30), chrome=False)
+    cut = img[30:]
+    p = detect_grid(cut).panels[0]
+    assert p.clip_top and not p.clip_bottom
+
+
+@pytest.mark.parametrize('sliver', [0.15, 0.18])
+def test_sliver_of_the_next_row_below_the_lattice_marks_clip_bottom(sliver):
+    # another window leaves only a sliver (< 20 % of a row) of the next row visible: the cell
+    # borders still run on below the last lattice line, so the last full row's items may continue
+    img, _, _, _ = render_panel(63.0, 8, 7, ITEMS, bottom_partial=1.0 - sliver)
+    p = detect_grid(img).panels[0]
+    assert p.n_rows == 6 and p.clip_bottom

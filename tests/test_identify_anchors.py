@@ -250,6 +250,20 @@ def test_cut_tile_cannot_be_a_shorter_item(tmp_path):
     assert res is None or not res.certain
 
 
+def test_cut_tile_that_is_in_fact_complete_does_not_crash(tmp_path):
+    """A bottom-row tile flagged clipped may show every row of a 3-slot item: the visible height
+    (3 slots + the closing line) is then a hair over the candidate's own 3 rows."""
+    r = _render(50, W=1, H=3)
+    idx = _index(tmp_path, [r])
+    idx.bind(idx.renders[0].key, 'tall-item')
+    full = _on_bg(r)
+    tile = np.vstack([full] + [full[-1:]] * 6)[:3 * 63 + 5]      # 3.06 slots visible: 49 thumbnail rows
+    res = idx.match_clipped(tile, 1, 'bottom', 63.0, 63.0)
+    assert res is None or res.item_id in ('', 'tall-item')
+    res = idx.match_clipped(tile, 1, 'top', 63.0, 63.0)
+    assert res is None or res.item_id in ('', 'tall-item')
+
+
 # ---------------------------------------------------------------- label reads on dimmed / busy strips
 def _grey_edge_strip(lr, text, w=127, pitch=63.0, dim_left=None):
     """A 2-slot wide strip: the label plus (optionally) a dimmed leading glyph (a selected tile draws

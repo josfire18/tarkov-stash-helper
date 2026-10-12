@@ -522,6 +522,7 @@ def _detect(img_bgr: np.ndarray, pitch_hint: float | None, min_cells: int,
     if panels:
         rh, rv = ridge_masks(img_bgr, contrast=10, neutral_only=True)
         panels = [_extend_sides(p, rv, panels) for p in panels]
+        panels = [mark_cut_edges(p, rv, img_bgr.shape[0]) for p in panels]
 
     if pitch_hint and pitch_x and abs(pitch_x - pitch_hint) / pitch_hint > 0.08:
         warnings.append(f'detected pitch {pitch_x:.1f}px differs from screen-implied '
@@ -637,6 +638,34 @@ def _extend_sides(p: Panel, rv: np.ndarray, others: list) -> Panel:
     import dataclasses
     return dataclasses.replace(p, xs=xs, n_cols=len(xs) - 1, x0=int(xs[0]), x1=int(xs[-1]) + 1,
                                ox=float(xs[0]) if xs[0] != p.xs[0] else p.ox)
+
+
+def mark_cut_edges(p: Panel, rv: np.ndarray, frame_h: int, band_px: int = 8, min_cov: float = 0.5) -> Panel:
+    """Flag a first / last row whose items run on past the visible lattice.
+
+    ``_build_panel`` only sees a cut row when its lines are long enough to be measured; two
+    other cuts leave a complete-looking row: (1) the panel runs to the image's top / bottom edge
+    (a screenshot that ends mid-stash), and (2) another window covers the panel and leaves less
+    than a fifth of the next row visible: its cell borders (vertical lattice ridges) still show in a
+    band just beyond the lattice, where a real panel edge has only chrome.  Such a panel gets
+    ``clip_top`` / ``clip_bottom`` so its edge-row items may be taller / start higher than shown."""
+    import dataclasses
+    H = int(frame_h)
+    ct, cb = p.clip_top, p.clip_bottom
+
+    def ridge_cover(y_a: int, y_b: int) -> float:
+        y_a, y_b = max(0, y_a), min(rv.shape[0], y_b)
+        inner = p.xs[1:-1]
+        if y_b - y_a < 4 or not inner:
+            return 0.0
+        return float(np.mean([rv[y_a:y_b, max(0, x - 2):x + 3].any(axis=1).mean() for x in inner]))
+    if not cb:
+        cb = p.y1 >= H - 3 or ridge_cover(p.y1 + 2, p.y1 + 2 + band_px) >= min_cov
+    if not ct:
+        ct = p.y0 <= 2 or ridge_cover(p.y0 - 1 - band_px, p.y0 - 1) >= min_cov
+    if (ct, cb) == (p.clip_top, p.clip_bottom):
+        return p
+    return dataclasses.replace(p, clip_top=ct, clip_bottom=cb)
 
 
 def _build_panel(hmc: np.ndarray, vmc: np.ndarray, ax: _Axis, ay: _Axis) -> Panel | None:
