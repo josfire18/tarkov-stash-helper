@@ -42,6 +42,7 @@ Next window, in order:
 ## Status 2026-10-11 (v0.4.1)
 Done: raid state from the game logs (#13); all lobby screens recognised on 38 real 1.2.0 frames, incl. flea offer, trader, receive-all, scav transfer (#14); weak picture match without label never confident; v0.4.1 released.
 Strict lean eval: 993 correct / 0 wrong / 66 check / 4 missed; certified 490, certified-but-wrong 0.
+Recall fixes on `feat/grid-recall` (38 real 1.2.0 frames): dim trader/flea stash lattice fitted inside the known stash region (`identify/stashfit.py`, dim-aware empty test + edge model) - frame 1 0 -> 120 cells, frames 6-8/26/33/34 60-100 -> 120; scav-transfer backpack found whole (4x5, was 2-3 columns: neutral bright frame lines count in `_grid_extent` on that screen); the 2 eval tiles lost to the empty-slot threshold are found again (gradient-aware empty rule: std < 8, or std < 11 with a plane-fit residual < 4.5).
 Next:
 1. Real in-raid inventory frames (none yet — all 4 'raid' frames were lobby screens) → verify own vs loot + Grab/Drop.
 2. Dim trader-screen stash: detect_grid finds few cells (frames 1, 5-10).

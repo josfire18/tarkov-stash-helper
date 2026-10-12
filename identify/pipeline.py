@@ -586,6 +586,13 @@ class Engine:
             if cancel is not None and cancel():
                 raise ScanCancelled()
             self._certify(img_bgr, w, w['det'])
+            d = w['det']
+            if w['it'].dim and not d.evidence.get('certified'):
+                # a trader screen dims the items the trader does not buy: the picture and the label
+                # are darkened, so neither the catalogue match nor the OCR read is trustworthy
+                d.uncertain = True
+                d.confidence = min(d.confidence, 0.5)
+                d.evidence['note'] = 'drawn dimmed (trader screen): not named confidently'
             self.tile_cache.put(w['key'], _to_cache(w['det']))
 
     # ------------------------------------------------------------------
