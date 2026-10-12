@@ -105,6 +105,15 @@ def _snap_frame(box, sh, sv, weak_v, weak_h, pitch, top_clip_y=None):
     left = sv[:, max(0, xl - 1):xl + 2].any(1)
     lx = _run(top, xl, gap) if not top_clipped else bx1 - xl
     ly = _run(left, yt, gap)
+    if not top_clipped:
+        nc0 = int(round(lx / pitch))
+        if nc0 < 1 or abs(lx - nc0 * pitch) > SNAP_TOL * pitch * max(1.0, nc0 ** 0.5) or ly < 0.7 * pitch:
+            # item art or a highlight border breaks the traced frame lines: the box itself may still
+            # be a whole number of cells (a lit-up slot, a carton drawn over the left border)
+            fx, fy = bx1 - bx0, by1 - by0
+            ncb, nrb = int(round(fx / pitch)), int(round(fy / pitch))
+            if ncb >= 1 and nrb >= 1 and abs(fx - ncb * pitch) <= 0.1 * pitch and abs(fy - nrb * pitch) <= 0.1 * pitch:
+                xl, yt, lx, ly = bx0, by0, fx, fy
     nc = int(round(lx / pitch))
     if nc < 1 or abs(lx - nc * pitch) > SNAP_TOL * pitch * max(1.0, nc ** 0.5):
         return None

@@ -39,7 +39,8 @@ window.TSH = (() => {
   T.ago = sec => sec < 90 ? Math.max(0, Math.round(sec)) + ' s ago' : sec < 5400 ? Math.round(sec / 60) + ' min ago' : Math.round(sec / 3600) + ' h ago';
 
   T.sceneLabel = sc => ({ lobby_gear: 'Lobby · gear', lobby_stash: 'Lobby · stash', raid_inventory: 'Raid · inventory',
-    raid_loot: 'Raid · looting', trader: 'Trader' })[sc] || '';
+    raid_loot: 'Raid · looting', trader: 'Trader', flea_offer: 'Flea market · offer', flea_handover: 'Flea market · hand over',
+    showcase: 'Incoming items', scav_transfer: 'Scav loot transfer' })[sc] || '';
 
   const pill = document.getElementById('pill'), text = document.getElementById('pill-text');
   function paint() {

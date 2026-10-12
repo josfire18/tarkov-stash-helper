@@ -14,6 +14,7 @@ Usage window 06:40–11:40 UTC (2026-10-03), target ≈ 20 %/h, checked every ~2
 | 6 | Hideout levels read from the hideout screen by the auto-scan | Sonnet | after 3 |
 | 7 | App icon in the taskbar: own AppUserModelID + window/taskbar icon (shows the Python icon today), exe icon in the spec | orchestrator | done on `feat/fast-first` |
 | 8 | Integrate, full test suite, rebuild exe, release | orchestrator | last |
+| 9 | Scene layer on every lobby screen (`feat/scene-lobby`, game 1.2.0 frames): stash toolbar found anywhere (flea 'Offer creation' window, trader, receive-all, scav loot transfer); scenes `flea_offer` `flea_handover` `trader` `showcase` `scav_transfer`; roles `incoming` (advised like stash) / `trader_goods` `handover` `offer_window` (never scanned or advised) | Sonnet | done: 38/38 frames labelled right (see tests/test_scene_lobby.py) |
 
 ## Findings that shape the work
 - Raid recordings on this machine are 1–4 min combat clips: no inventory frames. Real scene data

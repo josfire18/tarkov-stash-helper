@@ -33,7 +33,8 @@ from .config import SLOT
 from .grid import GridResult, Panel, line_mask
 
 ROLES = ('stash', 'own_rig', 'own_pockets', 'own_backpack', 'own_pouch', 'own_special', 'own_other',
-         'loot', 'container_window', 'picker', 'unknown')
+         'loot', 'container_window', 'picker', 'incoming', 'trader_goods', 'offer_window', 'handover',
+         'unknown')
 
 # slot header text -> role.  kind 'right': the grid sits right of the slot box (2 cells wide)
 # under the header; kind 'under': the slot boxes are drawn directly under the header.
@@ -48,8 +49,14 @@ HEADERS = {
     'POUCH': ('own_pouch', 'right'),
     'POCKETS': ('own_pockets', 'under'), 'SPECIAL SLOTS': ('own_special', 'under'),
 }
-_SIDE = {'stash': 'stash', 'loot': 'loot', 'container_window': 'stash',
-         'picker': 'other', 'unknown': 'other'}
+_SIDE = {'stash': 'stash', 'loot': 'loot', 'container_window': 'stash', 'incoming': 'stash',
+         'picker': 'other', 'trader_goods': 'other', 'offer_window': 'other', 'handover': 'other',
+         'unknown': 'other'}
+# roles whose items are the player's own to sell: the sell advice covers exactly these (app.py)
+SCAV_GRID_ROLES = ('own_rig', 'own_pockets', 'own_backpack', 'own_pouch', 'own_special')
+ADVISED_ROLES = ('stash', 'container_window', 'incoming')
+# roles whose cells are cut out of the detected panels and read
+SCANNED_ROLES = ADVISED_ROLES
 
 
 @dataclass
@@ -69,11 +76,14 @@ class Region:
 
 @dataclass
 class SceneInfo:
-    scene: str = 'unknown'      # lobby_gear|lobby_stash|raid_inventory|raid_loot|trader|none|unknown
+    scene: str = 'unknown'      # lobby_gear|lobby_stash|flea_offer|flea_handover|trader|showcase|
+                                # raid_inventory|raid_loot|none|unknown
     in_raid: bool | None = None
     regions: list = field(default_factory=list)
     windows: list = field(default_factory=list)
     toolbar: tuple | None = None      # (x0, x1) of the stash filter toolbar
+    stash_bbox: tuple | None = None   # (x, y, w, h) of the stash grid (from the toolbar + border lines)
+    side_bbox: tuple | None = None    # (x, y, w, h) of the SHOWCASE grid left of the stash (trader / receive)
     headers: list = field(default_factory=list)   # [(name, (x, y, w, h))]
     zones: list = field(default_factory=list)    # coarse header-anchored search zones (internal)
     pitch: float = float(SLOT)
@@ -84,9 +94,13 @@ class SceneInfo:
 # floating windows
 # --------------------------------------------------------------------------
 
-def find_close_buttons(frame: np.ndarray) -> list:
+def find_close_buttons(frame: np.ndarray, relaxed: bool = False) -> list:
     """Red close buttons ``[(x, y, w, h)]``: saturated dark red rounded rectangle (~1.5 x as wide
-    as tall, 0.012-0.03 of the frame height) with a white glyph in the middle."""
+    as tall, 0.012-0.03 of the frame height) with a white glyph in the middle.
+
+    ``relaxed`` also returns red rectangles with no (or a half hidden) glyph and a narrower shape:
+    a tooltip may cover most of the button.  Such candidates are only trusted after
+    :func:`trace_window` finds a window behind them."""
     H, W = frame.shape[:2]
     sc = 2 if H >= 900 else 1
     small = frame[::sc, ::sc].astype(np.int16)
@@ -96,18 +110,19 @@ def find_close_buttons(frame: np.ndarray) -> list:
     out = []
     for x, y, w, h, a in st[1:]:
         x, y, w, h = x * sc, y * sc, w * sc, h * sc
-        if not (0.011 * H <= h <= 0.032 * H and 0.8 <= w / h <= 2.1):
+        if not (0.011 * H <= h <= 0.032 * H and (0.4 if relaxed else 0.8) <= w / h <= 2.1):
             continue
         if a * sc * sc < 0.7 * w * h:
             continue
-        crop = frame[y:y + h, x:x + w]
-        white = crop.min(axis=2) >= 150
-        frac = white.mean()
-        if not (0.03 <= frac <= 0.4):
-            continue
-        ys, xs = np.nonzero(white)
-        if abs(xs.mean() / w - 0.5) > 0.2 or abs(ys.mean() / h - 0.5) > 0.2:
-            continue
+        if not relaxed:
+            crop = frame[y:y + h, x:x + w]
+            white = crop.min(axis=2) >= 150
+            frac = white.mean()
+            if not (0.03 <= frac <= 0.4):
+                continue
+            ys, xs = np.nonzero(white)
+            if abs(xs.mean() / w - 0.5) > 0.2 or abs(ys.mean() / h - 0.5) > 0.2:
+                continue
         out.append((int(x), int(y), int(w), int(h)))
     return out
 
@@ -141,7 +156,7 @@ def trace_window(frame: np.ndarray, btn: tuple):
     if xe is None:
         return None
     best, bx_ = -1.0, xe
-    for xx in range(xe, min(W - 1, xe + 7)):
+    for xx in range(xe, min(W - 1, xe + 3)):
         g = float(frame[y0:y1, xx].astype(np.float32).mean())
         if g > best:
             best, bx_ = g, xx
@@ -155,9 +170,26 @@ def trace_window(frame: np.ndarray, btn: tuple):
     xl = None
     for xx in range(bx - 3 * bw, max(0, bx - int(0.6 * W)), -1):
         if _col_frac(frame, xx, y0, y1, bcol, 30) >= 0.85:
-            xl = xx
-            break
+            # a real window border runs far beyond the title band (a tooltip box over the button
+            # has a short one: skip it and keep looking further left)
+            col = np.abs(frame[:, xx].astype(np.int16) - bcol).max(axis=1) <= 16
+            a_ = cy
+            while a_ > 0 and col[a_ - 1]:
+                a_ -= 1
+            b_ = cy
+            while b_ < H - 1 and col[b_ + 1]:
+                b_ += 1
+            if b_ - a_ >= 4 * bh:
+                xl = xx
+                break
     if xl is None:
+        # a window pushed against the screen edge has no left border: its title bar runs to x = 0
+        # (the row next to the button keeps the bar colour all the way)
+        row = frame[cy, :bx - 2 * bw].astype(np.int16)
+        bar = frame[cy, bx - 2 * bw].astype(np.int16)          # title-bar colour just left of the button
+        # (the title text sits at x ~ 10..: look at the few px before it)
+        if row.shape[0] > 0.1 * W and (np.abs(row[3:7] - bar).max(axis=1) <= 10).all():
+            return _trace_vertical(frame, 0, xr, y0, y1, bcol, bw, bh, cy, edge_left=True)
         return None
     while xl - 1 >= 0 and _col_frac(frame, xl - 1, y0, y1, bcol, 30) >= 0.85:
         xl -= 1
@@ -175,6 +207,35 @@ def trace_window(frame: np.ndarray, btn: tuple):
                     break
         return last
     top, bot = run(-1), run(1)
+    # a menu / tooltip over the left border cuts its run short: the right border may run further
+    if bot - top < 0.3 * H:
+        rt, rb = _trace_vertical(frame, xl, xr, y0, y1, bcol, bw, bh, cy, only_run=True)
+        if rt >= top - 2 * bh and rb > bot and rt <= top + 2 * bh:
+            bot = rb
+    w, h = xr - xl + 1, bot - top + 1
+    if w < 4 * bw or h < 2 * bh:
+        return None
+    return int(xl), int(top), int(w), int(h)
+
+
+def _trace_vertical(frame, xl, xr, y0, y1, bcol, bw, bh, cy, edge_left=False, only_run=False):
+    """Top / bottom of a window whose left edge is the screen edge: follow the right border."""
+    H = frame.shape[0]
+
+    def run(step):
+        yy, gap, last = cy, 0, cy
+        while 0 <= yy + step < H:
+            yy += step
+            if np.abs(frame[yy, xr].astype(np.int16) - bcol).max() <= 16:
+                last, gap = yy, 0
+            else:
+                gap += 1
+                if gap > 3:
+                    break
+        return last
+    top, bot = run(-1), run(1)
+    if only_run:
+        return top, bot
     w, h = xr - xl + 1, bot - top + 1
     if w < 4 * bw or h < 2 * bh:
         return None
@@ -202,37 +263,137 @@ def _has_grid_lines(frame, rect, title_h) -> bool:
 # stash toolbar
 # --------------------------------------------------------------------------
 
+ICON_STEP = 46.0 / 1440.0          # vertical pitch of the filter icons, as a fraction of the frame height
+
+
+@dataclass
+class Toolbar:
+    x0: int
+    x1: int
+    y0: int                         # first / last icon (centre)
+    y1: int
+    n: int                          # icons on the regular lattice
+    grid_right: float = 0.0         # vertical border-line coverage right next to it (a grid starts there)
+
+
+def find_toolbars(frame: np.ndarray, grid_check: bool = True) -> list:
+    """Every filter toolbar on the frame, wherever it is: a column of small bright icons on one
+    vertical lattice (step 0.032 H), >= 4 of them (a dimmed screen hides most), in a band 0.006-0.016 W wide.  A *stash*
+    toolbar is the one with a grid starting right next to it on its right (``grid_right``): the
+    trader's SHOWCASE column has the same icons but the grid is on its left."""
+    H, W = frame.shape[:2]
+    ya, yb = int(0.1 * H), int(0.9 * H)
+    g = cv2.cvtColor(frame[ya:yb], cv2.COLOR_BGR2GRAY)
+    bright = g > 150
+    cs = np.convolve(bright.sum(axis=0).astype(np.float32), np.ones(3) / 3, mode='same')
+    on = cs >= 0.05 * (yb - ya)
+    step = ICON_STEP * H
+    out = []
+    x = 0
+    while x < W:
+        if not on[x]:
+            x += 1
+            continue
+        x2 = x
+        while x2 + 1 < W and on[x2 + 1]:
+            x2 += 1
+        if 0.004 * W <= x2 - x + 1 <= 0.016 * W:
+            band = bright[:, x:x2 + 1].any(axis=1).astype(np.uint8)
+            nb, _, st, _ = cv2.connectedComponentsWithStats(band.reshape(-1, 1), connectivity=4)
+            icons = sorted((s_[1] + s_[3] / 2.0 + ya, s_[3]) for s_ in st[1:] if 0.008 * H <= s_[3] <= 0.04 * H)
+            if len(icons) >= 4:
+                cy = np.array([c for c, _ in icons])
+                best = None
+                for ph in cy:                      # the lattice phase that explains most icons
+                    r = ((cy - ph) / step + 0.5) % 1.0 - 0.5
+                    ok = np.abs(r) <= 0.12
+                    if best is None or ok.sum() > best[0]:
+                        best = (int(ok.sum()), ok)
+                n, ok = best
+                if n >= 4:
+                    c = cy[ok]
+                    out.append(Toolbar(int(x), int(x2), int(c[0]), int(c[-1]), n))
+        x = x2 + 1
+    if grid_check:
+        for t in out:
+            t.grid_right = _grid_strip(frame, t, True)
+    return out
+
+
+def _grid_strip(frame: np.ndarray, t: Toolbar, right: bool = True) -> float:
+    """Vertical border-line coverage in the strip right next to the toolbar (1.0 = a lattice line
+    runs the whole height).  Lines are the EFT cell-border colour."""
+    H, W = frame.shape[:2]
+    a, b = t.x1 + 3, min(W, t.x1 + int(0.013 * W))
+    y0, y1 = max(0, t.y0 - 8), min(H, t.y1 + 8)
+    if b - a < 4 or y1 - y0 < 40:
+        return 0.0
+    lm = line_mask(frame[y0:y1, a:b]).astype(np.uint8)
+    k = max(20, int(0.5 * SLOT * H / 1080.0))
+    vr = cv2.morphologyEx(lm, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, k)))
+    return float(vr.mean(axis=0).max())
+
+
+def pick_stash_toolbar(toolbars: list):
+    """The stash toolbar among ``find_toolbars``: the one with a grid on its right."""
+    c = [t for t in toolbars if t.grid_right >= 0.15]
+    return max(c, key=lambda t: (round(t.grid_right, 1), t.n)) if c else None
+
+
 def find_toolbar(frame: np.ndarray):
     """(x0, x1) of the stash filter toolbar (a column of small bright icons), or None."""
+    t = pick_stash_toolbar(find_toolbars(frame))
+    return (t.x0, t.x1) if t else None
+
+
+def stash_extent(frame: np.ndarray, t: Toolbar, pitch: float):
+    """(y_top, y_bottom) of the stash viewport from its border lines, or None.
+
+    The top is the strongest border line near the first icon (extended up along the cell lattice
+    when the first icons are hidden).  The bottom is the lowest full-width border line; when the cell borders still run on
+    below it (a clipped last row), one more cell is added."""
     H, W = frame.shape[:2]
-    xa, xb = int(0.55 * W), int(0.75 * W)
-    ya, yb = int(0.1 * H), int(0.55 * H)
-    g = cv2.cvtColor(frame[ya:yb, xa:xb], cv2.COLOR_BGR2GRAY)
-    bright = g > 150
-    cs = bright.sum(axis=0).astype(np.float32)
-    cs = np.convolve(cs, np.ones(3) / 3, mode='same')
-    # a column of stacked icons: bright in many rows, but only in a narrow band
-    on = cs >= 0.05 * (yb - ya)
-    runs = []
-    x = 0
-    while x < len(on):
-        if on[x]:
-            x2 = x
-            while x2 + 1 < len(on) and on[x2 + 1]:
-                x2 += 1
-            if 0.006 * W <= x2 - x + 1 <= 0.016 * W:
-                runs.append((float(cs[x:x2 + 1].sum()), x, x2))
-            x = x2 + 1
+    x0 = t.x1 + int(0.003 * W) + 4
+    x1 = min(W, x0 + int(10 * pitch))
+    if x1 - x0 < 4 * pitch:
+        return None
+    lm = line_mask(frame[:, x0:x1]).astype(np.uint8)
+    k = max(20, int(0.45 * pitch))
+    hr = cv2.morphologyEx(lm, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1)))
+    cov = hr.mean(axis=1)
+    rows = np.nonzero(cov >= 0.3)[0]
+    groups = []
+    for r in rows:
+        if groups and r - groups[-1][-1] <= 2:
+            groups[-1].append(r)
         else:
-            x += 1
-    for _, rx0, rx1 in sorted(runs, reverse=True):
-        # the band must contain several separate icons (vertical blobs), not one bright bar
-        band = bright[:, rx0:rx1 + 1].any(axis=1).astype(np.uint8)
-        nb, _, st, _ = cv2.connectedComponentsWithStats(band.reshape(-1, 1), connectivity=4)
-        icons = [s_ for s_ in st[1:] if 0.008 * H <= s_[3] <= 0.04 * H]
-        if len(icons) >= 4:
-            return int(xa + rx0), int(xa + rx1)
-    return None
+            groups.append([r])
+    lines = [(int(np.mean(gp)), float(cov[gp].max())) for gp in groups]
+    ys = np.array([y for y, _ in lines])
+
+    cand = [(round(c, 1), -y, y) for y, c in lines if c >= 0.4 and t.y0 - 0.06 * H <= y <= t.y0 + 0.02 * H]
+    if not cand:
+        return None
+    top = max(cand)[2]
+    while True:                                  # hidden first icons (a menu over them): follow the lattice up
+        up = [y for y, c in lines if c >= 0.4 and abs(y - (top - pitch)) <= 3]
+        if not up:
+            up = [y for y, c in lines if c >= 0.4 and abs(y - (top - 2 * pitch)) <= 3]
+        if not up:
+            break
+        top = up[0]
+    bots = [y for y, c in lines if c >= 0.9 and y >= top + 2 * pitch and y <= 0.995 * H]
+    if not bots:
+        return None
+    bot = max(bots)
+    # a clipped last row: the viewport ends at a black row (no border line) within one cell
+    strip = frame[bot + 2:min(H, bot + int(pitch)), x0:x1].astype(np.int16)
+    if strip.shape[0] > 4:
+        gr = strip.mean(axis=2)
+        black = (gr.mean(axis=1) < 12) & (gr.std(axis=1) < 4)
+        if black.any():
+            bot = int(bot + 2 + np.argmax(black))
+    return int(top), int(bot)
 
 
 # --------------------------------------------------------------------------
@@ -344,10 +505,13 @@ def _match_header(text: str):
     return (best, score) if score >= 0.8 else None
 
 
-def find_header_candidates(frame: np.ndarray, x_max: int) -> list:
-    """Bright uppercase-text blobs (x, y, w, h) that may be slot headers."""
+def find_header_candidates(frame: np.ndarray, x_max: int, y_band: tuple | None = None) -> list:
+    """Bright uppercase-text blobs (x, y, w, h) that may be slot headers (``y_band`` = (y0, y1) in
+    px narrows the search, default 0.07-0.93 H)."""
     H, W = frame.shape[:2]
-    y0, y1 = int(0.07 * H), int(0.93 * H)
+    y0, y1 = (int(0.07 * H), int(0.93 * H)) if y_band is None else (max(0, int(y_band[0])), min(H, int(y_band[1])))
+    if x_max < 8 or y1 - y0 < 8:
+        return []
     sub = frame[y0:y1, :x_max]
     m = (sub.min(axis=2) >= 190).astype(np.uint8)
     k = max(9, int(round(0.0125 * H)))
@@ -363,6 +527,40 @@ def find_header_candidates(frame: np.ndarray, x_max: int) -> list:
 # analysis
 # --------------------------------------------------------------------------
 
+def find_banner(frame: np.ndarray):
+    """The big centred screen title ("RAID ENDED"): bright text blob (x, y, w, h) in the top
+    centre, or None."""
+    H, W = frame.shape[:2]
+    y1 = int(0.085 * H)
+    xa, xb = int(0.3 * W), int(0.7 * W)
+    m = (frame[:y1, xa:xb].min(axis=2) >= 190).astype(np.uint8)
+    k = max(9, int(round(0.03 * H)))                  # joins the words of the title
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (k, 3)))
+    n, _, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    c = [(int(x + xa), int(y), int(w), int(h)) for x, y, w, h, a in st[1:]
+         if 0.022 * H <= h <= 0.05 * H and 0.08 * W <= w <= 0.3 * W]
+    return max(c, key=lambda b: b[2] * b[3]) if c else None
+
+
+def _fuzzy(text: str, word: str, thr: float = 0.75) -> bool:
+    t = re.sub(r'[^A-Z]', '', (text or '').upper())
+    if not t:
+        return False
+    if word in t:
+        return True
+    r = max((difflib.SequenceMatcher(None, t[i:i + len(word)], word).ratio()
+             for i in range(0, max(1, len(t) - len(word) + 1))), default=0.0)
+    return r >= thr
+
+
+def _menu_chrome(frame) -> bool:
+    try:
+        from autoscan.detect import menu_chrome
+        return bool(menu_chrome(frame))
+    except Exception:
+        return False
+
+
 def analyze_scene(frame_bgr: np.ndarray, *, in_raid=None) -> SceneInfo:
     H, W = frame_bgr.shape[:2]
     pitch = SLOT * min(W / 1920.0, H / 1080.0)
@@ -370,58 +568,111 @@ def analyze_scene(frame_bgr: np.ndarray, *, in_raid=None) -> SceneInfo:
 
     # ---- windows --------------------------------------------------------
     wins = []                       # [rect, title_h]
-    for btn in find_close_buttons(frame_bgr):
+
+    def add_window(btn):
         r = trace_window(frame_bgr, btn)
         if r is not None and not any(abs(r[0] - w[0][0]) < 4 and abs(r[1] - w[0][1]) < 4 for w in wins):
             wins.append([r, btn[1] + btn[3] - r[1] + 3])
+    for btn in find_close_buttons(frame_bgr):
+        add_window(btn)
+    for btn in find_close_buttons(frame_bgr, relaxed=True):      # a tooltip may hide most of the button
+        if not any(_inside((btn[0] + btn[2] / 2, btn[1] + btn[3] / 2), w[0]) for w in wins):
+            add_window(btn)
 
-    # ---- toolbar (stash) --------------------------------------------------
-    tb = find_toolbar(frame_bgr)
+    # ---- stash toolbar ------------------------------------------------------
+    toolbars = find_toolbars(frame_bgr)
+    st = pick_stash_toolbar(toolbars)
+    tb = (st.x0, st.x1) if st else None
     info.toolbar = tb
-    lobby = (not in_raid) if in_raid is not None else (tb is not None)
-    info.in_raid = (not lobby) if in_raid is None else in_raid
+    # a stash toolbar exists on lobby screens only (whatever a caller guessed from the menu bar)
+    if tb is not None:
+        lobby = True
+    elif in_raid is not None:
+        lobby = not in_raid
+    else:
+        lobby = _menu_chrome(frame_bgr)
+    if st:
+        ext = stash_extent(frame_bgr, st, pitch)
+        top, bot = ext if ext else (int(0.0715 * H), int(0.883 * H))
+        sx = tb[1] + int(0.003 * W)
+        info.stash_bbox = (sx, top, int(10 * pitch + 0.006 * W), bot - top)
+    other_tb = [t for t in toolbars if st is not None and t is not st and t.x1 < st.x0 - 0.1 * W
+                and t.grid_right < 0.15 and t.n >= 7]
 
-    # ---- headers + titles in ONE ocr call ----------------------------------
-    x_max = (tb[0] - 4) if (tb and lobby) else int(0.97 * W)
-    cands = find_header_candidates(frame_bgr, x_max)
-    cands = [c for c in cands if not any(_inside((c[0] + c[2] / 2, c[1] + c[3] / 2), w[0]) for w in wins)]
-    strips = []
-    for (x, y, w, h) in cands:
-        strips.append(frame_bgr[max(0, y - 3):y + h + 3, max(0, x - 3):x + w + 3])
+    # ---- OCR phase 1: window titles, the SHOWCASE header band, the screen banner ---------
     tstrips = []
     for rect, th in wins:
         x, y, w, h = rect
         tw = int(min(0.4 * w, 7.5 * th))
         tstrips.append(frame_bgr[y + 2:y + th - 3, x + 3:x + 3 + tw])
-    texts = _ocr_strips(strips + tstrips)
-    htexts, ttexts = texts[:len(strips)], texts[len(strips):]
+    bcands = []
+    if st and lobby:
+        y_top = info.stash_bbox[1]
+        bcands = find_header_candidates(frame_bgr, tb[0] - int(0.02 * W), (y_top - 0.04 * H, y_top - 0.003 * H))
+        bcands = [c for c in bcands if not any(_inside((c[0] + c[2] / 2, c[1] + c[3] / 2), w[0]) for w in wins)][:6]
+    banner = find_banner(frame_bgr) if (st and lobby) else None
+    bstrips = [frame_bgr[max(0, y - 3):y + h + 3, max(0, x - 3):x + w + 3] for (x, y, w, h) in bcands]
+    if banner is not None:
+        x, y, w, h = banner
+        bstrips.append(frame_bgr[max(0, y - 3):y + h + 3, max(0, x - 3):x + w + 3])
+    texts = _ocr_strips(tstrips + bstrips)
+    ttexts, btexts = texts[:len(tstrips)], texts[len(tstrips):]
+    banner_text = btexts[len(bcands)] if banner is not None else ''
+    show_hdr = refresh = None
+    for c, t in zip(bcands, btexts):
+        if show_hdr is None and _fuzzy(t, 'SHOWCASE', 0.78):
+            show_hdr = c
+        if _fuzzy(t, 'REFRESH', 0.8):
+            refresh = c
+    raid_ended = banner is not None and _fuzzy(banner_text, 'RAIDENDED', 0.8)
 
-    for c, t in zip(cands, htexts):
-        mh = _match_header(t)
-        if mh:
-            info.headers.append((mh[0], c))
-    # a header name appears once per side; keep the best (largest) per (name, side)
     # ---- window regions -----------------------------------------------------
+    lobby_window = False
     for (rect, th), title in zip(wins, ttexts):
         title = _clean_title(title)
         low = re.sub(r'[^a-z]', '', title.lower())
         if difflib.SequenceMatcher(None, low[:9], 'available').ratio() >= 0.75 or low.startswith('availab'):
             role, conf = 'picker', 0.95
+        elif difflib.SequenceMatcher(None, low[:13], 'offercreation').ratio() >= 0.8:
+            role, conf = 'offer_window', 0.9
+        elif difflib.SequenceMatcher(None, low[:8], 'handover').ratio() >= 0.8:
+            role, conf = 'handover', 0.9
         elif _has_grid_lines(frame_bgr, rect, th):
             role, conf = 'container_window', 0.85
         else:
             role, conf = 'unknown', 0.6
-        side = _SIDE.get(role, 'other')
-        if info.in_raid and role == 'container_window':
-            side = 'loot' if (rect[0] + rect[2] / 2) >= 0.55 * W else 'other'
-        info.windows.append(Region(rect, role, side, title or None, conf, th))
+        lobby_window = lobby_window or role in ('offer_window', 'handover')
+        info.windows.append(Region(rect, role, _SIDE.get(role, 'other'), title or None, conf, th))
+    if lobby_window:
+        lobby = True
+    info.in_raid = not lobby
+    for w in info.windows:
+        if info.in_raid and w.role == 'container_window':
+            w.side = 'loot' if (w.bbox[0] + w.bbox[2] / 2) >= 0.55 * W else 'other'
     info.regions.extend(info.windows)
 
-    # ---- stash region ---------------------------------------------------------
-    if tb and lobby:
-        sx = tb[1] + int(0.003 * W)
-        info.regions.append(Region((sx, int(0.0715 * H), int(10 * pitch + 0.006 * W), int(0.811 * H)),
-                                   'stash', 'stash', None, 0.95))
+    # ---- stash + SHOWCASE regions -----------------------------------------------------
+    side_kind = None
+    if st:
+        info.regions.append(Region(info.stash_bbox, 'stash', 'stash', None, 0.95))
+        if show_hdr is not None or other_tb:
+            side_kind = 'trader' if (refresh is not None or (other_tb and show_hdr is None)) else 'showcase'
+            gx0 = (show_hdr[0] - int(0.004 * W)) if show_hdr is not None else int(0.0047 * W)
+            gw = min(int(10 * pitch + 0.008 * W), tb[0] - 4 - gx0)
+            info.side_bbox = (gx0, info.stash_bbox[1], gw, info.stash_bbox[3])
+            role = 'trader_goods' if side_kind == 'trader' else 'incoming'
+            info.regions.append(Region(info.side_bbox, role, _SIDE[role], 'SHOWCASE', 0.85))
+
+    # ---- OCR phase 2: slot headers (not on trader / receive screens) --------------------
+    if side_kind is None:
+        x_max = (tb[0] - 4) if (tb and lobby) else int(0.97 * W)
+        cands = find_header_candidates(frame_bgr, x_max)
+        cands = [c for c in cands if not any(_inside((c[0] + c[2] / 2, c[1] + c[3] / 2), w[0]) for w in wins)]
+        strips = [frame_bgr[max(0, y - 3):y + h + 3, max(0, x - 3):x + w + 3] for (x, y, w, h) in cands]
+        for c, t in zip(cands, _ocr_strips(strips)):
+            mh = _match_header(t)
+            if mh:
+                info.headers.append((mh[0], c))
 
     # ---- header zones -----------------------------------------------------------
     for name, (x, y, w, h) in info.headers:
@@ -459,9 +710,26 @@ def analyze_scene(frame_bgr: np.ndarray, *, in_raid=None) -> SceneInfo:
         else:
             info.scene = 'raid_loot' if info.windows else 'unknown'
     elif tb is not None:
-        info.scene = 'lobby_gear' if nh >= 3 else 'lobby_stash'
+        offer = any(w.role == 'offer_window' for w in info.windows) or (not info.windows and tb[0] < 0.05 * W)
+        if raid_ended:
+            info.scene = 'scav_transfer'
+            for r in info.regions:                 # the scav's grids are moved to the stash
+                if r.role in SCAV_GRID_ROLES:
+                    r.role, r.side = 'incoming', 'stash'
+        elif side_kind:
+            info.scene = side_kind
+        elif offer:
+            info.scene = 'flea_offer'
+        else:
+            info.scene = 'lobby_gear' if nh >= 3 else 'lobby_stash'
+    elif any(w.role == 'handover' for w in info.windows):
+        info.scene = 'flea_handover'
+    elif any(w.role == 'offer_window' for w in info.windows):
+        info.scene = 'flea_offer'
     elif nh >= 3 or info.windows:
-        info.scene = 'unknown'
+        # a window over the lobby inventory hid the stash toolbar (the menu bar says lobby)
+        info.scene = ('lobby_gear' if nh >= 3 else 'lobby_stash') if (not info.in_raid and any(
+            w.role == 'container_window' for w in info.windows)) or nh >= 3 and not info.in_raid else 'unknown'
     else:
         info.scene = 'none'
     return info
@@ -553,6 +821,8 @@ def split_panels(grid_result: GridResult, scene: SceneInfo, frame_bgr: np.ndarra
     lobby = not scene.in_raid
     sx = (tb[1] + int(0.003 * W)) if (tb and lobby) else None
     wins = [w for w in scene.windows]
+    if sx is not None and scene.stash_bbox is None:        # hand-built SceneInfo: the lobby band
+        scene.stash_bbox = (sx, int(0.0715 * H), int(10 * pitch + 0.006 * W), int(0.811 * H))
     heads = []
     for name, (x, y, w, h) in scene.headers:
         role, kind = HEADERS[name]
@@ -575,9 +845,9 @@ def split_panels(grid_result: GridResult, scene: SceneInfo, frame_bgr: np.ndarra
         for key in {k for k in labels.ravel() if k is not None}:
             m = np.array([[k == key for k in row] for row in labels])
             role, side, conf, title, wi = key
-            if role not in ('stash', 'container_window') and not role.startswith(('own', 'loot', 'unknown')):
+            if role not in SCANNED_ROLES and not role.startswith(('own', 'loot', 'unknown')):
                 continue
-            if role not in ('stash', 'container_window') and frame_bgr is not None:
+            if _needs_line_evidence(role, title) and frame_bgr is not None:
                 # drawn borders needed (lattice spans background); closing fills big-item interiors
                 lm = lm_cache.get(id(panel))
                 if lm is None:
@@ -607,6 +877,16 @@ def split_panels(grid_result: GridResult, scene: SceneInfo, frame_bgr: np.ndarra
     return out
 
 
+def _needs_line_evidence(role: str, title) -> bool:
+    """Cells of own-gear style regions need drawn borders (the lattice of a merged panel also spans
+    background); stash / window / SHOWCASE grids do not."""
+    if role in ('stash', 'container_window'):
+        return False
+    if role == 'incoming':
+        return title in HEADERS                     # the scav's rig / pockets / backpack
+    return True
+
+
 def _own_gear_pieces(out: list, grid_result: GridResult, scene: SceneInfo, frame_bgr: np.ndarray) -> list:
     """Replace / complete the pieces of the player's own gear regions with the cell groups of
     :mod:`identify.owngrid` (rig slots with gaps, pockets, a faint-lined backpack): ``detect_grid``
@@ -620,19 +900,35 @@ def _own_gear_pieces(out: list, grid_result: GridResult, scene: SceneInfo, frame
     wins = [w.bbox for w in scene.windows]
     mine = []
     for reg in scene.regions:
-        if reg.role not in OWN_ROLES:
+        if not _is_gear(reg):
             continue
         for p in region_panels(frame_bgr, reg.bbox, pitch, wins):
             if any(_overlap_frac(p, q) > 0.5 for q, _ in mine):
                 continue
+            if _in_box(scene.stash_bbox, p) or (reg.title != 'SHOWCASE' and _in_box(scene.side_bbox, p)):
+                continue                                  # the stash is never a gear grid
             p.own = True
             mine.append((p, Region((p.x0, p.y0, p.x1 - p.x0, p.y1 - p.y0), reg.role, reg.side, reg.title, 0.85)))
     keep = [(p, r) for p, r in out
-            if not (r.role in OWN_ROLES and any(_overlap_frac(p, q) > 0.3 for q, _ in mine))]
+            if not (_is_gear(r) and any(_overlap_frac(p, q) > 0.3 for q, _ in mine))]
     for p, r in keep:
-        if r.role in OWN_ROLES:
+        if _is_gear(r):
             p.own = True
     return keep + mine
+
+
+def _in_box(box, p: Panel) -> bool:
+    if box is None:
+        return False
+    cx, cy = (p.x0 + p.x1) / 2.0, (p.y0 + p.y1) / 2.0
+    return box[0] <= cx <= box[0] + box[2] and box[1] <= cy <= box[1] + box[3]
+
+
+def _is_gear(reg) -> bool:
+    """A grid that needs the faint-line cell finder: the player's own gear, the scav's gear on the
+    loot-transfer screen, the (dark, mostly empty) SHOWCASE grid of incoming items."""
+    from .owngrid import OWN_ROLES
+    return reg.role in OWN_ROLES or reg.role == 'incoming'
 
 
 def _overlap_frac(a: Panel, b: Panel) -> float:
@@ -660,7 +956,7 @@ class _Shift:
 def _touches_window(panel, c, r, wins, skip):
     x0, x1, y0, y1 = panel.xs[c], panel.xs[c + 1], panel.ys[r], panel.ys[r + 1]
     for i, w in enumerate(wins):
-        if i == skip:
+        if i == skip or w.role == 'offer_window':
             continue
         wx, wy, ww, wh = w.bbox
         ix = min(x1, wx + ww + 2) - max(x0, wx - 2)
@@ -676,6 +972,8 @@ def _cell_key(panel, c, r, cx, cy, wins, sx, lobby, heads, scene, pitch, W, H):
     for i, w in enumerate(wins):                   # windows first: they sit on top of everything
         wx, wy, ww, wh = w.bbox
         if wx <= cx <= wx + ww and wy <= cy <= wy + wh:
+            if w.role == 'offer_window':               # its stash grid is the stash: decided below
+                break
             if w.role == 'container_window':
                 title_h = 0
                 # interior only: below the title band, fully inside the border, clear of other windows
@@ -685,8 +983,16 @@ def _cell_key(panel, c, r, cx, cy, wins, sx, lobby, heads, scene, pitch, W, H):
             return None
     if _touches_window(panel, c, r, wins, None):   # partly covered by a window: occluded
         return None
-    if lobby and sx is not None and cx >= sx and 0.0715 * H <= cy <= 0.883 * H:
+    sb = scene.stash_bbox
+    if lobby and sb is not None and sb[0] <= cx <= sb[0] + sb[2] and sb[1] <= cy <= sb[1] + sb[3]:
         return ('stash', 'stash', 0.95, None, -1)
+    ob = scene.side_bbox
+    if lobby and ob is not None and ob[0] <= cx <= ob[0] + ob[2] and ob[1] <= cy <= ob[1] + ob[3]:
+        if scene.scene == 'trader':
+            return None                                # the trader's goods are never the player's
+        return ('incoming', 'stash', 0.85, 'SHOWCASE', -1)
+    if scene.scene in ('trader', 'showcase', 'flea_offer', 'flea_handover'):
+        return None                                    # deal panel, offers, ...: not the player's grids
     # header relation
     best = None
     for h in heads:
@@ -707,6 +1013,8 @@ def _cell_key(panel, c, r, cx, cy, wins, sx, lobby, heads, scene, pitch, W, H):
         side = 'own'
         if scene.in_raid and best['x0'] >= 0.55 * W:
             role, side = 'loot', 'loot'
+        elif scene.scene == 'scav_transfer' and role in SCAV_GRID_ROLES:
+            role, side = 'incoming', 'stash'
         return (role, side, 0.8, best['name'], -1)
     if lobby:
         return ('own_other', 'own', 0.6, None, -1)
@@ -721,7 +1029,8 @@ def _cell_key(panel, c, r, cx, cy, wins, sx, lobby, heads, scene, pitch, W, H):
 ROLE_BGR = {'stash': (80, 200, 60), 'own_rig': (255, 160, 40), 'own_pockets': (255, 200, 80),
             'own_backpack': (255, 120, 20), 'own_pouch': (255, 90, 90), 'own_special': (255, 180, 140),
             'own_other': (200, 160, 120), 'loot': (40, 140, 255), 'container_window': (0, 230, 255),
-            'picker': (60, 60, 255), 'unknown': (180, 180, 180)}
+            'picker': (60, 60, 255), 'unknown': (180, 180, 180), 'incoming': (255, 0, 200),
+            'trader_goods': (0, 120, 255), 'offer_window': (200, 200, 0), 'handover': (0, 80, 200)}
 
 
 def annotate(frame_bgr: np.ndarray, scene: SceneInfo, pieces: list | None = None) -> np.ndarray:
