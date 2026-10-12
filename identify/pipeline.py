@@ -289,6 +289,12 @@ class Engine:
             guns = {str(self.cat.cats[self._id_row[t_]]) == 'weapon' for t_ in twins if t_ in self._id_row}
             if self._twins_settled_by_footprint(det.item_id, twins, tile, False, w):
                 ev['note'] = 'printed label is shared; size / picture separate the twins'
+                if not ev.get('label_twins') and det.item_id:
+                    # the game-font label is exact, every item that prints it is a known twin and the
+                    # footprint / picture rules out each of them but this one: label-verified
+                    det.confidence = max(det.confidence, LABEL_VERIFIED_CONF)
+                    det.uncertain = False
+                    ev['verified'] = 'label+twins'
                 return
             if not (det.category == 'weapon' and guns == {True}):     # all guns: "a gun" is enough
                 det.uncertain = True
