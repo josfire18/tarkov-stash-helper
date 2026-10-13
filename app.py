@@ -758,16 +758,13 @@ def tesseract_path_override():
 
 
 def is_unpriced_weapon(item_data, category=None):
-    """True for a gun the sell list should skip.
-
-    A gun's value depends on whatever parts are on it, so its identity can't
-    price it.  tarkov.dev also tags signal flares (RSP-30) as 'gun', but those
-    are fixed special-slot items with a real price, so they are kept.
-    """
+    """True for a weapon the sell list cannot price: a default-build preset (its price is a whole
+    build's) or a weapon no catalog item backs.  A base gun is priced as the bare gun
+    (sellcalc.is_base_gun); the attachments on it are never counted."""
     types = set((item_data or {}).get('types') or ())
     if 'specialSlot' in types:
         return False
-    if types & {'gun', 'preset'}:
+    if 'preset' in types:
         return True
     return item_data is None and category == 'weapon'
 
@@ -781,7 +778,8 @@ def is_dogtag(item_data):
 
 
 def skip_badge(item_data, category=None):
-    """Badge for an item the sell list leaves out ('GUN', 'TAG'), or None to price it."""
+    """Badge for an item the sell list leaves out ('GUN' = a preset / unbacked weapon, 'TAG'), or
+    None to price it.  Base guns are priced."""
     if is_unpriced_weapon(item_data, category):
         return 'GUN'
     if is_dogtag(item_data):
@@ -2802,7 +2800,7 @@ def _sell_payload(raw_detections, panels, grid_failed, warnings, scene_info, set
     # --- Build every entry, numbered in SELL order ---------------------------
     # The picture goes out untouched: the Live page outlines every tile in its action's
     # colour client-side.  The decisions themselves are sellcalc.plan_entries (pure).
-    skipped = []          # guns/dogtags: recognised but never priced
+    skipped = []          # presets/dogtags: recognised but never priced
     sellable = []
     for d in sorted(raw_detections, key=lambda r: (r['panel'], r['row'], r['col'])):
         badge = skip_badge(id_to_item.get(d['item_id']), d.get('category'))

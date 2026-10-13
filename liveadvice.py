@@ -15,7 +15,7 @@ Rules
   the trader's net and (when the item may be sold on the flea) the flea net after the fee.  Items
   needed for an open quest / hideout upgrade come first, flagged "Quest" / "Hideout", whatever they
   are worth; the rest must reach ``live_min_value_per_slot``; at most ``live_top_n`` in total.
-  Guns are never priced (their value is their parts), so they are not ranked.
+  A gun is valued as the bare base weapon (``base_gun``): the attachments on it are not counted.
 * drop  = only when the best grab does not fit into the free space of the tactical rig, pockets or
   backpack (the secure container, special slots and worn equipment are never touched): the
   cheapest-per-slot items on you - never one a quest / the hideout needs - whose removal makes room,
@@ -38,8 +38,11 @@ def is_raid_scene(scene, in_raid=None) -> bool:
 
 
 def _unpriced(item, category=None) -> bool:
-    """A gun (value = its parts) is never ranked or dropped."""
-    return category == 'weapon' or 'gun' in ((item or {}).get('types') or ())
+    """Only a weapon no catalog item backs, or a default-build preset, is left out; a base gun is
+    ranked and dropped at its bare-gun value (attachments are not counted)."""
+    if item is None:
+        return category == 'weapon'
+    return 'preset' in (item.get('types') or ())
 
 
 def unit_value(item, fir, settings, ctx) -> int:
@@ -61,6 +64,7 @@ def need_flag(item_id, protected, any_of_ids=()):
 def _entry(d, item, flag, value, per_slot, slots, why=''):
     return {'item_id': d['item_id'], 'name': item.get('name') or d.get('name'), 'count': d.get('count') or 1,
             'slots': slots, 'value': value, 'per_slot': per_slot, 'flag': flag, 'why': why,
+            **({'base_gun': True} if sellcalc.is_base_gun(item) else {}),
             'px': d['px'], 'py': d['py'], 'pw': d['pw'], 'ph': d['ph'], 'w': _wh(d)[0], 'h': _wh(d)[1],
             'panel': d.get('panel'), 'col': d.get('col'), 'row': d.get('row')}
 

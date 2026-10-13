@@ -9,7 +9,7 @@ uncertain, so it contributes nothing). Every tile counts as exactly one of these
 * **uncertain**: flagged. This counts as a failure too.
 * **missed**: the tile was not segmented.
 
-Guns count as correct when they are recognised as a gun, because the sell list skips them. Dogtags count as correct when any dogtag is named.
+A gun counts as correct only when it is the right BASE weapon (the sell list prices it as the bare gun, attachments not counted). Dogtags count as correct when any dogtag is named.
 
 **Protocol change: clean state per screenshot.** `test_scan.py --score` scans each image twice
 (a "warm-up" scan, then the timed scan), and the learned-icon store carries over between images. Two
@@ -68,9 +68,9 @@ probably came through the learned-icon store, which the next section closes.
      twins separated by a clear picture margin (`TWIN_GAP_OK` = 2.0 fused units with DINO, 6.0 on residual
      alone).
    * *unresolved twins*: capped at 0.5, which counts as uncertain.
-   * *weapon-sure* (0.95): the label names a gun with no unresolved twin, or the best three different pictures
-     are all guns, presets or weapon builds. Guns are skipped by the sell list, so being sure it is a gun is
-     enough.
+   * *weapon-sure* (0.95): the printed label names ONE base gun (alone, or as the start of the label plus the
+     matching calibre); a picture that merely looks like some gun no longer counts, because a gun is priced as its
+     base weapon (see "Base item identity" below).
 7. **Learning is stricter** (`Engine._learn`). A cached icon is only named when the item can have that
    footprint and its label is not glyph-ambiguous with another item's label. A systematic misread such as
    "MPX FS" on a drum magazine used to "confirm itself" across two scans of one view, and the wrong name then
@@ -292,3 +292,22 @@ with the 24-hex id read as three big-endian uint32 words `t | p | q`. How it was
 Coverage on this cache: 3,548 of 8,384 index entries (3,319 of 7,113 files, 3,313 items) get an exact id; 189/189 plain label-certified renders and 252/252 independent pairs agree. Not reproduced: built items (weapons with mods, loaded magazines, armour with plates, filled containers fold their parts and slot-name hashes in; a loaded magazine is not `^ ((23 + n) << 2) ^ ammo hash ^ constant`), and items not in the tarkov.dev list (armour inserts, some quest items).
 
 Wiring: the catalog build re-validates the hash against the unambiguous picture associations (gate: >= 95 % agreement on >= 20 files, status in the catalog meta and `data/eft_hash_status.json`) and, when open, names each hashed render (`assoc` entry flagged `'hash'`; extra `cache` template only when the picture is not a look-alike of several items, which otherwise blurred stage 1 on w04). `CacheIndex` re-reads `index.json` around its file scan (only unchanged entries count, since the game renumbers files) and names renders `id_src='hash'`; pixels filed under two items, or a hash that contradicts a learned binding, leave the render unnamed. Tests: `tests/test_eft_hash.py`, `tests/test_identify_anchors.py::test_renders_named_by_the_game_icon_hash`.
+
+## Base item identity (2026-10-13, lean, strict)
+The identity of a tile is its BASE item and the price is that item's own tarkov.dev value: a loaded magazine is the
+magazine, plated armour the armour, a filled container the container, a built gun the base weapon. Plates, rounds,
+contents and attachments are never read or added.
+
+* Magazines, armour, rigs, containers: the label (game-font anchor or exact OCR authority) decides, never the
+  picture of what is inside; the footprint is fixed. On the eval none of the 0 wrong / Check tiles of these
+  classes comes from contents - they are same-label twins or tiles cut by the viewport.
+* Guns: identified from the printed short name + footprint growth + calibre, never from a preset / build look-alike.
+  Evidence ladder: anchor-certified label; exact OCR authority naming ONE gun; the label starting with a gun's short
+  name followed by the build's own name ("M870 Hammer", new `Engine._gun_by_prefix`) vouched for by the bottom-left
+  calibre; a near-literal default-build render vouched for by the calibre. Same-label guns (MDR 5.56 / 7.62) are
+  separated by the calibre, else the tile is Check - they are priced differently.
+* The picture-only "all three best pictures are guns" rule is gone: it vouched for *a* gun, which no longer suffices.
+* `accuracy_report.py` counts a gun as correct only when it is the right base gun (was: any gun).
+* Result (no DINO): 1035 correct / 0 wrong / 26 Check / 2 missed -> 1034 / 0 / 27 / 2; certified 626, certified-but-wrong 0.
+  The one tile that changed is the Desert Tech MDR 5.56 whose same-label twin (MDR 7.62) the picture does not separate
+  and whose calibre is not readable: it is now Check instead of a coin flip.

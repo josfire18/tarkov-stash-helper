@@ -6,8 +6,8 @@ item, not flagged - the dangerous case), UNCERTAIN (flagged, counts as a failure
     python scripts/accuracy_report.py [--no-dino] [--no-ocr] [--json out.json] [images...]
 
 Without images every ``data/eval/**/<name>.png`` that has a ``<name>.truth.full.json`` is used.
-Truth rows marked uncertain / without an item id are excluded.  Guns count as correct when they
-are recognised as a weapon (they are skipped by the sell list), dogtags when any dogtag is named.
+Truth rows marked uncertain / without an item id are excluded.  A gun counts as correct only when it is
+the right base weapon (the sell list prices it as the bare gun), dogtags when any dogtag is named.
 """
 from __future__ import annotations
 
@@ -35,8 +35,8 @@ def eval_images():
 
 
 def is_ok(t, d, cat):
-    if cat == 'weapon':
-        return d.get('category') == 'weapon'
+    if cat == 'weapon':           # a gun is priced as its base weapon: it must be THE right gun
+        return d.get('category') == 'weapon' and d['item_id'] == t['item_id']
     if t.get('name', '').startswith('Dogtag ') and 'case' not in t.get('name', ''):
         return d.get('name', '').startswith('Dogtag ') and 'case' not in d.get('name', '')
     return d['item_id'] == t['item_id'] or (bool(d.get('name')) and d.get('name') == t.get('name'))
