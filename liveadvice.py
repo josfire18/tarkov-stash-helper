@@ -78,6 +78,8 @@ def rank_grab(dets, id_to_item, protected, any_of_ids, settings, ctx, top_n=DEFA
         # an uncertain one never counts
         if d.get('role') not in LOOT_ROLES or (d.get('uncertain') and not d.get('provisional')):
             continue
+        if d.get('side') == 'own':                      # a container window opened from the player's own bag
+            continue
         item = id_to_item.get(d['item_id'])
         if not item or _unpriced(item, d.get('category')):
             continue
