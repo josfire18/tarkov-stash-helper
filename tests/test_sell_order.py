@@ -1,5 +1,6 @@
 """Sell advice: flea eligibility and the order the player sells in."""
 import app
+import sellcalc
 
 
 def _item(**kw):
@@ -49,13 +50,16 @@ def test_unknown_trader_sorts_after_known_ones():
     assert [e['trader_name'] for e in out] == ['Jaeger', 'Lightkeeper']
 
 
-def test_guns_are_skipped_but_flares_and_knives_are_priced():
-    assert app.is_unpriced_weapon({'types': ['gun']}) is True
-    assert app.is_unpriced_weapon({'types': ['preset']}) is True
+def test_base_guns_are_priced_but_presets_and_unbacked_weapons_are_skipped():
+    assert app.is_unpriced_weapon({'types': ['gun']}) is False                  # priced as the bare gun
+    assert app.is_unpriced_weapon({'types': ['preset']}) is True                # a whole build's price
     assert app.is_unpriced_weapon({'types': ['gun', 'specialSlot']}) is False   # RSP-30 flare
     assert app.is_unpriced_weapon({'types': ['knife']}) is False
     assert app.is_unpriced_weapon(None, 'weapon') is True
     assert app.is_unpriced_weapon(None, 'barter') is False
+    assert sellcalc.is_base_gun({'types': ['gun', 'wearable']}) is True
+    assert sellcalc.is_base_gun({'types': ['gun', 'specialSlot']}) is False
+    assert sellcalc.is_base_gun({'types': ['preset']}) is False
 
 
 def test_price_outage_falls_back_to_cache(monkeypatch, tmp_path):
@@ -620,7 +624,8 @@ def test_dogtags_are_skipped_but_the_dogtag_case_is_priced():
     assert app.skip_badge({'name': 'Dogtag USEC', 'types': ['barter', 'noFlea']}) == 'TAG'
     assert app.skip_badge({'name': 'Dogtag BEAR', 'types': ['barter', 'noFlea']}) == 'TAG'
     assert app.skip_badge({'name': 'Dogtag case', 'types': ['container', 'noFlea']}) is None
-    assert app.skip_badge({'name': 'Colt M4A1', 'types': ['gun']}) == 'GUN'
+    assert app.skip_badge({'name': 'Colt M4A1', 'types': ['gun']}) is None          # a base gun is priced
+    assert app.skip_badge({'name': 'AK-74N Default', 'types': ['preset']}) == 'GUN'
     assert app.skip_badge({'name': 'Salewa', 'types': ['meds']}) is None
 
 

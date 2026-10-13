@@ -174,6 +174,22 @@ def intel_center_level(stations, completed_level_ids):
 
 
 # ---------------------------------------------------------------------------
+# What an identified tile is priced as
+# ---------------------------------------------------------------------------
+# The rule: a tile is priced as its BASE item - what that item alone would fetch.  A loaded
+# magazine is the magazine, plated armour the armour, a filled container the container, a built
+# gun the base weapon.  Contents, plates, ammo and attachments are never read nor added, so the
+# price is always the base item's own tarkov.dev trader / flea value.
+
+def is_base_gun(item_data):
+    """True for a base weapon (tarkov.dev type 'gun').  Its price is the bare gun's; whatever is
+    built on it is not counted.  Signal flares (RSP-30) are tagged 'gun' too, but are fixed
+    special-slot items with a real price of their own."""
+    types = set((item_data or {}).get('types') or ())
+    return 'gun' in types and 'specialSlot' not in types
+
+
+# ---------------------------------------------------------------------------
 # Flea fee and list price
 # ---------------------------------------------------------------------------
 
@@ -636,7 +652,8 @@ def plan_entries(detections, id_to_item, protected, settings, ctx, any_of=None):
         count = d.get('count') or 1
         k = kept.get(i, 0)
         prot = protected.get(d['item_id'])
-        base = {'item_id': d['item_id'], 'matched_name': item['name'], **_geometry(d)}
+        base = {'item_id': d['item_id'], 'matched_name': item['name'], **_geometry(d),
+                **({'base_gun': True} if is_base_gun(item) else {})}
 
         if k:
             keep.append({**base, 'num': 'K', 'count': k, 'stack': count, 'drawn': k >= count,

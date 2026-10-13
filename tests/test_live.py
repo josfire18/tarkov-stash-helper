@@ -69,10 +69,17 @@ def test_grab_ranks_by_value_per_slot_best_of_trader_and_flea():
     assert names.index('Golden lion') < names.index('Big thing')
 
 
-def test_flea_not_counted_for_noflea_items_and_guns_not_ranked():
-    out = run([det('nofl', 'loot'), det('gun', 'loot', col=1, category='weapon')])['grab']
+def test_flea_not_counted_for_noflea_items():
+    out = run([det('nofl', 'loot')])['grab']
     assert [g['name'] for g in out] == ['Banned thing']
     assert out[0]['value'] == 40000                            # trader only, the 900k flea price is not available
+
+
+def test_a_gun_is_ranked_at_its_base_gun_value_and_labelled():
+    out = run([det('nofl', 'loot'), det('gun', 'loot', col=1, category='weapon')])['grab']
+    gun = next(g for g in out if g['name'] == 'Some gun')
+    assert gun['value'] == 70000 and gun['base_gun'] is True   # the bare gun's trader price, no attachments
+    assert 'base_gun' not in next(g for g in out if g['name'] == 'Banned thing')
 
 
 def test_stacks_multiply_and_top_n_and_threshold_come_from_settings():

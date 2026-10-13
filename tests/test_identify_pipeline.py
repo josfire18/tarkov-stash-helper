@@ -247,3 +247,67 @@ def test_literal_match_outranks_a_partial_label_only():
 def test_tie_detection():
     assert PL.is_tie(0.0) and PL.is_tie(0.05)
     assert not PL.is_tie(0.5) and not PL.is_tie(None)
+
+
+# --------------------------------------------------------------------------
+# guns are priced as the BASE weapon: the printed label (not a look-alike picture) names it
+# --------------------------------------------------------------------------
+
+GUNS = [  # (id, name, short, W, H, types)
+    (idof(50), 'Remington Model 870 12ga pump-action shotgun', 'M870', 5, 1, ['gun']),
+    (idof(51), 'Mossberg 590A1 12ga pump-action shotgun', '590A1', 5, 1, ['gun']),
+    (idof(52), 'Desert Tech MDR 5.56x45 assault rifle', 'MDR', 4, 2, ['gun']),
+    (idof(53), 'Desert Tech MDR 7.62x51 assault rifle', 'MDR', 4, 2, ['gun']),
+    (idof(54), 'M870 forend', 'M870 forend', 2, 1, ['mods']),
+    (idof(55), 'AK-74N 5.45x39 assault rifle', 'AK-74N', 5, 2, ['gun']),
+    (idof(56), 'AK-74 5.45x39 assault rifle', 'AK-74', 5, 2, ['gun'])]
+
+
+@pytest.fixture(scope='module')
+def gun_engine(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp('guns')
+    (tmp / 'tmpl').mkdir()
+    prices = []
+    for k, (iid, name, short, w, h, types) in enumerate(GUNS):
+        cv2.imwrite(str(tmp / 'tmpl' / f'{iid}.png'), make_icon(800 + k, w, h))
+        prices.append({'id': iid, 'name': name, 'shortName': short, 'width': w, 'height': h,
+                       'backgroundColor': 'blue', 'types': types})
+    (tmp / 'p.json').write_text(json.dumps({'items': prices}), encoding='utf-8')
+    cat = C.build_catalog(str(tmp / 'p.json'), str(tmp / 'tmpl'), str(tmp / 'nc'), with_cache=False, log=lambda *_: None)
+    return Engine(EngineSettings(use_dino=False, use_ocr=False, accelerate=False), catalog=cat)
+
+
+def test_a_built_guns_label_starts_with_the_base_guns_short_name(gun_engine):
+    eng = gun_engine
+    m870 = eng._id_row[idof(50)]
+    # "<short name> <the build's own name>": the gun whose short name starts the label
+    assert eng._gun_by_prefix(['M870 Hammer'], _tile(5, 1), False) == m870
+    assert eng._gun_by_prefix(['xx', 'M870 Breacher Mk2'], _tile(5, 1), False) == m870
+    # a read that is only the short name goes the normal route; so does one that cuts into a word
+    assert eng._gun_by_prefix(['M870'], _tile(5, 1), False) is None
+    assert eng._gun_by_prefix(['M8701 Hammer'], _tile(5, 1), False) is None
+    # a longer short name wins over the shorter one that is a prefix of it, never a guess between two
+    assert eng._gun_by_prefix(['AK-74 Hammer'], _tile(5, 2), False) == eng._id_row[idof(56)]
+    assert eng._gun_by_prefix(['AK-74N Hammer'], _tile(5, 2), False) == eng._id_row[idof(55)]
+    assert eng._gun_by_prefix(['MDR Hammer'], _tile(4, 2), False) is None      # two guns print "MDR"
+    # a gun that cannot occupy the tile is not named
+    assert eng._gun_by_prefix(['M870 Hammer'], _tile(1, 1), False) is None
+
+
+def test_the_gun_is_sure_only_when_the_label_names_one_gun(gun_engine):
+    eng = gun_engine
+    m870, forend = eng._id_row[idof(50)], eng._id_row[idof(54)]
+    assert eng._weapon_sure([], (m870, 100.0, 1, None)) is True
+    assert eng._weapon_sure([], (m870, PL.PREFIX_AUTH, 1, None)) is True
+    assert eng._weapon_sure([], (m870, 60.0, 1, None)) is False        # a doubtful read
+    assert eng._weapon_sure([], (forend, 100.0, 1, None)) is False     # a part is not a gun
+    # a picture that merely looks like some gun (its best pictures all guns) no longer counts
+    assert eng._weapon_sure([(m870, 0, 'a', 1.0), (eng._id_row[idof(51)], 0, 'b', 1.0)], None) is False
+
+
+def test_same_label_guns_report_their_finalists_for_the_calibre_to_separate(gun_engine):
+    eng = gun_engine
+    got = eng._label_authority(['MDR'], _tile(4, 2), True)
+    assert got[2] == 2
+    assert {str(eng.cat.names[r]) for r in eng._last_finalists} == {
+        'Desert Tech MDR 5.56x45 assault rifle', 'Desert Tech MDR 7.62x51 assault rifle'}

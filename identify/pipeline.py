@@ -82,7 +82,8 @@ WEAPON_RIVAL_GAP = 3.0       # ...unless a non-weapon is within this of it
 COLOUR_GAP_OK = 12.0       # look-alike twins: colour-only error lead (0-255 levels) that settles them
 COLOUR_MIN_PX = 30         # common opaque pixels (32 px/slot) needed for a colour comparison
 LABEL_VERIFIED_CONF = 0.97 # exact, unambiguous label read of an item that fits the footprint
-WEAPON_SURE_CONF = 0.95    # certainly a gun (guns are skipped, the exact gun does not matter)
+WEAPON_SURE_CONF = 0.95    # the base gun is known (named by its printed label, or by label + calibre)
+PREFIX_AUTH = 96.0         # label authority of a gun named by the START of its label ("M870 Hammer")
 _CAL_TOKEN = re.compile(r'\d+[.,]?\d*x\d{2}|\d{1,2}ga|[.,]\d{3}', re.I)
 # logistic calibration of the reported confidence: p = sigmoid(b + sum(w * feature)); fitted by
 # `python -m identify.calibrate` on degraded variants of the labelled stash (see that module)
@@ -177,6 +178,8 @@ class Engine:
         self._api_fold: list = []
         self._id_row: dict = {}
         self.preset_base: dict = {}
+        self._gun_short: dict = {}
+        self._last_finalists: list = []
         self._hits_cache: dict = {}
         if self.s.accelerate:
             match_enable_torch(self.s.device)
@@ -893,6 +896,21 @@ class Engine:
                                              twin_rank=self._twin_ranker(w), only_weapons=True)
                 if auth is not None and self._calibre_names_gun(cal_read['txt'], auth[0], w, tile, edge):
                     calibre_gun = True
+        if not calibre_gun and (auth is None or str(cat.cats[auth[0]]) != 'weapon'):
+            # a built gun prints its short name and then the build's own name ("M870 Hammer"):
+            # the gun is the one whose short name starts the label, vouched for by its calibre
+            pg = self._gun_by_prefix(w.get('ocr_all') or [], tile, edge)
+            if pg is not None and gun_probe() and self._calibre_names_gun(cal_read['txt'], pg, w, tile, edge):
+                auth = (pg, PREFIX_AUTH, 1, None)
+                calibre_gun = True
+        if (not calibre_gun and auth is not None and auth[2] > 1 and str(cat.cats[auth[0]]) == 'weapon'
+                and gun_probe()):
+            # same-label guns of different calibre (MDR 5.56 / 7.62, Desert Eagle .50 / .357): the
+            # calibre printed bottom-left tells them apart
+            fin = [r for r in self._last_finalists if str(cat.cats[r]) == 'weapon']
+            named = [r for r in fin if self._calibre_names_gun(cal_read['txt'], r, w, tile, edge)]
+            if len(named) == 1 and len(fin) > 1:
+                auth = (named[0], min(auth[1], PREFIX_AUTH), 1, None)
         if not calibre_gun:
             cw = None
             if auth is not None:
@@ -1008,7 +1026,7 @@ class Engine:
             evidence['verified'] = 'label'
         if str(cat.cats[chosen_row]) == 'weapon' and self._weapon_sure(
                 evidence.get('pool_rows'), auth if (twins == 1 or twin_ok) else None):
-            # guns are skipped by the sell list: being sure it IS a gun is all that matters
+            # the label (or label + calibre) names ONE base gun: the sell list prices it as the bare weapon
             conf = max(conf, WEAPON_SURE_CONF)
             evidence['verified'] = 'weapon'
         if auth is None and not calibre_gun and item_id and text and (o or 0) >= 100.0                 and self._unresolved_label_twins(w, tile, edge, item_id, have_dino):
@@ -1019,7 +1037,7 @@ class Engine:
             evidence['label_twins'] = True
         if calibre_gun:
             # the printed calibre ("20g") is the chosen gun's own and no same-label part's name
-            # carries it: that is the gun (the sell list skips guns, so no more is needed)
+            # carries it: that is the gun
             conf = max(conf, WEAPON_SURE_CONF)
             evidence['verified'] = 'weapon+calibre'
             evidence.pop('note', None)
@@ -1083,6 +1101,9 @@ class Engine:
                         self.gun_sizes[grow].add((int(c.tw[r]), int(c.th[r])))
                         break
             self._fold_of = {int(r): ocr_mod.fold_glyph(str(c.shorts[r])) for r in self._api}
+            self._gun_short = {}
+            for _, grow in guns:
+                self._gun_short.setdefault(ocr_mod.canon_nospace(str(c.shorts[grow])), []).append(grow)
         return self._api
 
     def _twins_settled_by_footprint(self, item_id: str, twins, tile: Tile, edge: bool, w=None) -> bool:
@@ -1206,7 +1227,7 @@ class Engine:
         """True when the item the picture chose shares its exactly-read label with another
         differently named item that fits the footprint unturned while the chosen one only fits
         turned, and the picture's lead over that item is below the twin gap (:data:`TWIN_GAP_OK`, :data:`TWIN_GAP_OK_RES` without DINO).  Guns
-        among themselves do not count: the sell list skips them."""
+        among themselves do not count (colour variants of one gun: the picture and calibre settle them)."""
         self._api_rows()
         cat = self.cat
         me = self._id_row.get(item_id)
@@ -1270,13 +1291,32 @@ class Engine:
         return bool(str(c.cats[row]) == 'weapon' or c.preset[row] or c.src[row] == 'build')
 
     def _weapon_sure(self, pool_rows, auth) -> bool:
-        """The tile is certainly *a gun* (which one does not matter: guns are skipped).  True when
-        the printed name confidently names a gun, or every one of the best three differently
-        named pictures is a gun / preset / weapon build."""
-        if auth is not None and auth[1] >= OCR_AUTH and str(self.cat.cats[auth[0]]) == 'weapon':
-            return True
-        top = (pool_rows or [])[:3]
-        return len(top) >= 2 and all(self._weapon_like(r) for r, *_ in top)
+        """The base gun is known: the printed label (alone, or the start of it plus the calibre)
+        confidently names one gun.  A picture that merely looks like *a* gun is not enough any
+        more - a gun is priced as its base weapon, so which gun matters."""
+        return auth is not None and auth[1] >= OCR_AUTH and str(self.cat.cats[auth[0]]) == 'weapon'
+
+    def _gun_by_prefix(self, texts: list, tile: Tile, edge: bool):
+        """Catalog row of the base gun whose short name STARTS a printed label that goes on with
+        more words (a saved build's own name: "M870 Hammer", "KS-23M Drozd"); None unless exactly
+        one gun name fits.  Only guns that can occupy this tile (:meth:`_footprint_ok`)."""
+        self._api_rows()
+        cat = self.cat
+        found: dict = {}
+        for txt in texts:
+            words = txt.split()
+            for k in range(1, len(words)):
+                key = ocr_mod.canon_nospace(' '.join(words[:k]))
+                if len(key) < 3:
+                    continue
+                for r in self._gun_short.get(key, ()):
+                    if self._footprint_ok(r, tile, edge):
+                        found[r] = max(found.get(r, 0), len(key))
+        if not found:
+            return None
+        top = max(found.values())
+        rows = [r for r, n in found.items() if n == top]
+        return rows[0] if len({str(cat.names[r]) for r in rows}) == 1 else None
 
     def _footprint_ok(self, row: int, tile: Tile, at_edge: bool) -> bool:
         """Can item ``row`` occupy this tile?  An item's footprint is fixed (either orientation)
@@ -1348,6 +1388,7 @@ class Engine:
         there was only one finalist or no picture score)."""
         self._api_rows()
         cat = self.cat
+        self._last_finalists = []
         allsc: dict[int, float] = {}
         for txt in texts:
             for i, s_ in self._label_hits(txt, tile.W).items():
@@ -1408,6 +1449,7 @@ class Engine:
             others = [vis.get(r, -99.0) for r in finalists[1:] if str(cat.names[r]) != nm0]
             if others:
                 gap = vis[finalists[0]] - max(others)
+        self._last_finalists = list(finalists)
         if probed:
             # the calibre read only breaks the tie: art can look like text, so never "verified"
             return finalists[0], float(top), max(2, n_before), None
