@@ -14,7 +14,11 @@ from identify import scene as S
 from identify.grid import GridResult, Panel, detect_grid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LIVE = os.path.join(ROOT, 'data', 'scenes', 'live')
+# data/frames_ref/lobby/ holds a stable copy (the collector's data/scenes/live/ is a ring of 300
+# that rotates these out); fall back to the live folder.
+LIVE = next((d for d in (os.path.join(ROOT, 'data', 'frames_ref', 'lobby'),
+                         os.path.join(ROOT, 'data', 'scenes', 'live')) if os.path.isdir(d)),
+            os.path.join(ROOT, 'data', 'scenes', 'live'))
 LIVE_FRAMES = {
     'gear': '1791730346167-lobby.png', 'flea_offer': '1791730379737-raid.png',
     'trader': '1791730400469-lobby.png', 'handover': '1791731210892-lobby.png',

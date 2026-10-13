@@ -3246,4 +3246,19 @@ if __name__ == '__main__':
         sys.stderr = log_file
     else:
         print(f"Tarkov Stash Helper starting (internal: {URL})")
-    _run_app()
+    try:
+        _run_app()
+    except BaseException as e:
+        if isinstance(e, SystemExit):
+            raise
+        # Launch errors (also from the Windows start-up entry, which has no console) must
+        # leave a trace: the full traceback goes to data/app.log.
+        import traceback
+        try:
+            with open(os.path.join(DATA, 'app.log'), 'a', encoding='utf-8') as fh:
+                fh.write('\n' + time.strftime('%Y-%m-%d %H:%M:%S')
+                         + f' launch failed, argv={sys.argv!r}, cwd={os.getcwd()!r}\n'
+                         + traceback.format_exc())
+        except OSError:
+            pass
+        raise
