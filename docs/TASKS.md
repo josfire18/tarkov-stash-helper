@@ -54,3 +54,6 @@ Next:
 Merged: grid recall (#16), coverage (#17, v0.4.2 released), cut-tile certification (#18), label reads (this PR).
 Strict lean eval: 1030 / 0 wrong / 31 Check / 2 missed; certified 537, certified-but-wrong 0.
 Next: panel bottom-clip detection misses items cut by the panel/image bottom (Hawk gunpowder, fuel tank segmented too short); hideout screen; real raid frames still needed.
+
+## Parked
+- Build pricing: the user opens the weapon inspect/modding window so the attachment icons along the bottom are visible; identify each attachment (plain items -> exact via icon hash) and sum a build value. Parked by the user 2026-10-13.

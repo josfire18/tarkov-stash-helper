@@ -49,6 +49,7 @@ HEADERS = {
     'POUCH': ('own_pouch', 'right'),
     'POCKETS': ('own_pockets', 'under'), 'SPECIAL SLOTS': ('own_special', 'under'),
 }
+RAID_LOOT_X = 0.63         # in a raid the player's grids end left of this fraction of the width, loot starts right of it
 _SIDE = {'stash': 'stash', 'loot': 'loot', 'container_window': 'stash', 'incoming': 'stash',
          'picker': 'other', 'trader_goods': 'other', 'offer_window': 'other', 'handover': 'other',
          'unknown': 'other'}
@@ -69,11 +70,15 @@ class Region:
     title: str | None = None
     confidence: float = 0.0
     title_h: int = 0            # windows: height of the title band in px
+    hidden: tuple = ()          # loot grids: (col, row) cells still hidden by the search (never read)
 
     def as_dict(self) -> dict:
         x, y, w, h = (int(v) for v in self.bbox)
-        return {'bbox': [x, y, w, h], 'role': self.role, 'side': self.side,
-                'title': self.title, 'confidence': round(float(self.confidence), 2)}
+        d = {'bbox': [x, y, w, h], 'role': self.role, 'side': self.side,
+             'title': self.title, 'confidence': round(float(self.confidence), 2)}
+        if self.hidden:
+            d['hidden'] = [[int(c), int(r)] for c, r in self.hidden]
+        return d
 
 
 @dataclass
@@ -90,6 +95,8 @@ class SceneInfo:
     zones: list = field(default_factory=list)    # coarse header-anchored search zones (internal)
     pitch: float = float(SLOT)
     frame_wh: tuple = (0, 0)
+    loot: object = None               # in a raid: identify.lootgrid.LootInfo of the right-hand LOOT column
+    searching: bool = False           # the LOOT header shows the red SEARCHING cancel button
 
 
 # --------------------------------------------------------------------------
@@ -127,6 +134,13 @@ def find_close_buttons(frame: np.ndarray, relaxed: bool = False) -> list:
                 continue
         out.append((int(x), int(y), int(w), int(h)))
     return out
+
+
+def _is_search_button(btn, W, H) -> bool:
+    """The red cancel button of the in-raid LOOT header ("SEARCHING  x  0:05"): same look as a window's
+    close button, but it sits in the header row of the right-hand column, not on a window."""
+    x, y, w, h = btn
+    return x + w / 2.0 >= 0.6 * W and 0.045 * H <= y + h / 2.0 <= 0.075 * H
 
 
 def _col_frac(frame, x, y0, y1, ref, tol, below=True):
@@ -421,7 +435,10 @@ def _ocr_strips(strips: list, psm: int = 6) -> list:
         if g.mean() < 127:                    # light text on dark -> make it dark on light
             g = 255 - g
         tiles.append(g)
-        keys.append((g.shape, hash(g.tobytes())))
+        # the cache key is the bright-text bitmap, not the binarised tile: the blurred scene behind a
+        # header changes the Otsu result from frame to frame, the text pixels do not
+        bright = (s.min(axis=2) >= 170) if s.ndim == 3 else (s > 127)
+        keys.append((g.shape, hash(bright.tobytes()), bright.shape))
     out = [_OCR_CACHE.get(k) for k in keys]
     todo = [i for i, o in enumerate(out) if o is None]
     if todo:
@@ -505,6 +522,31 @@ def _grid_extent(frame: np.ndarray, zone: Region, windows: list, pitch: float, n
     return tuple(int(v) for v in (zx + x0 + pad, zy + y0 + pad, x1 - x0 - 2 * pad, y1 - y0 - 2 * pad))
 
 
+def _text_mask(strip: np.ndarray, frac: float, floor: int) -> np.ndarray:
+    """Bright text of a strip as a binary image (255 = text): a bitmap that does not depend on the
+    blurred scene behind it, so the OCR cache hits for the same text."""
+    g = strip.min(axis=2) if strip.ndim == 3 else strip
+    if g.size == 0:
+        return g
+    thr = max(floor, frac * float(g.max()))
+    return ((g >= thr) * 255).astype(np.uint8)
+
+
+def _slot_extent(frame: np.ndarray, zone: Region, windows: list, pitch: float):
+    """Fallback for ``_grid_extent``: slots drawn with a tinted (brown special slots) frame are not in
+    the border colour; the own-grid frame finder (bright ridges) still finds them.  Union bbox of the
+    cell groups whose top sits just under the header, or None."""
+    from .owngrid import region_panels
+    hy = zone.bbox[1] + 0.2 * pitch                       # header bottom
+    ps = [p for p in region_panels(frame, zone.bbox, pitch, [w.bbox for w in windows])
+          if hy - 0.3 * pitch <= p.y0 <= hy + 1.0 * pitch]
+    if not ps:
+        return None
+    x0, y0 = min(p.x0 for p in ps), min(p.y0 for p in ps)
+    x1, y1 = max(p.x1 for p in ps), max(p.y1 for p in ps)
+    return (int(x0), int(y0), int(x1 - x0), int(y1 - y0))
+
+
 def _match_header(text: str):
     t = re.sub(r'[^A-Z ]', '', text.upper()).strip()
     if len(t) < 4:
@@ -582,6 +624,9 @@ def analyze_scene(frame_bgr: np.ndarray, *, in_raid=None) -> SceneInfo:
     wins = []                       # [rect, title_h]
 
     def add_window(btn):
+        if _is_search_button(btn, W, H):
+            info.searching = True
+            return
         r = trace_window(frame_bgr, btn)
         if r is not None and not any(abs(r[0] - w[0][0]) < 4 and abs(r[1] - w[0][1]) < 4 for w in wins):
             wins.append([r, btn[1] + btn[3] - r[1] + 3])
@@ -660,8 +705,25 @@ def analyze_scene(frame_bgr: np.ndarray, *, in_raid=None) -> SceneInfo:
     info.in_raid = not lobby
     for w in info.windows:
         if info.in_raid and w.role == 'container_window':
-            w.side = 'loot' if (w.bbox[0] + w.bbox[2] / 2) >= 0.55 * W else 'other'
+            # a window of the looted container opens on the right, one opened from the backpack /
+            # rig next to the player's own grids: the player's gear column ends at ~0.63 W
+            w.side = 'loot' if (w.bbox[0] + w.bbox[2] / 2) >= RAID_LOOT_X * W else 'own'
     info.regions.extend(info.windows)
+
+    # ---- in-raid LOOT column (right of the player's gear) -----------------------------
+    loot_strips = []
+    if info.in_raid:
+        from .lootgrid import analyze_loot
+        info.loot = analyze_loot(frame_bgr, pitch)
+        lo = info.loot
+        if lo.origin is not None:
+            ox, oy = lo.origin
+            if lo.panel is None and lo.placeholder is None:       # nothing drawn: is there a LOOT header at all?
+                loot_strips.append(_text_mask(frame_bgr[max(0, int(oy - 0.34 * pitch)):int(oy - 0.04 * pitch),
+                                                        ox:int(ox + 1.9 * pitch)], 0.6, 90))
+            else:                                                 # the container's name at the top right
+                loot_strips.append(_text_mask(frame_bgr[int(0.0455 * H):int(0.0665 * H), int(0.89 * W):int(0.995 * W)],
+                                              0.65, 130))
 
     # ---- stash + SHOWCASE regions -----------------------------------------------------
     side_kind = None
@@ -681,10 +743,18 @@ def analyze_scene(frame_bgr: np.ndarray, *, in_raid=None) -> SceneInfo:
         cands = find_header_candidates(frame_bgr, x_max)
         cands = [c for c in cands if not any(_inside((c[0] + c[2] / 2, c[1] + c[3] / 2), w[0]) for w in wins)]
         strips = [frame_bgr[max(0, y - 3):y + h + 3, max(0, x - 3):x + w + 3] for (x, y, w, h) in cands]
-        for c, t in zip(cands, _ocr_strips(strips)):
+        read = _ocr_strips(strips + loot_strips)
+        for c, t in zip(cands, read):
             mh = _match_header(t)
             if mh:
                 info.headers.append((mh[0], c))
+        if loot_strips:
+            txt = read[len(strips)]
+            if info.loot.panel is None and info.loot.placeholder is None:
+                info.loot.header = _fuzzy(txt, 'LOOT', 0.7)
+            else:
+                info.loot.name = _clean_title(txt) or None
+        _add_loot_regions(info)
 
     # ---- header zones -----------------------------------------------------------
     for name, (x, y, w, h) in info.headers:
@@ -700,6 +770,8 @@ def analyze_scene(frame_bgr: np.ndarray, *, in_raid=None) -> SceneInfo:
             if kind == 'right' and abs(x2 - x) < 0.5 * pitch and y2 > y + 3:
                 zy1 = min(zy1, y2 - 2)
         zx1 = (tb[0] - 2) if (tb and lobby) else int(0.97 * W)
+        if info.in_raid and side == 'own':             # the player's grids end before the LOOT column
+            zx1 = min(zx1, int(RAID_LOOT_X * W))
         if kind == 'under':
             for n2, (x2, y2, w2, h2) in info.headers:  # next header to the right on the same row
                 if abs(y2 - y) < 0.3 * pitch and x2 > x + pitch:
@@ -710,6 +782,8 @@ def analyze_scene(frame_bgr: np.ndarray, *, in_raid=None) -> SceneInfo:
         if z.role in ('own_other',):
             continue
         bb = _grid_extent(frame_bgr, z, info.windows, pitch, neutral_frames=raid_ended)
+        if bb is None and info.in_raid and z.role in ('own_special', 'own_pockets', 'own_rig'):
+            bb = _slot_extent(frame_bgr, z, info.windows, pitch)
         if bb is not None:
             info.regions.append(Region(bb, z.role, z.side, z.title, 0.85))
 
@@ -717,10 +791,11 @@ def analyze_scene(frame_bgr: np.ndarray, *, in_raid=None) -> SceneInfo:
     nh = len(info.headers)
     if info.in_raid:
         loot_h = any(r.side == 'loot' for r in info.regions if r.title in HEADERS)
+        loot_side = loot_h or (info.loot is not None and info.loot.found) or             any(r.side == 'loot' for r in info.windows if r.role == 'container_window')
         if nh >= 2:
-            info.scene = 'raid_loot' if loot_h else 'raid_inventory'
+            info.scene = 'raid_loot' if loot_side else 'raid_inventory'
         else:
-            info.scene = 'raid_loot' if info.windows else 'unknown'
+            info.scene = 'raid_loot' if (info.windows or loot_side) else 'unknown'
     elif tb is not None:
         offer = any(w.role == 'offer_window' for w in info.windows) or (not info.windows and tb[0] < 0.05 * W)
         if raid_ended:
@@ -745,6 +820,21 @@ def analyze_scene(frame_bgr: np.ndarray, *, in_raid=None) -> SceneInfo:
     else:
         info.scene = 'none'
     return info
+
+
+def _add_loot_regions(info: SceneInfo) -> None:
+    """Regions of the LOOT column: the container's grid (cells hidden by the search listed in
+    ``hidden``) or the UNSEARCHED stand-in (everything hidden)."""
+    lo = info.loot
+    if lo is None:
+        return
+    title = lo.name
+    if lo.panel is not None:
+        p = lo.panel
+        info.regions.append(Region((p.x0, p.y0, p.x1 - p.x0, p.y1 - p.y0), 'loot', 'loot', title, 0.9,
+                                   hidden=tuple(sorted(lo.hidden))))
+    elif lo.placeholder is not None:
+        info.regions.append(Region(lo.placeholder, 'loot', 'loot', title or 'UNSEARCHED', 0.8, hidden=((0, 0),)))
 
 
 def _clean_title(t: str) -> str:
@@ -896,7 +986,52 @@ def split_panels(grid_result: GridResult, scene: SceneInfo, frame_bgr: np.ndarra
         out = [(p, r) for p, r in out[:n_orig] if not (r.role == 'stash' and r.title is None)] + out[n_orig:]
     if frame_bgr is not None:
         out = _own_gear_pieces(out, grid_result, scene, frame_bgr)
+    out.extend(_loot_pieces(scene, wins))
     out.sort(key=lambda t: (t[0].y0, t[0].x0))
+    return out
+
+
+def _loot_box(scene: SceneInfo):
+    """(x0, y0, x1, y1) of the LOOT column's grid / stand-in, or None."""
+    lo = scene.loot
+    if lo is None:
+        return None
+    if lo.panel is not None:
+        p = lo.panel
+        return (p.x0, p.y0, p.x1, p.y1)
+    if lo.placeholder is not None:
+        x, y, w, h = lo.placeholder
+        return (x, y, x + w, y + h)
+    return None
+
+
+def _loot_pieces(scene: SceneInfo, wins) -> list:
+    """``[(Panel, Region)]`` of the revealed cells of the looted container's grid (found by
+    :mod:`identify.lootgrid`, not by ``detect_grid``): cells still hidden by the search, and cells a
+    window covers, are left out."""
+    lo = scene.loot
+    if lo is None or lo.panel is None:
+        return []
+    pn = lo.panel
+    nc, nr = pn.n_cols, pn.n_rows
+    m = np.ones((nr, nc), bool)
+    for c, r in lo.hidden:
+        if r < nr and c < nc:
+            m[r, c] = False
+    for r in range(nr):
+        for c in range(nc):
+            if m[r, c] and _touches_window(pn, c, r, wins, None):
+                m[r, c] = False
+    out = []
+    for (c0, c1, r0, r1) in _rects_from_mask(m):
+        xs, ys = pn.xs[c0:c1 + 2], pn.ys[r0:r1 + 2]
+        p = Panel(x0=int(xs[0]), y0=int(ys[0]), x1=int(xs[-1]) + 1, y1=int(ys[-1]) + 1,
+                  ox=float(xs[0]), oy=float(ys[0]), pitch_x=pn.pitch_x, pitch_y=pn.pitch_y,
+                  n_cols=c1 - c0 + 1, n_rows=r1 - r0 + 1, xs=list(xs), ys=list(ys),
+                  clip_top=False, clip_bottom=bool(pn.clip_bottom and r1 == nr - 1),
+                  strength=pn.strength, own=True)
+        title = next((r.title for r in scene.regions if r.role == 'loot' and r.bbox[:2] == (pn.x0, pn.y0)), None)
+        out.append((p, Region((p.x0, p.y0, p.x1 - p.x0, p.y1 - p.y0), 'loot', 'loot', title, 0.9)))
     return out
 
 
@@ -1024,6 +1159,8 @@ def _touches_window(panel, c, r, wins, skip):
 def _cell_key(panel, c, r, cx, cy, wins, sx, lobby, heads, scene, pitch, W, H):
     """(role, side, confidence, title, window_index) for one cell, or None when it must not be read."""
     x0, x1, y0, y1 = panel.xs[c], panel.xs[c + 1], panel.ys[r], panel.ys[r + 1]
+    if scene.in_raid and not panel.own and not 0.8 * pitch <= panel.pitch_x <= 1.25 * pitch:
+        return None                                # a lattice fitted to item art (EFT draws every cell at one pitch)
     for i, w in enumerate(wins):                   # windows first: they sit on top of everything
         wx, wy, ww, wh = w.bbox
         if wx <= cx <= wx + ww and wy <= cy <= wy + wh:
@@ -1038,6 +1175,9 @@ def _cell_key(panel, c, r, cx, cy, wins, sx, lobby, heads, scene, pitch, W, H):
             return None
     if _touches_window(panel, c, r, wins, None):   # partly covered by a window: occluded
         return None
+    lb = _loot_box(scene)
+    if lb is not None and lb[0] - 4 <= cx <= lb[2] + 4 and lb[1] - 4 <= cy <= lb[3] + 4:
+        return None                                    # the looted container: read by _loot_pieces
     sb = scene.stash_bbox
     if lobby and sb is not None and sb[0] <= cx <= sb[0] + sb[2] and sb[1] <= cy <= sb[1] + sb[3]:
         return ('stash', 'stash', 0.95, None, -1)
@@ -1061,7 +1201,9 @@ def _cell_key(panel, c, r, cx, cy, wins, sx, lobby, heads, scene, pitch, W, H):
                     if h2 is not h and abs(h2['y'] - h['y']) < 0.3 * pitch and h2['x'] > h['x'] + pitch \
                             and cx >= h2['x0'] - 0.3 * pitch:
                         ok = False
-        if ok and (best is None or h['ybot'] > best['ybot']):
+        # the nearest column wins (a backpack grid is also inside the 11-cell reach of the equipment
+        # headers of the column to its left), then the lowest header
+        if ok and (best is None or (h['x0'] // (0.5 * pitch), h['ybot']) > (best['x0'] // (0.5 * pitch), best['ybot'])):
             best = h
     if best is not None:
         role = best['role']
