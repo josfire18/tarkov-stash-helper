@@ -46,14 +46,18 @@ def _ridges(gray: np.ndarray, level: int):
     return (gray - np.maximum(left, right)) >= level, (gray - np.maximum(up, down)) >= level
 
 
-def _frames(crop: np.ndarray, pitch: float, blank=()):
+def _frames(crop: np.ndarray, pitch: float, blank=(), strong: int = STRONG, linemask: bool = True,
+            min_abs: int = 0):
     """Connected frames of long drawn lines: [(x0, y0, x1, y1)] bboxes (crop coordinates, x1/y1 =
     the last line pixel) plus the strong masks."""
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.int16)
-    sv, sh = _ridges(gray, STRONG)
-    from .grid import line_mask
-    lm = line_mask(crop)
-    sv, sh = sv | lm, sh | lm
+    sv, sh = _ridges(gray, strong)
+    if min_abs:                                            # a drawn frame is bright, not just a bit above a dark ground
+        sv, sh = sv & (gray >= min_abs), sh & (gray >= min_abs)
+    if linemask:
+        from .grid import line_mask
+        lm = line_mask(crop)
+        sv, sh = sv | lm, sh | lm
     for (bx, by, bw, bh) in blank:                         # floating windows hide what is below
         sv[max(0, by):max(0, by + bh), max(0, bx):max(0, bx + bw)] = False
         sh[max(0, by):max(0, by + bh), max(0, bx):max(0, bx + bw)] = False
@@ -156,8 +160,11 @@ def _snap_frame(box, sh, sv, weak_v, weak_h, pitch, top_clip_y=None):
     return xs, ys, False, clip
 
 
-def region_panels(frame: np.ndarray, bbox, pitch: float, windows=()):
-    """Panels of the cell groups inside ``bbox`` (x, y, w, h) of ``frame``: [Panel]."""
+def region_panels(frame: np.ndarray, bbox, pitch: float, windows=(), strong: int = STRONG,
+                  linemask: bool = True, min_abs: int = 0):
+    """Panels of the cell groups inside ``bbox`` (x, y, w, h) of ``frame``: [Panel].  ``strong`` /
+    ``linemask`` / ``min_abs`` tune what counts as a drawn frame line (the in-raid loot grid: bright
+    outer frame, near invisible inner lines, no stash border colour)."""
     H, W = frame.shape[:2]
     m = max(4, int(0.1 * pitch))
     x0, y0 = max(0, int(bbox[0]) - m), max(0, int(bbox[1]) - m)
@@ -166,7 +173,7 @@ def region_panels(frame: np.ndarray, bbox, pitch: float, windows=()):
         return []
     crop = frame[y0:y1, x0:x1]
     blank = [(int(wx - 2 - x0), int(wy - 2 - y0), int(ww + 5), int(wh_ + 5)) for (wx, wy, ww, wh_) in windows]
-    boxes, sh, sv = _frames(crop, pitch, blank)
+    boxes, sh, sv = _frames(crop, pitch, blank, strong, linemask, min_abs)
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.int16)
     wv, wh = _ridges(gray, WEAK)
     weak_v = (wv | sv).sum(0)
