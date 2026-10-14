@@ -42,7 +42,7 @@ sys.path.insert(0, ROOT)
 from autoscan.detect import InventoryDetector          # noqa: E402
 from autoscan.trigger import thumbnail, view_hash      # noqa: E402
 
-DEFAULT_OUT = r'D:\Documents\.. Scripting\Python\Tarkov Helper\data\scenes'
+DEFAULT_OUT = os.path.join(ROOT, 'data', 'scenes')
 DEFAULT_GLOBS = [
     r'D:\Videos\Captures\EscapeFromTarkov\*.mkv',
     r'D:\Videos\Geforce Captures\**\*.mp4',
