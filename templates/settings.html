@@ -205,6 +205,8 @@ function chip(text, kind) { return el('span', { class: 'chip ' + (kind || ''), t
 // Settings state + auto-save (debounced; only the changed keys are sent, the server merges them)
 // ---------------------------------------------------------------------------
 let state = {};          // what the page shows: stored values over the defaults
+const PROFILE_KEYS = ['faction', 'prestige', 'flea_offer_slots', 'intel_center_level', 'hideout_management_level', 'trader_levels'];
+const PROFILE_LABELS = { pvp: 'PvP', pve: 'PvE', season: 'PvP S' };
 let defaults = {};
 let pending = {};        // changed keys not yet sent
 let saveTimer = null;
@@ -251,6 +253,7 @@ async function reload(keys) {
     if (!res.ok || !res.data || !res.data.settings) return;
     defaults = res.data.defaults;
     for (const k of (keys || Object.keys(res.data.settings))) if (!(k in pending)) state[k] = res.data.settings[k];
+    paintProfile(res.data.profile);
     syncRows(keys);
     applyDerived();
   } catch (_) { /* offline: keep what is shown */ }
@@ -293,19 +296,36 @@ const SECTIONS = [
         options: [{ value: 'auto', label: 'Auto-detect' }, { value: 'pvp', label: 'PvP' }, { value: 'pve', label: 'PvE' }, { value: 'season', label: 'PvP Season' }],
         detected: true,
         help: 'Prices, quests and hand-ins for this profile. Leave it on Auto: the game log says which one you are in. Seasonal PvP uses the PvP market.' },
-      { key: 'faction', type: 'select', label: 'Faction',
-        options: [{ value: 'auto', label: 'Auto-detect' }, { value: 'BEAR', label: 'BEAR' }, { value: 'USEC', label: 'USEC' }],
-        help: 'Your PMC faction – a few tasks and rewards differ between BEAR and USEC.' },
       { key: 'eft_install_dir', type: 'text', label: 'Tarkov folder', placeholder: 'Auto-detect',
         help: 'Where Tarkov is installed (the folder with EscapeFromTarkov.exe); leave it empty to find it automatically.' },
-      { key: 'prestige', type: 'select', label: 'Prestige level', noReset: true,
-        options: [{ value: 0, label: 'None' }, ...range(1, 6)],
-        help: 'Decides which hand-in items must be Found in Raid.',
-        action: { label: 'New prestige', run: newPrestige } },
       { key: 'kappa_only_tasks', type: 'switch', label: 'Only count Kappa tasks',
         help: 'Only keep items for the Collector’s own quest chain (about 13 quests since 1.0). Off keeps items for every quest you have not finished — recommended.' },
     ],
     build: buildProgressStatus },
+
+  // Everything here describes the character, so each profile (PvP, PvP S, PvE) has its own values.
+  { id: 'character', title: 'Your character', jump: 'Your character', intro: null,
+    rows: [
+      { key: 'faction', type: 'select', label: 'Faction',
+        options: [{ value: 'auto', label: 'Auto-detect' }, { value: 'BEAR', label: 'BEAR' }, { value: 'USEC', label: 'USEC' }],
+        help: 'Your PMC faction – a few tasks and rewards differ between BEAR and USEC.' },
+      { key: 'prestige', type: 'select', label: 'Prestige level', noReset: true,
+        options: [{ value: 0, label: 'None' }, ...range(1, 6)],
+        help: 'Decides which hand-in items must be Found in Raid.',
+        action: { label: 'New prestige', run: newPrestige } },
+      { key: 'flea_offer_slots', type: 'number', label: 'Flea offer slots', min: 0, max: 20,
+        help: 'How many offers you can have on the flea at once – your flea rating decides .' },
+      { key: 'intel_center_level', type: 'select', label: 'Intelligence Center level',
+        options: [{ value: null, label: 'Auto (from your hideout levels)' }, { value: 0, label: 'Not built' }, ...range(1, 3)],
+        help: 'Level 3 makes flea fees 30% cheaper; Auto uses your hideout levels.' },
+      { key: 'hideout_management_level', type: 'number', label: 'Hideout Management skill', min: 0, max: 51,
+        help: 'Your skill level (0–51); every level adds a little more fee discount once the Intelligence Center is level 3.' },
+      { id: 'ref_level', keys: ['trader_levels', 'skip_traders'], type: 'select', label: 'Ref loyalty level',
+        options: range(1, 4), dimWhen: skipsRef,
+        get: s => (s.trader_levels || {}).Ref || 1,
+        put: (v, s) => ({ trader_levels: Object.assign({}, s.trader_levels || {}, { Ref: v }) }),
+        help: 'Only matters if you sell to Ref (see Selling) – Ref pays more as your loyalty level goes up.' },
+    ] },
 
   { id: 'scanning', title: 'Scanning', intro: null,
     rows: [
@@ -345,27 +365,15 @@ const SECTIONS = [
                     { value: true, label: 'Required – only FIR items can be listed' },
                     { value: false, label: 'Not required' }],
           help: 'Whether the flea market only takes Found-in-Raid items; leave it on “follow” unless Battlestate lifts the rule for an event.' },
-        { key: 'flea_offer_slots', type: 'number', label: 'Flea offer slots', min: 0, max: 20,
-          help: 'How many offers you can have on the flea at once – your flea rating decides .' },
         { key: 'flea_overflow', type: 'select', label: 'When your slots are full',
           options: [{ value: 'queue', label: 'Queue them for when a slot frees up' }, { value: 'trader', label: 'Sell them to a trader now' }],
           help: 'What to do with flea picks that don’t fit in your free offer slots.' },
         { key: 'flea_min_gain', type: 'number', label: 'Minimum flea profit', min: 0, max: 10000000, step: 1000, unit: 'roubles',
           help: 'Only suggest the flea when it beats the best trader by at least this much per offer – an offer takes a slot and sells later.' },
-        { key: 'intel_center_level', type: 'select', label: 'Intelligence Center level',
-          options: [{ value: null, label: 'Auto (from your hideout levels)' }, { value: 0, label: 'Not built' }, ...range(1, 3)],
-          help: 'Level 3 makes flea fees 30% cheaper; Auto uses your hideout levels.' },
-        { key: 'hideout_management_level', type: 'number', label: 'Hideout Management skill', min: 0, max: 51,
-          help: 'Your skill level (0–51); every level adds a little more fee discount once the Intelligence Center is level 3.' },
       ] },
       { rows: [
         { id: 'traders', keys: ['skip_traders'], type: 'checks', label: 'Traders to sell to', wide: true,
           help: 'Untick any trader you never use and the advisor stops sending items there. Ref pays in GP coins, not roubles, so it starts unticked.' },
-        { id: 'ref_level', keys: ['trader_levels', 'skip_traders'], type: 'select', label: 'Ref loyalty level',
-          options: range(1, 4), dimWhen: skipsRef,
-          get: s => (s.trader_levels || {}).Ref || 1,
-          put: (v, s) => ({ trader_levels: Object.assign({}, s.trader_levels || {}, { Ref: v }) }),
-          help: 'Only matters if you tick Ref above – Ref pays more as your loyalty level goes up.' },
       ] },
     ] },
 
@@ -528,6 +536,15 @@ async function newPrestige() {
   if (!res.ok) { toast('Couldn’t start a new prestige', 'bad', 4000); return; }
   await reload(['prestige']);
   toast('✓ Prestige ' + res.data.prestige, 'ok', 2400);
+}
+
+// The character section is titled with the profile it edits ("Your character · PvP S").
+function paintProfile(profile) {
+  const sec = SECTIONS.find(x => x.id === 'character');
+  if (!sec || !profile) return;
+  sec.title = 'Your character · ' + (profile.label || PROFILE_LABELS[profile.mode] || '');
+  const h = document.getElementById('h-character');
+  if (h) h.textContent = sec.title;
 }
 
 function setLine(line, text, kind) { line.textContent = text || ''; line.className = 'line ' + (kind || ''); }
@@ -705,7 +722,7 @@ function paintDetectedMode(m) {
     + (m.mismatch ? ' (you picked another)' : '');
 }
 document.addEventListener('tsh:status', ev => paintDetectedMode(ev.detail && ev.detail.mode));
-document.addEventListener('tsh:mode', () => { reload(['game_mode']); pollData(); pollProgress(); });
+document.addEventListener('tsh:mode', () => { reload(['game_mode', ...PROFILE_KEYS]); pollData(); pollProgress(); });   // another profile = another character
 
 // ---------------------------------------------------------------------------
 // Data section
@@ -876,7 +893,7 @@ async function loadAbout() {
 function jumpBar() {
   const bar = document.getElementById('jump');
   for (const sec of SECTIONS) {
-    bar.append(el('a', { href: '#sec-' + sec.id, text: sec.title, onclick: e => {
+    bar.append(el('a', { href: '#sec-' + sec.id, text: sec.jump || sec.title, onclick: e => {
       e.preventDefault();
       document.getElementById('sec-' + sec.id).scrollIntoView({ behavior: 'smooth', block: 'start' });
     } }));
@@ -897,6 +914,7 @@ async function init() {
   }
   state = res.data.settings;
   defaults = res.data.defaults;
+  paintProfile(res.data.profile);
   page.replaceChildren(...SECTIONS.map(buildSection));
   syncRows();
   applyDerived();

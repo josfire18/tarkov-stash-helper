@@ -543,11 +543,8 @@ def _tasks_cache():
 
 
 def _protect(monkeypatch, tmp_path, progress, keep_list=None, price_idx=None):
-    import json
-    prog = tmp_path / 'progress.json'
-    prog.write_text(json.dumps(progress), encoding='utf-8')
-    monkeypatch.setattr(app, 'PROGRESS_PATH', str(prog))
     monkeypatch.setattr(app, 'SETTINGS_PATH', str(tmp_path / 'settings.json'))
+    app.save_progress(progress)                 # the active profile's progress (rewritten per call)
     monkeypatch.setattr(app, 'get_tasks', lambda allow_fetch=True: _tasks_cache())
     return app.get_protected_ids(keep_list or {'categories': []}, price_idx or {})
 
@@ -642,11 +639,8 @@ def _any_of_cache():
 
 
 def _plan_for(monkeypatch, tmp_path, progress):
-    import json
-    prog = tmp_path / 'progress.json'
-    prog.write_text(json.dumps(progress), encoding='utf-8')
-    monkeypatch.setattr(app, 'PROGRESS_PATH', str(prog))
     monkeypatch.setattr(app, 'SETTINGS_PATH', str(tmp_path / 'settings.json'))
+    app.save_progress(progress)                 # the active profile's progress (rewritten per call)
     monkeypatch.setattr(app, 'get_tasks', lambda allow_fetch=True: _any_of_cache())
     return app.get_protected_plan({'categories': []}, {})
 

@@ -836,7 +836,7 @@ def build_sell_context(settings, prices):
     try:
         tasks = get_tasks(allow_fetch=False)
         if tasks:
-            progress = load_json(PROGRESS_PATH, default_progress)
+            progress = load_progress()
             intel = sellcalc.intel_center_level(tasks.get('hideoutStations'),
                                                 progress.get('completed_hideout'))
     except Exception as e:
@@ -953,6 +953,222 @@ def default_keep_list():
             }
         ]
     }
+
+
+# ---------------------------------------------------------------------------
+# Profiles: PvP, PvP Season and PvE are separate characters
+# ---------------------------------------------------------------------------
+# Everything that describes the player's character (quests, hideout, have-counts, the keep list and
+# the character settings) lives under data/profiles/<mode>/; the app's own preferences stay in
+# data/settings.json.  The active profile IS the effective game mode.  Nothing outside this block
+# reads or writes those files directly.
+
+PROFILES_DIR = os.path.join(DATA, 'profiles')
+# Settings that describe the character (a different value per profile).  Everything else in
+# default_settings is an app preference and stays global.
+PROFILE_SETTING_KEYS = ('prestige', 'faction', 'trader_levels', 'intel_center_level',
+                        'hideout_management_level', 'flea_offer_slots')
+_profiles_lock = threading.RLock()
+_migrating = threading.local()
+_mig_clean = {'sig': None}      # settings.json signature known to hold no profile keys
+
+
+def global_defaults():
+    return {k: v for k, v in default_settings().items() if k not in PROFILE_SETTING_KEYS}
+
+
+def profile_defaults():
+    return {k: v for k, v in default_settings().items() if k in PROFILE_SETTING_KEYS}
+
+
+def split_settings(settings):
+    """``(global_part, profile_part)`` of a settings dict."""
+    g = {k: v for k, v in settings.items() if k not in PROFILE_SETTING_KEYS}
+    p = {k: v for k, v in settings.items() if k in PROFILE_SETTING_KEYS}
+    return g, p
+
+
+def _plog(msg):
+    line = f'[profiles] {msg}'
+    print(line)
+    try:
+        os.makedirs(PROFILES_DIR, exist_ok=True)
+        with open(os.path.join(PROFILES_DIR, 'migration.log'), 'a', encoding='utf-8') as f:
+            f.write(time.strftime('%Y-%m-%d %H:%M:%S ') + line + '\n')
+    except OSError:
+        pass
+
+
+def _read_json_file(path):
+    """The parsed file, or None when it is missing or unreadable.  Never creates anything."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _file_sig(path):
+    try:
+        st = os.stat(path)
+        return (path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (path, None, None)
+
+
+def _bak_path(path):
+    bak, n = path + '.migrated.bak', 1
+    while os.path.exists(bak):
+        n += 1
+        bak = f'{path}.migrated{n}.bak'
+    return bak
+
+
+def profile_dir(mode):
+    return os.path.join(PROFILES_DIR, mode)
+
+
+def _global_raw():
+    """data/settings.json as stored (created from the defaults when missing); no migration."""
+    return load_json(SETTINGS_PATH, global_defaults)
+
+
+def migrate_profiles():
+    """One-time move of the pre-profile files into the profile that was active when they were made
+    (the currently effective mode: the manual pick, else the game log, else the last session, else
+    PvP).  data/progress.json and data/keep_list.json move to data/profiles/<mode>/ (the old files
+    stay as ``*.migrated.bak``); the character keys leave data/settings.json for
+    data/profiles/<mode>/settings.json (the old file is kept as ``settings.json.migrated.bak``).  A
+    profile that already has its own file is never overwritten.  Idempotent; returns what moved."""
+    if getattr(_migrating, 'on', False):
+        return []
+    with _profiles_lock:
+        legacy = {'progress': PROGRESS_PATH, 'keep_list': KEEPLIST_PATH}
+        todo = [n for n, p in legacy.items() if os.path.exists(p)]
+        raw = None
+        sig = _file_sig(SETTINGS_PATH)
+        if sig != _mig_clean['sig']:
+            raw = _read_json_file(SETTINGS_PATH)
+            if isinstance(raw, dict) and any(k in raw for k in PROFILE_SETTING_KEYS):
+                todo.append('settings')
+            else:
+                _mig_clean['sig'] = sig
+        if not todo:
+            return []
+        _migrating.on = True
+        try:
+            if not isinstance(raw, dict):
+                raw = _read_json_file(SETTINGS_PATH)
+            mode = effective_mode(raw if isinstance(raw, dict) else {})
+            os.makedirs(profile_dir(mode), exist_ok=True)
+            moved = []
+            for name in todo:
+                if name == 'settings':
+                    prof_keys = {k: raw[k] for k in PROFILE_SETTING_KEYS if k in raw}
+                    target = os.path.join(profile_dir(mode), 'settings.json')
+                    existing = _read_json_file(target)
+                    save_json(target, {**prof_keys, **(existing if isinstance(existing, dict) else {})})
+                    bak = _bak_path(SETTINGS_PATH)
+                    shutil.copy2(SETTINGS_PATH, bak)
+                    save_json(SETTINGS_PATH, {k: v for k, v in raw.items() if k not in PROFILE_SETTING_KEYS})
+                    _plog(f'settings: {", ".join(sorted(prof_keys))} -> profile {mode} '
+                          f'(old file kept as {os.path.basename(bak)})')
+                else:
+                    src = legacy[name]
+                    target = os.path.join(profile_dir(mode), name + '.json')
+                    bak = _bak_path(src)
+                    if os.path.exists(target):
+                        os.replace(src, bak)
+                        _plog(f'{name}: profile {mode} already has its own file; '
+                              f'the old one is kept as {os.path.basename(bak)}')
+                    else:
+                        shutil.copy2(src, target)
+                        os.replace(src, bak)
+                        _plog(f'{name}: {os.path.basename(src)} -> profile {mode} '
+                              f'(old file kept as {os.path.basename(bak)})')
+                moved.append(name)
+            _mig_clean['sig'] = None
+            return moved
+        finally:
+            _migrating.on = False
+
+
+def _load_global_settings():
+    """The app-wide settings only (no character keys)."""
+    migrate_profiles()
+    return _global_raw()
+
+
+def profile_path(name, mode=None):
+    """data/profiles/<mode>/<name>.json for the active profile (or ``mode``)."""
+    migrate_profiles()
+    mode = mode or effective_mode(_global_raw())
+    return os.path.join(profile_dir(mode), name + '.json')
+
+
+def active_profile():
+    """The active profile = the effective game mode ('pvp' | 'season' | 'pve')."""
+    return effective_mode(_load_global_settings())
+
+
+def profile_info(mode=None):
+    mode = mode or active_profile()
+    return {'mode': mode, 'label': MODE_LABELS[mode]}
+
+
+def load_profile_settings(mode=None):
+    """The character settings of a profile, defaults filled in."""
+    stored = _read_json_file(profile_path('settings', mode))
+    stored = stored if isinstance(stored, dict) else {}
+    return {**profile_defaults(), **{k: v for k, v in stored.items() if k in PROFILE_SETTING_KEYS}}
+
+
+def _load_settings(mode=None):
+    """The effective settings: the global ones plus the active profile's character settings."""
+    g = _load_global_settings()
+    return {**g, **load_profile_settings(mode or effective_mode(g))}
+
+
+def _save_settings(settings, mode=None):
+    """Store ``settings`` split by scope: character keys into the profile (``mode``, default the
+    active one), everything else into data/settings.json.  Keys left out are left alone."""
+    g, p = split_settings(settings)
+    mode = mode or active_profile()
+    with _profiles_lock:
+        save_json(SETTINGS_PATH, {**_global_raw(), **g})
+        if p:
+            path = profile_path('settings', mode)
+            stored = _read_json_file(path)
+            save_json(path, {**(stored if isinstance(stored, dict) else {}), **p})
+
+
+def load_progress(mode=None):
+    return load_json(profile_path('progress', mode), default_progress)
+
+
+def save_progress(progress, mode=None):
+    save_json(profile_path('progress', mode), progress)
+
+
+def load_keep_list(mode=None):
+    """The keep list of a profile.  A profile that has none yet starts from the built-in defaults
+    plus the Collector list from the wiki cache (no network)."""
+    path = profile_path('keep_list', mode)
+    if os.path.exists(path):
+        return load_json(path, default_keep_list)
+    keep_list = default_keep_list()
+    try:
+        cache = _read_json_file(KAPPA_WIKI_PATH)
+        if cache and cache.get('names'):
+            merge_kappa_into_keep_list(keep_list, cache['names'])
+    except Exception as e:
+        print(f'[profiles] could not seed the Collector list: {e}')
+    save_json(path, keep_list)
+    return keep_list
+
+
+def save_keep_list(keep_list, mode=None):
+    save_json(profile_path('keep_list', mode), keep_list)
 
 
 # ---------------------------------------------------------------------------
@@ -1240,14 +1456,20 @@ def kappa_sync(force=False):
     longer on the wiki are removed (not just flagged) from the kappa
     category; user-added ('custom') entries are never removed."""
     names = fetch_kappa_names(force=force)
-    keep_list = load_json(KEEPLIST_PATH, default_keep_list)
     price_idx = None
     try:
         price_idx = build_price_index(get_prices())
     except Exception as e:
         print(f"[kappa] price index unavailable during sync: {e}")
-    summary = merge_kappa_into_keep_list(keep_list, names, price_idx)
-    save_json(KEEPLIST_PATH, keep_list)
+    active = active_profile()
+    summary = None
+    # every profile's Collector list follows the wiki (hand-in state of each is preserved)
+    for mode in (m for m in GAME_MODES if m == active or os.path.exists(profile_path('keep_list', m))):
+        keep_list = load_keep_list(mode)
+        res = merge_kappa_into_keep_list(keep_list, names, price_idx)
+        save_keep_list(keep_list, mode)
+        if mode == active:
+            summary = res
     print(f"[kappa] synced {len(names)} wiki items — "
           f"{len(summary['added'])} added, {len(summary['removed'])} removed"
           + (f" ({', '.join(summary['removed'])})" if summary['removed'] else ""))
@@ -1280,7 +1502,7 @@ def _eft_install_dir():
     """The EFT install folder, looked up at most every 30 s (registry + disk probes are not free)."""
     if time.time() - _install_cache['at'] > 30:
         try:
-            s = load_json(SETTINGS_PATH, default_settings)
+            s = _global_raw()
             _install_cache['dir'] = eftlogs.find_install_dir(s.get('eft_install_dir') or None)
         except Exception:
             _install_cache['dir'] = None
@@ -1330,7 +1552,7 @@ def detect_mode():
 
 def mode_setting(settings=None):
     """The ``game_mode`` setting, normalised: 'auto' or one of the modes."""
-    v = (settings if settings is not None else _load_settings()).get('game_mode', 'auto')
+    v = (settings if settings is not None else _load_global_settings()).get('game_mode', 'auto')
     return v if v in GAME_MODES else 'auto'
 
 
@@ -1401,6 +1623,7 @@ def mode_status():
     if not info['data_ready'] and info['data_source'] != tarkovdata.DEFAULT_SOURCE:
         ensure_source_async(info['data_source'])
     info['downloading'] = info['data_source'] in _ensure['running']
+    info['profile'] = {'mode': info['effective'], 'label': info['label']}
     return info
 
 
@@ -1416,10 +1639,10 @@ def api_mode_set():
     mode = body.get('mode') if isinstance(body, dict) else None
     if mode not in ('auto',) + tuple(GAME_MODES):
         return jsonify({'ok': False, 'error': 'mode must be auto, pvp, pve or season'}), 400
-    settings = load_json(SETTINGS_PATH, default_settings)
+    settings = _load_global_settings()
     settings['game_mode'] = mode
-    save_json(SETTINGS_PATH, settings)
-    _mode_cache['val'] = None
+    _save_settings(settings)
+    _mode_cache['val'] = None           # every profile-scoped file now resolves to the new profile
     return jsonify({'ok': True, **mode_status()})
 
 
@@ -1427,7 +1650,7 @@ def api_mode_set():
 def scan_task_logs(full=False):
     """Bring the log records up to date (full: re-check every folder; otherwise only new folders
     and the live one).  Never raises; the error is kept for the status endpoint."""
-    settings = load_json(SETTINGS_PATH, default_settings)
+    settings = _load_settings()
     if not settings.get('auto_task_progress', True):
         return None
     try:
@@ -1447,7 +1670,7 @@ def scan_task_logs(full=False):
 def log_task_progress(cache=None):
     """The quest progress read from the logs for the configured mode/faction, or None when the
     feature is off or nothing could be read.  Cached until the logs or the task data change."""
-    settings = load_json(SETTINGS_PATH, default_settings)
+    settings = _load_settings()
     if not settings.get('auto_task_progress', True):
         return None
     if not _log_progress['scanned']:
@@ -1476,7 +1699,8 @@ def effective_progress(cache=None):
     failed quest needs nothing any more) and the other faction's quests count as done.  The
     player's clicks on the Tasks page win: ``manual_overrides[task] = 'done'|'open'``.
     Adds ``auto_done`` (ids done because of the logs) and ``log_status``."""
-    progress = load_json(PROGRESS_PATH, default_progress)
+    mode = active_profile()
+    progress = load_progress(mode)
     manual = set(progress.get('completed_tasks', []))
     overrides = progress.get('manual_overrides') or {}
     lp = log_task_progress(cache)
@@ -1487,6 +1711,7 @@ def effective_progress(cache=None):
     forced_done = {t for t, v in overrides.items() if v == 'done'}
     done = ((manual | auto) - forced_open) | forced_done
     out = dict(progress)
+    out['profile'] = mode
     out['completed_tasks'] = sorted(done)
     out['auto_done'] = sorted((auto & done) - forced_done)
     out['log_status'] = None if not lp else {
@@ -1762,7 +1987,7 @@ def get_protected_plan(keep_list, price_idx):
     no single-item need claims.
     """
     protected, any_of = {}, []
-    settings = load_json(SETTINGS_PATH, default_settings)
+    settings = _load_settings()
     # "Pure money" switches (Settings page): skip whole need sources so every item is routed
     # to the flea or a trader.  Task items include the Collector (Kappa) and manual task lists.
     ignore_tasks = bool(settings.get('ignore_task_items'))
@@ -1931,8 +2156,8 @@ def run_keep_scan(from_calibration=False):
     _scan_state.update({'running': True, 'phase': 'capture',
                         'done': 0, 'total': 0, 'ts': time.time()})
     try:
-        settings   = load_json(SETTINGS_PATH, default_settings)
-        keep_list  = load_json(KEEPLIST_PATH, default_keep_list)
+        settings   = _load_settings()
+        keep_list  = load_keep_list()
         warnings   = []
         # entry id -> keep-list category id, so the FiR check below only ever
         # gates KAPPA (Collector) entries — task/manual entries are unaffected.
@@ -2068,14 +2293,14 @@ hotkey_manager = HotkeyManager()
 
 
 def start_hotkey_listener():
-    settings = load_json(SETTINGS_PATH, default_settings)
+    settings = _load_settings()
     hotkey_str = settings.get('hotkey', DEFAULT_HOTKEY)
     # Migrate the old F9 default: EFT and common overlays grab function keys,
     # so plain F9 frequently never reaches this app.
     if hotkey_str == '<f9>':
         hotkey_str = DEFAULT_HOTKEY
         settings['hotkey'] = hotkey_str
-        save_json(SETTINGS_PATH, settings)
+        _save_settings(settings)
         print(f"Hotkey migrated F9 → {hotkey_str} (F9 conflicts with EFT itself)")
     try:
         hotkey_manager.register(hotkey_str)
@@ -2140,9 +2365,9 @@ def set_hotkey():
         hotkey_manager.register(hotkey_str)
     except Exception as e:
         return jsonify({'ok': False, 'error': f'Invalid hotkey: {e}'}), 400
-    settings = load_json(SETTINGS_PATH, default_settings)
+    settings = _load_settings()
     settings['hotkey'] = hotkey_str
-    save_json(SETTINGS_PATH, settings)
+    _save_settings(settings)
     return jsonify({'ok': True, 'hotkey': hotkey_str})
 
 @app.route('/api/screenshot', methods=['POST'])
@@ -2161,18 +2386,18 @@ def take_screenshot():
 
 @app.route('/api/keep-list', methods=['GET'])
 def get_keep_list():
-    return jsonify(load_json(KEEPLIST_PATH, default_keep_list))
+    return jsonify({**load_keep_list(), 'profile': profile_info()})
 
 @app.route('/api/keep-list/toggle', methods=['POST'])
 def toggle_item():
     data = request.json
     item_id = data.get('id')
-    keep_list = load_json(KEEPLIST_PATH, default_keep_list)
+    keep_list = load_keep_list()
     for cat in keep_list['categories']:
         for item in cat['items']:
             if item['id'] == item_id:
                 item['acquired'] = not item['acquired']
-                save_json(KEEPLIST_PATH, keep_list)
+                save_keep_list(keep_list)
                 return jsonify({'ok': True, 'acquired': item['acquired']})
     return jsonify({'ok': False, 'error': 'Item not found'}), 404
 
@@ -2180,7 +2405,7 @@ def toggle_item():
 def add_item():
     data = request.json
     cat_id = data.get('category', 'kappa')
-    keep_list = load_json(KEEPLIST_PATH, default_keep_list)
+    keep_list = load_keep_list()
     for cat in keep_list['categories']:
         if cat['id'] == cat_id:
             new_item = {
@@ -2197,23 +2422,23 @@ def add_item():
             if 'count' in data:
                 new_item['count'] = data['count']
             cat['items'].append(new_item)
-            save_json(KEEPLIST_PATH, keep_list)
+            save_keep_list(keep_list)
             return jsonify({'ok': True, 'item': new_item})
     return jsonify({'ok': False, 'error': 'Category not found'}), 404
 
 @app.route('/api/keep-list/remove/<item_id>', methods=['DELETE'])
 def remove_item(item_id):
-    keep_list = load_json(KEEPLIST_PATH, default_keep_list)
+    keep_list = load_keep_list()
     for cat in keep_list['categories']:
         cat['items'] = [i for i in cat['items'] if i['id'] != item_id]
-    save_json(KEEPLIST_PATH, keep_list)
+    save_keep_list(keep_list)
     return jsonify({'ok': True})
 
 @app.route('/api/keep-list/acquire', methods=['POST'])
 def acquire_items():
     """Batch-mark entries acquired — the scan confirm bar's one-click action."""
     ids = set((request.json or {}).get('ids') or [])
-    keep_list = load_json(KEEPLIST_PATH, default_keep_list)
+    keep_list = load_keep_list()
     updated = 0
     for cat in keep_list['categories']:
         for item in cat['items']:
@@ -2221,7 +2446,7 @@ def acquire_items():
                 item['acquired'] = True
                 updated += 1
     if updated:
-        save_json(KEEPLIST_PATH, keep_list)
+        save_keep_list(keep_list)
     return jsonify({'ok': True, 'updated': updated})
 
 @app.route('/api/kappa/refresh', methods=['POST'])
@@ -2396,10 +2621,11 @@ def _validate_settings(incoming, current):
 @app.route('/api/settings', methods=['GET'])
 def get_settings():
     # lifecycle keys filled in for settings files saved before they existed
-    stored = lifecycle.with_defaults(load_json(SETTINGS_PATH, default_settings))
+    stored = lifecycle.with_defaults(_load_settings())
     if request.args.get('full') in ('1', 'true'):     # the Settings page: stored values over the defaults
         defaults = default_settings()
-        return jsonify({'settings': {**defaults, **stored}, 'defaults': defaults})
+        return jsonify({'settings': {**defaults, **stored}, 'defaults': defaults,
+                        'profile': {**profile_info(), 'keys': list(PROFILE_SETTING_KEYS)}})
     return jsonify(stored)
 
 @app.route('/api/settings', methods=['POST'])
@@ -2409,7 +2635,8 @@ def save_settings():
     incoming = request.get_json(silent=True)
     if not isinstance(incoming, dict):
         return jsonify({'ok': False, 'error': 'Expected a JSON object of settings.'}), 400
-    old = load_json(SETTINGS_PATH, default_settings)
+    old = _load_settings()
+    old_profile = effective_mode(old)       # character keys in this request belong to the profile the page showed
     new, errors = _validate_settings(incoming, old)
     if errors:
         return jsonify({'ok': False, 'error': '; '.join(errors.values()), 'errors': errors}), 400
@@ -2419,13 +2646,14 @@ def save_settings():
         except Exception as e:
             return jsonify({'ok': False, 'error': f'Invalid hotkey: {e}',
                             'errors': {'hotkey': str(e)}}), 400
-    save_json(SETTINGS_PATH, new)
+    _save_settings(new, mode=old_profile)
     if new.get('game_mode') != old.get('game_mode'):
         _mode_cache['val'] = None                       # the next call re-resolves the effective mode
         try:
             mode_status()                               # start the PvE download if it was never done
         except Exception as e:
             print(f'[settings] mode switch: {e}')
+        new = _load_settings()                          # the new profile's character settings
     try:
         autoscanner.poke()                              # Auto-scan on/off and friends: re-evaluate now
     except Exception:
@@ -2439,11 +2667,11 @@ def save_settings():
             hook(old, new)
         except Exception as e:
             print(f'[settings] change hook failed: {e}')
-    return jsonify({'ok': True, 'settings': new})
+    return jsonify({'ok': True, 'settings': new, 'profile': profile_info()})
 
 @app.route('/api/reset', methods=['POST'])
 def reset_keep_list():
-    save_json(KEEPLIST_PATH, default_keep_list())
+    save_keep_list(default_keep_list())
     # Land on current wiki data when online; the hardcoded defaults are only
     # the offline fallback.
     try:
@@ -2612,7 +2840,7 @@ def api_tasks():
     except Exception as e:
         return jsonify({'error': str(e)}), 502
     progress = effective_progress(cache)
-    settings = load_json(SETTINGS_PATH, default_settings)
+    settings = _load_settings()
     kappa_only = settings.get('kappa_only_tasks', False)
     qp = request.args.get('kappa_only')
     if qp is not None:
@@ -2622,6 +2850,7 @@ def api_tasks():
     view['source'] = cache.get('source') or 'graphql'
     view['task_progress'] = _task_progress_status(progress)
     view['auto_done'] = progress.get('auto_done') or []
+    view['profile'] = profile_info(progress.get('profile'))
     return jsonify(view)
 
 @app.route('/api/v1/needs', methods=['GET'])
@@ -2633,7 +2862,7 @@ def api_v1_needs():
         cache = get_tasks()
     except Exception as e:
         return jsonify({'version': 1, 'error': str(e)}), 503
-    settings = load_json(SETTINGS_PATH, default_settings)
+    settings = _load_settings()
     kappa_only = bool(settings.get('kappa_only_tasks', False))
     view = compute_tasks_view(cache, effective_progress(cache), kappa_only=kappa_only)
     items = []
@@ -2649,10 +2878,10 @@ def api_v1_needs():
                         for s in rec['sources']],
         })
     pins = [{'name': it.get('name') or '?', 'category': cat.get('label') or cat.get('id')}
-            for cat in load_json(KEEPLIST_PATH, default_keep_list).get('categories', [])
+            for cat in load_keep_list().get('categories', [])
             for it in cat.get('items', []) if not it.get('acquired')]
     return jsonify({'version': 1, 'app_version': APP_VERSION, 'kappa_only': kappa_only,
-                    'items': items, 'pins': pins})
+                    'profile': profile_info(), 'items': items, 'pins': pins})
 
 @app.route('/api/tasks/refresh', methods=['POST'])
 def api_tasks_refresh():
@@ -2669,7 +2898,7 @@ def api_tasks_complete():
     typ, tid, done = data.get('type'), data.get('id'), bool(data.get('done'))
     if typ not in ('task', 'hideout') or not tid:
         return jsonify({'ok': False, 'error': 'type must be task|hideout, id required'}), 400
-    progress = load_json(PROGRESS_PATH, default_progress)
+    progress = load_progress()
     key = 'completed_tasks' if typ == 'task' else 'completed_hideout'
     ids = set(progress.get(key, []))
     (ids.add if done else ids.discard)(tid)
@@ -2677,12 +2906,12 @@ def api_tasks_complete():
     if typ == 'task':
         # An explicit click beats what the logs say, both ways (see effective_progress).
         progress.setdefault('manual_overrides', {})[tid] = 'done' if done else 'open'
-    save_json(PROGRESS_PATH, progress)
-    return jsonify({'ok': True})
+    save_progress(progress)
+    return jsonify({'ok': True, 'profile': profile_info()})
 
 
 def _task_progress_status(progress=None):
-    settings = load_json(SETTINGS_PATH, default_settings)
+    settings = _load_settings()
     progress = progress or effective_progress()
     return {'enabled': bool(settings.get('auto_task_progress', True)),
             'log': progress.get('log_status'), 'error': _log_progress['error'],
@@ -2710,11 +2939,11 @@ def api_tasks_have():
         delta = int(data.get('delta') or 0)
     except (TypeError, ValueError):
         return jsonify({'ok': False, 'error': 'delta must be an integer'}), 400
-    progress = load_json(PROGRESS_PATH, default_progress)
+    progress = load_progress()
     have = progress.setdefault('have', {})
     have[item_id] = max(0, int(have.get(item_id, 0)) + delta)
-    save_json(PROGRESS_PATH, progress)
-    return jsonify({'ok': True, 'have': have[item_id]})
+    save_progress(progress)
+    return jsonify({'ok': True, 'have': have[item_id], 'profile': profile_info()})
 
 
 @app.route('/api/hideout/level', methods=['POST'])
@@ -2733,13 +2962,13 @@ def api_hideout_level():
     station = next((s for s in cache.get('hideoutStations', []) if s.get('id') == station_id), None)
     if station is None:
         return jsonify({'ok': False, 'error': 'unknown station'}), 404
-    progress = load_json(PROGRESS_PATH, default_progress)
+    progress = load_progress()
     done = set(progress.get('completed_hideout', []))
     for lv in station.get('levels', []):
         (done.add if lv['level'] <= level else done.discard)(lv['id'])
     progress['completed_hideout'] = sorted(done)
-    save_json(PROGRESS_PATH, progress)
-    return jsonify({'ok': True, 'level': level})
+    save_progress(progress)
+    return jsonify({'ok': True, 'level': level, 'profile': profile_info()})
 
 
 @app.route('/api/items/search', methods=['GET'])
@@ -2762,36 +2991,37 @@ def api_items_search():
 
 @app.route('/api/prestige', methods=['GET'])
 def api_prestige():
-    settings = load_json(SETTINGS_PATH, default_settings)
+    settings = _load_settings()
     try:
         levels = fetch_prestige_requirements()
     except Exception as e:
         return jsonify({'levels': [], 'current': settings.get('prestige', 3),
-                        'cache_age_minutes': None, 'error': str(e)})
+                        'cache_age_minutes': None, 'error': str(e), 'profile': profile_info()})
     cache = load_json(PRESTIGE_WIKI_PATH, lambda: None) if os.path.exists(PRESTIGE_WIKI_PATH) else None
     age = round((time.time() - cache.get('timestamp', 0)) / 60, 1) if cache else None
     return jsonify({'levels': levels, 'current': settings.get('prestige', 3),
-                    'cache_age_minutes': age})
+                    'cache_age_minutes': age, 'profile': profile_info()})
 
 
 @app.route('/api/prestige/advance', methods=['POST'])
 def api_prestige_advance():
-    """New prestige: bumps settings['prestige'] (capped at 6), resets task/
-    hideout progress, and un-acquires every keep-list entry (kappa + manual).
-    Region/hotkey/grid/monitor and other settings fields are untouched."""
-    settings = load_json(SETTINGS_PATH, default_settings)
+    """New prestige of the ACTIVE profile: bumps its prestige (capped at 6), resets its task/
+    hideout progress, and un-acquires every entry of its keep list (kappa + manual).  The other
+    profiles, region/hotkey/grid/monitor and the other settings are untouched."""
+    mode = active_profile()
+    settings = load_profile_settings(mode)
     settings['prestige'] = min(6, settings.get('prestige', 0) + 1)
-    save_json(SETTINGS_PATH, settings)
+    _save_settings(settings, mode=mode)
 
-    save_json(PROGRESS_PATH, default_progress())
+    save_progress(default_progress(), mode)
 
-    keep_list = load_json(KEEPLIST_PATH, default_keep_list)
+    keep_list = load_keep_list(mode)
     for cat in keep_list['categories']:
         for item in cat['items']:
             item['acquired'] = False
-    save_json(KEEPLIST_PATH, keep_list)
+    save_keep_list(keep_list, mode)
 
-    return jsonify({'prestige': settings['prestige']})
+    return jsonify({'prestige': settings['prestige'], 'profile': profile_info(mode)})
 
 
 # ---------------------------------------------------------------------------
@@ -2985,7 +3215,7 @@ def _sell_payload(raw_detections, panels, grid_failed, warnings, scene_info, set
 
     # Everything the player shouldn't sell: unacquired keep-list entries +
     # task/hideout items still short of their required count.
-    keep_list = load_json(KEEPLIST_PATH, default_keep_list)
+    keep_list = load_keep_list()
     protected, any_of = get_protected_plan(keep_list, price_idx)
 
     if not tesseract_available():
@@ -3072,7 +3302,7 @@ def _sell_payload(raw_detections, panels, grid_failed, warnings, scene_info, set
 
 
 def _sell_scan_inner(from_calibration=False, frame_bgr=None, lean=False, publish=None, cancel=None):
-    settings = load_json(SETTINGS_PATH, default_settings)
+    settings = _load_settings()
 
     _scan_state.update({'running': True, 'phase': 'capture',
                         'done': 0, 'total': 0, 'ts': time.time()})
@@ -3129,17 +3359,13 @@ def _autoscan_scan(frame_bgr, publish=None, cancel=None):
         return _sell_scan_inner(frame_bgr=frame_bgr, lean=True, publish=publish, cancel=cancel).get_json()
 
 
-def _load_settings():
-    return load_json(SETTINGS_PATH, default_settings)
-
-
 import autoscan  # noqa: E402  (needs app + the helpers above)
 autoscanner = autoscan.AutoScanner(_autoscan_scan, _load_settings,
                                    busy_fn=lambda: _scan_state['running'], progressive=True,
                                    raid_state_fn=raid_state.get, mode_fn=mode_status,
                                    collect_dir=os.path.join(DATA, 'scenes', 'live'))
 app.register_blueprint(autoscan.make_blueprint(
-    autoscanner, _load_settings, lambda s: save_json(SETTINGS_PATH, s)))
+    autoscanner, _load_settings, lambda s: _save_settings(s)))
 def rescan_now():
     """Scan the view on screen again, even if it has not changed since the last scan."""
     autoscanner.trigger.reset_view()
@@ -3201,11 +3427,15 @@ def _startup_maintenance():
                 print(f"[cleanup] removed retired file {fn}")
             except Exception as e:
                 print(f"[cleanup] could not remove {fn}: {e}")
-    migrate_settings()
     try:
-        scan_task_logs(full=True)            # quest progress from the game logs, before the first scan
+        scan_task_logs(full=True)            # first: the log history tells which profile the old files belong to, and the quest progress is ready for the first scan
     except Exception as e:
         print(f"[eftlogs] startup scan skipped: {e}")
+    try:
+        migrate_profiles()                   # pre-profile progress / keep list / character settings -> the active profile
+    except Exception as e:
+        print(f"[profiles] migration failed: {e}")
+    migrate_settings()
     try:
         cache = load_json(KAPPA_WIKI_PATH, lambda: None) if os.path.exists(KAPPA_WIKI_PATH) else None
         if not cache or time.time() - cache.get('timestamp', 0) > KAPPA_WIKI_TTL:
@@ -3225,7 +3455,7 @@ def _warm_v2_engine():
         if os.path.exists(PRICES_PATH):
             from identify.config import EngineSettings
             from identify.pipeline import Engine
-            es = EngineSettings.from_settings(load_json(SETTINGS_PATH, default_settings))
+            es = EngineSettings.from_settings(_load_settings())
             _v2_engine[:] = [repr(es), Engine(es)]
             print('[v2] identification engine ready')
     except Exception as e:
@@ -3430,7 +3660,7 @@ def _run_app():
         try:
             s = _load_settings()
             s['start_with_windows'] = False
-            save_json(SETTINGS_PATH, s)
+            _save_settings(s)
             lifecycle.apply_settings(s)      # unregisters the startup entry and stops the watcher
         except Exception as e:
             print(f"[lifecycle] could not turn auto-launch off: {e}")

@@ -23,6 +23,14 @@ def _no_network_no_real_data(monkeypatch, tmp_path):
         for name, fn in (('META_PATH', 'tarkovdev_meta.json'), ('PRICES_PATH', 'prices_cache.json'),
                          ('TASKS_CACHE_PATH', 'tasks_cache.json')):
             monkeypatch.setattr(app, name, str(tmp_path / 'autouse_data' / fn), raising=False)
+        # Profile files (progress / keep list / character settings) and the pre-profile originals
+        # they migrate from: never the real data/.
+        for name, fn in (('SETTINGS_PATH', 'settings.json'), ('PROGRESS_PATH', 'progress.json'),
+                         ('KEEPLIST_PATH', 'keep_list.json'), ('KAPPA_WIKI_PATH', 'kappa_wiki.json')):
+            monkeypatch.setattr(app, name, str(tmp_path / 'autouse_data' / fn), raising=False)
+        monkeypatch.setattr(app, 'PROFILES_DIR', str(tmp_path / 'autouse_data' / 'profiles'), raising=False)
+        if hasattr(app, '_mig_clean'):
+            monkeypatch.setattr(app, '_mig_clean', {'sig': None})
         # Never read the real game's Logs folder or write data/eftlogs_cache.json.
         if hasattr(app, '_log_scanner'):
             import eftlogs
