@@ -374,10 +374,11 @@ $('prestige-h').onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.p
 // ---- sync line -------------------------------------------------------------------------------
 function renderSync() {
   const tp = view.task_progress, el = $('sync');
+  const prof = view.profile && view.profile.label ? view.profile.label + ' profile · ' : '';   // PvP / PvP S / PvE each keep their own progress
   el.className = 'sync';
-  if (!tp || !tp.enabled) { el.className = 'sync warn'; el.innerHTML = 'Quest sync is off · <a href="/settings">Settings</a>'; }
-  else if (tp.log) el.textContent = `Quests synced from game logs · ${tp.log.completed} done`;
-  else { el.className = 'sync warn'; el.innerHTML = 'Couldn’t read the game logs · <a href="/settings">Settings</a>'; }
+  if (!tp || !tp.enabled) { el.className = 'sync warn'; el.innerHTML = prof + 'quest sync is off · <a href="/settings">Settings</a>'; }
+  else if (tp.log) el.textContent = `${prof}quests synced from game logs · ${tp.log.completed} done`;
+  else { el.className = 'sync warn'; el.innerHTML = prof + 'couldn’t read the game logs · <a href="/settings">Settings</a>'; }
 }
 
 // ---- actions ---------------------------------------------------------------------------------
@@ -456,7 +457,10 @@ async function load() {
   view = v; keep = k;
   renderSync(); renderHideout(); renderList(); renderQuests(); renderPrestige();
 }
-document.addEventListener('tsh:mode', () => load());      // another game mode = another data set
+document.addEventListener('tsh:mode', () => {              // another game mode = another profile + data set
+  load();
+  api('GET', '/api/prestige').then(p => { prestige = p; renderPrestige(); }).catch(() => {});
+});
 (async () => {
   const f = store.get('needs.filter');
   if (['all', 'quests', 'hideout', 'kappa', 'pinned'].includes(f)) filter = f;

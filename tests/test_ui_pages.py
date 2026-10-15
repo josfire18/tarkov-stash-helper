@@ -1,6 +1,7 @@
 """The three pages (Live, Needs, Settings), the old-route redirects and the tiny endpoints the
 Needs / Live pages call.  Data paths live in tmp_path; the real data/ folder is never touched."""
 import json
+import pathlib
 
 import pytest
 
@@ -27,7 +28,7 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(tsh_app, '_load_cache', lambda path: json.load(open(path)) if path == str(tmp_path / 'prices.json') else None)
     monkeypatch.setattr(tsh_app, '_usable_prices', lambda c: c or {})
     with tsh_app.app.test_client() as c:
-        c.progress = tmp_path / 'progress.json'
+        c.progress = pathlib.Path(tsh_app.profile_path('progress'))      # the active profile's file
         yield c
 
 
