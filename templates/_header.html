@@ -6,6 +6,16 @@
     <a class="tab{% if active == 'settings' %} active{% endif %}" href="/settings"{% if active == 'settings' %} aria-current="page"{% endif %}>Settings</a>
   </nav>
   <span class="spacer"></span>
+  <span class="modewrap" id="modewrap" hidden>
+    <button type="button" class="modechip" id="modechip" aria-haspopup="menu" aria-expanded="false" aria-controls="modemenu"><span id="modechip-text">PvP</span><i class="caret" aria-hidden="true"></i></button>
+    <div class="modemenu" id="modemenu" role="menu" aria-label="Game mode" hidden>
+      <button type="button" role="menuitemradio" aria-checked="false" data-mode="auto">Auto</button>
+      <button type="button" role="menuitemradio" aria-checked="false" data-mode="pvp">PvP</button>
+      <button type="button" role="menuitemradio" aria-checked="false" data-mode="pve">PvE</button>
+      <button type="button" role="menuitemradio" aria-checked="false" data-mode="season">PvP Season</button>
+      <p class="modenote" id="modenote" hidden></p>
+    </div>
+  </span>
   <span class="pill" id="pill" tabindex="0" role="status"><i class="dot"></i><span id="pill-text">Connecting</span></span>
 </header>
 <div id="toast" role="status" aria-live="polite"></div>
@@ -69,9 +79,68 @@ window.TSH = (() => {
     if (st && st.game && !tip) tip = `Tarkov ${st.game.size[0]}×${st.game.size[1]}, capture: ${st.backend || '?'}`;
     pill.className = 'pill ' + cls; text.textContent = msg; pill.title = tip || (st && st.message) || '';
   }
+
+  // ---- game mode chip: PvP / PvP S / PvE, with a small menu to pick (or leave it on Auto) ----------
+  const wrap = document.getElementById('modewrap'), chipBtn = document.getElementById('modechip'),
+        chipText = document.getElementById('modechip-text'), menu = document.getElementById('modemenu'),
+        note = document.getElementById('modenote');
+  const items = [...menu.querySelectorAll('[role=menuitemradio]')];
+  let modeKey = null;
+  function paintMode() {
+    const m = T.status && T.status.mode;
+    if (!m) return;
+    wrap.hidden = false;
+    chipText.textContent = m.mismatch ? `${m.label} · game: ${m.detected_label}` : m.label;
+    chipBtn.classList.toggle('warn', !!m.mismatch);
+    chipBtn.title = m.mismatch ? `You picked ${m.label}; the game is on ${m.detected_label}. Prices and quests follow your pick.`
+      : m.setting === 'auto' ? (m.detected_source === 'default' ? 'Game mode: no game log found yet, assuming PvP.' : 'Game mode, detected from the game log.')
+      : 'Game mode, set by you.';
+    for (const it of items) {
+      const o = (m.options || []).find(x => x.value === it.dataset.mode);
+      if (o) it.textContent = o.label;
+      it.setAttribute('aria-checked', String(it.dataset.mode === m.setting));
+    }
+    const msg = m.downloading || (!m.data_ready && m.data_source !== 'regular') ? `Downloading ${m.label} prices…`
+      : m.seasonal_prices ? 'Prices: PvP market (no seasonal data)' : '';
+    note.textContent = msg; note.hidden = !msg;
+    const key = m.effective + ':' + m.data_source;
+    if (modeKey !== null && key !== modeKey) document.dispatchEvent(new CustomEvent('tsh:mode', { detail: m }));
+    modeKey = key;
+  }
+  function openMenu() {
+    menu.hidden = false; chipBtn.setAttribute('aria-expanded', 'true');
+    (items.find(i => i.getAttribute('aria-checked') === 'true') || items[0]).focus();
+  }
+  function closeMenu(refocus) {
+    if (menu.hidden) return;
+    menu.hidden = true; chipBtn.setAttribute('aria-expanded', 'false');
+    if (refocus) chipBtn.focus();
+  }
+  async function pickMode(v) {
+    closeMenu(true);
+    const r = await T.api('POST', '/api/mode', { mode: v });
+    if (!r._ok || !r.effective) { T.toast('Couldn’t change the game mode', 'bad'); return; }
+    if (T.status) T.status.mode = r;
+    paintMode();
+  }
+  chipBtn.addEventListener('click', () => (menu.hidden ? openMenu() : closeMenu(true)));
+  chipBtn.addEventListener('keydown', e => { if (e.key === 'ArrowDown') { e.preventDefault(); if (menu.hidden) openMenu(); } });
+  items.forEach(it => it.addEventListener('click', () => pickMode(it.dataset.mode)));
+  menu.addEventListener('keydown', e => {
+    const i = items.indexOf(document.activeElement);
+    if (e.key === 'ArrowDown') { e.preventDefault(); items[(i + 1) % items.length].focus(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); }
+    else if (e.key === 'Home') { e.preventDefault(); items[0].focus(); }
+    else if (e.key === 'End') { e.preventDefault(); items[items.length - 1].focus(); }
+    else if (e.key === 'Escape') { e.preventDefault(); closeMenu(true); }
+    else if (e.key === 'Tab') closeMenu(false);
+  });
+  document.addEventListener('mousedown', e => { if (!wrap.contains(e.target)) closeMenu(false); });
+
   async function poll() {
     try { T.status = await T.api('GET', '/api/autoscan/status'); } catch (_) { T.status = null; }
     paint();
+    paintMode();
     document.dispatchEvent(new CustomEvent('tsh:status', { detail: T.status }));
     setTimeout(poll, 1500);
   }

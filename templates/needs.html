@@ -456,6 +456,7 @@ async function load() {
   view = v; keep = k;
   renderSync(); renderHideout(); renderList(); renderQuests(); renderPrestige();
 }
+document.addEventListener('tsh:mode', () => load());      // another game mode = another data set
 (async () => {
   const f = store.get('needs.filter');
   if (['all', 'quests', 'hideout', 'kappa', 'pinned'].includes(f)) filter = f;

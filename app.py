@@ -308,7 +308,34 @@ _refresh_lock = threading.RLock()     # one refresh at a time (the refresher, a 
 _refresh_state = {                    # in-memory status, merged into /api/prices/status
     'prices': {'attempt': 0, 'error': None},
     'tasks':  {'attempt': 0, 'error': None},
+    'prices_pve': {'attempt': 0, 'error': None},      # the PvE data set is refreshed separately
+    'tasks_pve':  {'attempt': 0, 'error': None},
 }
+
+
+# ---------------------------------------------------------------------------
+# Game mode -> data source.  Prices, tasks, hideout and traders differ between the PvP and the PvE
+# profile; json.tarkov.dev has a data set for each ('regular' / 'pve') but none for the seasonal PvP
+# profile, which is priced from the regular one.  Every cache and its refresh bookkeeping is kept per
+# data source, so the two are never mixed.  The item catalog (icons) is shared and built from the
+# regular data.  ``_active_source()`` is defined with the mode detection further down.
+# ---------------------------------------------------------------------------
+
+def _prices_path(source=None):
+    return tarkovdata.source_path(PRICES_PATH, source or _active_source())
+
+
+def _tasks_path(source=None):
+    return tarkovdata.source_path(TASKS_CACHE_PATH, source or _active_source())
+
+
+def _meta_path(source=None):
+    return tarkovdata.source_path(META_PATH, source or _active_source())
+
+
+def _rstate(kind, source):
+    """The in-memory refresh status of ``kind`` ('prices' | 'tasks') for a data source."""
+    return _refresh_state[kind if source == tarkovdata.DEFAULT_SOURCE else f'{kind}_{source}']
 
 
 def _load_cache(path):
@@ -321,13 +348,13 @@ def _load_cache(path):
         return None
 
 
-def _load_meta():
-    return tarkovdata.load_meta(META_PATH)
+def _load_meta(source=None):
+    return tarkovdata.load_meta(_meta_path(source))
 
 
-def _save_meta_quietly(meta):
+def _save_meta_quietly(meta, source=None):
     try:
-        tarkovdata.save_meta(META_PATH, meta)
+        tarkovdata.save_meta(_meta_path(source), meta)
     except OSError as e:
         print(f'[refresh] could not save refresh bookkeeping: {e}')
 
@@ -337,8 +364,9 @@ def _usable_prices(cache):
 
 
 def fetch_prices_graphql(previous=None):
-    """Refresh the price cache from the GraphQL API alone (the fallback source).  Validated
-    like the JSON source, written atomically, returns the cache.  Raises PriceFetchError."""
+    """Refresh the (regular) price cache from the GraphQL API alone (the fallback source).
+    Validated like the JSON source, written atomically, returns the cache.  Raises
+    PriceFetchError."""
     cache = _graphql_prices()
     previous = previous if previous is not None else _usable_prices(_load_cache(PRICES_PATH))
     try:
@@ -352,23 +380,29 @@ def fetch_prices_graphql(previous=None):
     return cache
 
 
-def refresh_prices(force=False):
-    """Bring the price cache up to date.  Source order: json.tarkov.dev (conditional, cheap
-    when nothing changed), then the GraphQL API, then - as an error - the cache that is
-    already on disk (the callers' stale-cache fallback).  Never replaces a good cache with
-    a bad one.  Returns ``{'status', 'source', 'cache', 'new_ids'}``; a new item id on a
-    machine that already has a catalog queues the catalog update."""
+def refresh_prices(force=False, source=None):
+    """Bring the price cache of a data source (default: the active game mode's) up to date.
+    Source order: json.tarkov.dev (conditional, cheap when nothing changed), then - for the regular
+    data only - the GraphQL API, then - as an error - the cache that is already on disk (the
+    callers' stale-cache fallback).  Never replaces a good cache with a bad one.  Returns
+    ``{'status', 'source', 'cache', 'new_ids'}``; a new item id on a machine that already has a
+    catalog queues the catalog update (regular data only: the catalog is shared)."""
+    source = source or _active_source()
+    pve = source != tarkovdata.DEFAULT_SOURCE
+    path, state = _prices_path(source), _rstate('prices', source)
     with _refresh_lock:
-        previous = _usable_prices(_load_cache(PRICES_PATH))
-        meta = _load_meta()
-        _refresh_state['prices']['attempt'] = meta['attempted']['prices'] = time.time()
+        previous = _usable_prices(_load_cache(path))
+        meta = _load_meta(source)
+        state['attempt'] = meta['attempted']['prices'] = time.time()
         if force:
             meta['etags'] = {}
         try:
             try:
-                res = tarkovdata.refresh_prices(PRICES_PATH, meta, previous)
+                res = tarkovdata.refresh_prices(path, meta, previous, source=source)
                 res['source'] = tarkovdata.SOURCE_NAME
             except Exception as json_err:      # network, bad payload, a converter bug: all fall back
+                if pve:
+                    raise PriceFetchError(f'json.tarkov.dev ({source}): {json_err}')
                 print(f'[prices] json.tarkov.dev failed ({json_err}); trying the GraphQL API')
                 try:
                     cache = fetch_prices_graphql(previous)
@@ -383,15 +417,15 @@ def refresh_prices(force=False):
                        'new_ids': [i['id'] for i in cache['items'] if i['id'] not in old_ids] if old_ids else []}
         except PriceFetchError as e:
             meta['errors']['prices'] = str(e)
-            _refresh_state['prices']['error'] = str(e)
-            _save_meta_quietly(meta)
+            state['error'] = str(e)
+            _save_meta_quietly(meta, source)
             raise
         meta['errors'].pop('prices', None)
-        _refresh_state['prices']['error'] = None
-        if res['new_ids']:
+        state['error'] = None
+        if res['new_ids'] and not pve:
             meta['catalog_pending'] = sorted(set(meta['catalog_pending']) | set(res['new_ids']))
-        _save_meta_quietly(meta)
-    if res['new_ids']:
+        _save_meta_quietly(meta, source)
+    if res['new_ids'] and not pve:
         print(f"[prices] {len(res['new_ids'])} new items")
         _queue_catalog_update()
     return res
@@ -402,19 +436,22 @@ def fetch_prices():
     return refresh_prices()['cache']
 
 
-def _cache_age_seconds(cache, kind):
+def _cache_age_seconds(cache, kind, source=None):
     """Seconds since this cache was last confirmed current: written, or re-checked
     (a 304 from json.tarkov.dev rewrites nothing)."""
     ts = (cache or {}).get('timestamp', 0)
     try:
-        ts = max(ts, _load_meta()['checked'].get(kind) or 0)
+        ts = max(ts, _load_meta(source)['checked'].get(kind) or 0)
     except Exception:
         pass
     return time.time() - ts
 
 
-def get_prices():
-    """Return cached prices, refreshing if stale.
+def get_prices(source=None):
+    """Return the cached prices of the active game mode's data source (or of ``source``),
+    refreshing if stale.  The other source's prices are never substituted.  A source that was
+    never fetched (e.g. PvE on first use) is downloaded in the background and this raises
+    PriceFetchError meanwhile, so a scan never waits on that download.
 
     The background refresher normally keeps the cache current, so this is cheap.  A failed
     refresh (tarkov.dev outage) falls back to the last good cache, marked ``stale_error`` so
@@ -422,14 +459,19 @@ def get_prices():
     scan - and is not retried for RETRY_BACKOFF seconds (a scan never waits on a dead
     network twice in a row).
     """
-    cache = _usable_prices(_load_cache(PRICES_PATH))
-    if cache and _cache_age_seconds(cache, 'prices') < PRICE_CACHE_TTL:
+    source = source or _active_source()
+    cache = _usable_prices(_load_cache(_prices_path(source)))
+    if cache and _cache_age_seconds(cache, 'prices', source) < PRICE_CACHE_TTL:
         return cache
-    err = _refresh_state['prices']['error']
-    if cache and err and time.time() - _refresh_state['prices']['attempt'] < RETRY_BACKOFF:
+    state = _rstate('prices', source)
+    err = state['error']
+    if cache and err and time.time() - state['attempt'] < RETRY_BACKOFF:
         return {**cache, 'stale_error': err}
+    if not cache and source != tarkovdata.DEFAULT_SOURCE:
+        ensure_source_async(source)
+        raise PriceFetchError(f'{source.upper()} prices are still downloading - try again in a moment')
     try:
-        return fetch_prices()
+        return refresh_prices(source=source)['cache']
     except (PriceFetchError, http_requests.RequestException) as e:
         if not cache:
             raise
@@ -825,7 +867,7 @@ def default_settings():
         'kappa_only_tasks': False,
         'auto_task_progress': True,  # read completed/failed quests from EFT's logs (eftlogs.py)
         'eft_install_dir': None,     # None = find the install via the registry / common paths
-        'game_mode': 'auto',         # 'auto' (profile of the latest session) | 'pvp' | 'pve' | 'season'
+        'game_mode': 'auto',         # 'auto' (the mode the game log says) | 'pvp' | 'pve' | 'season'
         'faction': 'auto',           # 'auto' (from faction-only quests in the logs) | 'BEAR' | 'USEC'
         'debug_dumps': True,  # save raw frame + detections of the last few scans under data/debug/
         # Sell advice (see sellcalc.SELL_DEFAULTS for what each means; all are optional in settings.json)
@@ -1249,6 +1291,138 @@ def _eft_install_dir():
 # lobby / matching / loading / in_raid straight from the live game log (None = unreadable)
 raid_state = eftlogs.RaidState(_eft_install_dir)
 
+# ---------------------------------------------------------------------------
+# Game mode: which profile the player is on (PvP / PvE / PvP Season)
+# ---------------------------------------------------------------------------
+
+GAME_MODES = eftlogs.MODES
+MODE_LABELS = {'pvp': 'PvP', 'pve': 'PvE', 'season': 'PvP S'}
+_MODE_CACHE_S = 1.0
+_mode_cache = {'at': -1e9, 'val': None}
+
+
+def detect_mode():
+    """The game mode the logs say: ``{'mode', 'source', 'since'}``.  ``source`` is 'log' (the newest
+    session announced it - the live game, or the last one played), 'history' (an older session said
+    it) or 'default' (no log at all: PvP).  Cached for a second; never raises."""
+    now = time.time()
+    if _mode_cache['val'] is not None and now - _mode_cache['at'] < _MODE_CACHE_S:
+        return _mode_cache['val']
+    det = None
+    try:
+        live = raid_state.mode()
+        if live and live['mode'] in GAME_MODES:
+            det = {'mode': live['mode'], 'source': 'log', 'since': live.get('since')}
+    except Exception:
+        pass
+    if det is None:
+        try:
+            m, since = eftlogs.latest_session_mode(_log_scanner.records())
+            if m in GAME_MODES:
+                det = {'mode': m, 'source': 'history', 'since': since}
+        except Exception:
+            pass
+    if det is None:
+        det = {'mode': eftlogs.DEFAULT_MODE, 'source': 'default', 'since': None}
+    _mode_cache.update(at=now, val=det)
+    return det
+
+
+def mode_setting(settings=None):
+    """The ``game_mode`` setting, normalised: 'auto' or one of the modes."""
+    v = (settings if settings is not None else _load_settings()).get('game_mode', 'auto')
+    return v if v in GAME_MODES else 'auto'
+
+
+def effective_mode(settings=None):
+    """The one place that decides which mode the app works in: the manual pick, or - on 'auto' -
+    the detected one.  Sell advice, Needs, flea rules and quest progress all follow this."""
+    pick = mode_setting(settings)
+    return detect_mode()['mode'] if pick == 'auto' else pick
+
+
+def _active_source(settings=None):
+    """The json.tarkov.dev data source of the effective mode ('regular' | 'pve')."""
+    return tarkovdata.source_for_mode(effective_mode(settings))
+
+
+def mode_info(settings=None):
+    """Everything the mode chip, the popover and the Settings page show."""
+    settings = settings if settings is not None else _load_settings()
+    pick, det = mode_setting(settings), detect_mode()
+    eff = det['mode'] if pick == 'auto' else pick
+    source = tarkovdata.source_for_mode(eff)
+    known = det['source'] != 'default'
+    return {
+        'setting': pick, 'effective': eff, 'label': MODE_LABELS[eff],
+        'detected': det['mode'], 'detected_label': MODE_LABELS[det['mode']],
+        'detected_source': det['source'], 'detected_since': det['since'],
+        'mismatch': bool(pick != 'auto' and known and pick != det['mode']),
+        'data_source': source, 'seasonal_prices': eff == 'season',
+        'data_ready': os.path.exists(_prices_path(source)) and os.path.exists(_tasks_path(source)),
+        'options': [{'value': 'auto', 'label': f"Auto · detected {MODE_LABELS[det['mode']]}" if known else 'Auto'}]
+                   + [{'value': m, 'label': {'pvp': 'PvP', 'pve': 'PvE', 'season': 'PvP Season'}[m]}
+                      for m in GAME_MODES],
+    }
+
+
+_ensure = {'running': set(), 'lock': threading.Lock()}
+
+
+def ensure_source_async(source):
+    """Download a data source that has no cache yet (PvE the first time it is used) in the
+    background: prices first (the task data takes its item names from them), then tasks and hideout.
+    One download per source at a time; failures are reported through the refresh status."""
+    if source == tarkovdata.DEFAULT_SOURCE:
+        return False
+    with _ensure['lock']:
+        if source in _ensure['running']:
+            return False
+        _ensure['running'].add(source)
+
+    def work():
+        try:
+            if not _usable_prices(_load_cache(_prices_path(source))):
+                refresh_prices(source=source)
+            if not _load_cache(_tasks_path(source)):
+                refresh_tasks(source=source)
+        except Exception as e:
+            print(f'[mode] {source} data download failed: {e}')
+        finally:
+            with _ensure['lock']:
+                _ensure['running'].discard(source)
+    threading.Thread(target=work, daemon=True, name=f'fetch-{source}').start()
+    return True
+
+
+def mode_status():
+    """``mode_info`` plus a nudge: if the active mode's data was never downloaded, start that now."""
+    info = mode_info()
+    if not info['data_ready'] and info['data_source'] != tarkovdata.DEFAULT_SOURCE:
+        ensure_source_async(info['data_source'])
+    info['downloading'] = info['data_source'] in _ensure['running']
+    return info
+
+
+@app.route('/api/mode', methods=['GET'])
+def api_mode_get():
+    return jsonify(mode_status())
+
+
+@app.route('/api/mode', methods=['POST'])
+def api_mode_set():
+    """Pick the mode: ``{"mode": "auto"|"pvp"|"pve"|"season"}`` (saved as the ``game_mode`` setting)."""
+    body = request.get_json(silent=True)
+    mode = body.get('mode') if isinstance(body, dict) else None
+    if mode not in ('auto',) + tuple(GAME_MODES):
+        return jsonify({'ok': False, 'error': 'mode must be auto, pvp, pve or season'}), 400
+    settings = load_json(SETTINGS_PATH, default_settings)
+    settings['game_mode'] = mode
+    save_json(SETTINGS_PATH, settings)
+    _mode_cache['val'] = None
+    return jsonify({'ok': True, **mode_status()})
+
+
 
 def scan_task_logs(full=False):
     """Bring the log records up to date (full: re-check every folder; otherwise only new folders
@@ -1281,14 +1455,13 @@ def log_task_progress(cache=None):
     if cache is None:
         cache = get_tasks(allow_fetch=False)
     tasks = (cache or {}).get('tasks') or None
-    key = (_log_scanner.last_scan_at, (cache or {}).get('timestamp'),
-           settings.get('game_mode', 'auto'), settings.get('faction', 'auto'))
+    mode = effective_mode(settings)
+    key = (_log_scanner.last_scan_at, (cache or {}).get('timestamp'), mode, settings.get('faction', 'auto'))
     with _log_progress_lock:
         if _log_progress['key'] == key and _log_progress['result'] is not None:
             return _log_progress['result']
         try:
-            res = _log_scanner.progress(settings.get('game_mode', 'auto'), tasks,
-                                        settings.get('faction', 'auto'))
+            res = _log_scanner.progress(mode, tasks, settings.get('faction', 'auto'))
         except Exception as e:
             _log_progress['error'] = str(e)
             return None
@@ -1345,7 +1518,7 @@ def _graphql_tasks():
 
 
 def fetch_tasks_graphql(previous=None):
-    """Refresh the tasks cache from the GraphQL API alone; validated, written atomically."""
+    """Refresh the (regular) tasks cache from the GraphQL API alone; validated, written atomically."""
     cache = _graphql_tasks()
     previous = previous if previous is not None else _load_cache(TASKS_CACHE_PATH)
     try:
@@ -1357,24 +1530,30 @@ def fetch_tasks_graphql(previous=None):
     return cache
 
 
-def refresh_tasks(force=False):
-    """Bring the tasks/hideout cache up to date: json.tarkov.dev first, then GraphQL; a bad
-    payload never replaces the cache on disk.  Returns ``{'status', 'source', 'cache'}``."""
+def refresh_tasks(force=False, source=None):
+    """Bring the tasks/hideout cache of a data source (default: the active game mode's) up to
+    date: json.tarkov.dev first, then (regular data only) GraphQL; a bad payload never replaces the
+    cache on disk.  Returns ``{'status', 'source', 'cache'}``."""
+    source = source or _active_source()
+    pve = source != tarkovdata.DEFAULT_SOURCE
+    path, state = _tasks_path(source), _rstate('tasks', source)
     with _refresh_lock:
-        previous = _load_cache(TASKS_CACHE_PATH)
+        previous = _load_cache(path)
         if previous and not (previous.get('tasks') and previous.get('hideoutStations')):
             previous = None
-        meta = _load_meta()
-        _refresh_state['tasks']['attempt'] = meta['attempted']['tasks'] = time.time()
+        meta = _load_meta(source)
+        state['attempt'] = meta['attempted']['tasks'] = time.time()
         if force:
             meta['etags'] = {k: v for k, v in meta['etags'].items() if k not in
                              ('tasks', 'tasks_en', 'hideout', 'hideout_en')}
-        names = tarkovdata.item_names_from_prices(_load_cache(PRICES_PATH))
+        names = tarkovdata.item_names_from_prices(_load_cache(_prices_path(source)))
         try:
             try:
-                res = tarkovdata.refresh_tasks(TASKS_CACHE_PATH, meta, previous, names)
+                res = tarkovdata.refresh_tasks(path, meta, previous, names, source=source)
                 res['source'] = tarkovdata.SOURCE_NAME
             except Exception as json_err:      # network, bad payload, a converter bug: all fall back
+                if pve:
+                    raise RuntimeError(f'json.tarkov.dev ({source}): {json_err}')
                 print(f'[tasks] json.tarkov.dev failed ({json_err}); trying the GraphQL API')
                 try:
                     cache = fetch_tasks_graphql(previous)
@@ -1387,12 +1566,12 @@ def refresh_tasks(force=False):
                 res = {'status': 'updated', 'source': 'graphql', 'cache': cache}
         except RuntimeError as e:
             meta['errors']['tasks'] = str(e)
-            _refresh_state['tasks']['error'] = str(e)
-            _save_meta_quietly(meta)
+            state['error'] = str(e)
+            _save_meta_quietly(meta, source)
             raise
         meta['errors'].pop('tasks', None)
-        _refresh_state['tasks']['error'] = None
-        _save_meta_quietly(meta)
+        state['error'] = None
+        _save_meta_quietly(meta, source)
         return res
 
 
@@ -1401,23 +1580,27 @@ def fetch_tasks():
     return refresh_tasks()['cache']
 
 
-def get_tasks(allow_fetch=True):
-    """Cached task data, refreshed when stale (the background refresher normally keeps it
+def get_tasks(allow_fetch=True, source=None):
+    """Cached task data of the active game mode's data source (or of ``source``), refreshed when stale (the background refresher normally keeps it
     current; a failed refresh falls back to the cache on disk). With allow_fetch=False,
     returns whatever cache exists (or None) without touching the network - used inside
     scans so a scan can never block on tarkov.dev."""
-    cache = _load_cache(TASKS_CACHE_PATH)
+    source = source or _active_source()
+    cache = _load_cache(_tasks_path(source))
     if cache and not (cache.get('tasks') and cache.get('hideoutStations')):
         cache = None
-    if cache and (not allow_fetch or _cache_age_seconds(cache, 'tasks') < TASKS_CACHE_TTL):
+    if cache and (not allow_fetch or _cache_age_seconds(cache, 'tasks', source) < TASKS_CACHE_TTL):
         return cache
     if not allow_fetch:
         return None
-    err = _refresh_state['tasks']['error']
-    if cache and err and time.time() - _refresh_state['tasks']['attempt'] < RETRY_BACKOFF:
+    state = _rstate('tasks', source)
+    if cache and state['error'] and time.time() - state['attempt'] < RETRY_BACKOFF:
         return cache
+    if not cache and source != tarkovdata.DEFAULT_SOURCE:
+        ensure_source_async(source)
+        raise RuntimeError(f'{source.upper()} task data is still downloading - try again in a moment')
     try:
-        return fetch_tasks()
+        return refresh_tasks(source=source)['cache']
     except (RuntimeError, http_requests.RequestException) as e:
         if not cache:
             raise
@@ -2237,6 +2420,12 @@ def save_settings():
             return jsonify({'ok': False, 'error': f'Invalid hotkey: {e}',
                             'errors': {'hotkey': str(e)}}), 400
     save_json(SETTINGS_PATH, new)
+    if new.get('game_mode') != old.get('game_mode'):
+        _mode_cache['val'] = None                       # the next call re-resolves the effective mode
+        try:
+            mode_status()                               # start the PvE download if it was never done
+        except Exception as e:
+            print(f'[settings] mode switch: {e}')
     try:
         autoscanner.poke()                              # Auto-scan on/off and friends: re-evaluate now
     except Exception:
@@ -2560,7 +2749,8 @@ def api_items_search():
     if len(q) < 2:
         return jsonify({'items': []})
     hits = []
-    for it in _usable_prices(_load_cache(PRICES_PATH) or {}).get('items', []):
+    cache = _usable_prices(_load_cache(_prices_path())) or _usable_prices(_load_cache(PRICES_PATH)) or {}
+    for it in cache.get('items', []):          # (names only: the PvE list falls back to the regular one)
         name, short = it['name'].lower(), (it.get('shortName') or '').lower()
         if q in name or q in short:
             rank = 0 if name.startswith(q) or short.startswith(q) else 1
@@ -2612,33 +2802,36 @@ def api_prestige_advance():
 def settings_page():
     return render_template('settings.html')
 
-def _cache_status(path, kind, count_key):
+def _cache_status(path, kind, count_key, source=tarkovdata.DEFAULT_SOURCE):
     """Status of one cache for /api/prices/status: age since last confirmed current, when it was
     last rewritten, which source produced it, and the last refresh error (None when the latest
     attempt succeeded)."""
     cache = _load_cache(path)
+    state = _rstate(kind, source)
     if not cache or not cache.get(count_key):
-        return {'cached': False, 'age_minutes': None, 'count': 0,
-                'error': _refresh_state[kind]['error']}
-    meta = _load_meta()
+        return {'cached': False, 'age_minutes': None, 'count': 0, 'error': state['error']}
+    meta = _load_meta(source)
     now = time.time()
     return {
         'cached': True,
-        'age_minutes': round(_cache_age_seconds(cache, kind) / 60, 1),
+        'age_minutes': round(_cache_age_seconds(cache, kind, source) / 60, 1),
         'updated_minutes': round((now - cache.get('timestamp', 0)) / 60, 1),
         'count': len(cache[count_key]),
         'source': cache.get('source') or 'graphql',
-        'error': _refresh_state[kind]['error'] or meta['errors'].get(kind),
+        'error': state['error'] or meta['errors'].get(kind),
     }
 
 
 @app.route('/api/prices/status', methods=['GET'])
 def prices_status():
-    st = _cache_status(PRICES_PATH, 'prices', 'items')
+    source = _active_source()
+    st = _cache_status(_prices_path(source), 'prices', 'items', source)
     st['stale'] = bool(st['cached'] and st['age_minutes'] > 3 * PRICE_REFRESH_INTERVAL / 60)
     st['refresh_minutes'] = PRICE_REFRESH_INTERVAL // 60
-    st['tasks'] = _cache_status(TASKS_CACHE_PATH, 'tasks', 'tasks')
-    st['catalog_pending'] = len(_load_meta()['catalog_pending'])
+    st['tasks'] = _cache_status(_tasks_path(source), 'tasks', 'tasks', source)
+    st['data_source'] = source
+    st['mode'] = effective_mode()
+    st['catalog_pending'] = len(_load_meta(tarkovdata.DEFAULT_SOURCE)['catalog_pending'])
     st['catalog_building'] = _index_build_state['running']
     return jsonify(st)
 
@@ -2655,6 +2848,11 @@ def prices_refresh():
 _index_build_state = {'running': False, 'phase': None, 'done': 0, 'total': 0, 'ts': 0, 'error': None}
 _catalog_rerun = threading.Event()     # items changed while a build was running: build once more
 _startup_done = threading.Event()      # the engine warm-up at launch finished (builds wait for it)
+
+
+def _catalog_prices():
+    """The item list the shared icon catalog is built from: always the regular data set."""
+    return get_prices() if _active_source() == tarkovdata.DEFAULT_SOURCE else get_prices(tarkovdata.DEFAULT_SOURCE)
 
 
 def _wait_for_idle_scan(timeout=300):
@@ -2674,8 +2872,8 @@ def run_icon_db_build(reason='manual'):
             _startup_done.wait(600)           # never race the launch-time engine warm-up
         while True:
             _catalog_rerun.clear()
-            pending = set(_load_meta()['catalog_pending'])
-            prices = get_prices()
+            pending = set(_load_meta(tarkovdata.DEFAULT_SOURCE)['catalog_pending'])
+            prices = _catalog_prices()
             def cb(done, total):
                 _index_build_state['done']  = done
                 _index_build_state['total'] = total
@@ -2690,9 +2888,9 @@ def run_icon_db_build(reason='manual'):
             _warm_v2_engine()
             print('[catalog] built')
             if failed == 0 and pending:
-                meta = _load_meta()
+                meta = _load_meta(tarkovdata.DEFAULT_SOURCE)
                 meta['catalog_pending'] = sorted(set(meta['catalog_pending']) - pending)
-                _save_meta_quietly(meta)
+                _save_meta_quietly(meta, tarkovdata.DEFAULT_SOURCE)
             if not _catalog_rerun.is_set():
                 break
     except Exception as e:
@@ -2938,7 +3136,7 @@ def _load_settings():
 import autoscan  # noqa: E402  (needs app + the helpers above)
 autoscanner = autoscan.AutoScanner(_autoscan_scan, _load_settings,
                                    busy_fn=lambda: _scan_state['running'], progressive=True,
-                                   raid_state_fn=raid_state.get,
+                                   raid_state_fn=raid_state.get, mode_fn=mode_status,
                                    collect_dir=os.path.join(DATA, 'scenes', 'live'))
 app.register_blueprint(autoscan.make_blueprint(
     autoscanner, _load_settings, lambda s: save_json(SETTINGS_PATH, s)))
@@ -3038,7 +3236,7 @@ def _warm_v2_engine():
 # Background refresher: keeps prices, tasks and the item catalog current without being asked
 # ---------------------------------------------------------------------------
 
-def _refresh_due(kind, path, interval, meta, now):
+def _refresh_due(kind, path, interval, meta, now, source=tarkovdata.DEFAULT_SOURCE):
     """True when this cache was last confirmed current more than ``interval`` seconds ago (so a
     cache that is already old at startup refreshes immediately) and the last attempt - failed ones
     included - is at least RETRY_BACKOFF (or the interval, if shorter) back."""
@@ -3046,22 +3244,27 @@ def _refresh_due(kind, path, interval, meta, now):
     confirmed = max((cache or {}).get('timestamp', 0), meta['checked'].get(kind) or 0) if cache else 0
     if now - confirmed < interval:
         return False
-    attempt = max(meta['attempted'].get(kind) or 0, _refresh_state[kind]['attempt'])
+    attempt = max(meta['attempted'].get(kind) or 0, _rstate(kind, source)['attempt'])
     return now - attempt >= min(RETRY_BACKOFF, interval)
 
 
 def refresh_cycle(now=None):
     """One pass of the refresher: refresh whatever is due (prices first - the task data takes its
     item names from them), then resume catalog work a previous run left unfinished.  Never
-    raises.  Returns the list of what was refreshed."""
+    raises.  Returns the list of what was refreshed.  Only the ACTIVE game mode's data source is
+    kept current; the other one is refreshed when it becomes active."""
     now = time.time() if now is None else now
     ran = []
+    try:
+        source = _active_source()
+    except Exception:
+        source = tarkovdata.DEFAULT_SOURCE
     for kind, path, interval, fn in (
-            ('prices', PRICES_PATH, PRICE_REFRESH_INTERVAL, refresh_prices),
-            ('tasks', TASKS_CACHE_PATH, TASKS_REFRESH_INTERVAL, refresh_tasks)):
+            ('prices', _prices_path(source), PRICE_REFRESH_INTERVAL, refresh_prices),
+            ('tasks', _tasks_path(source), TASKS_REFRESH_INTERVAL, refresh_tasks)):
         try:
-            if _refresh_due(kind, path, interval, _load_meta(), now):
-                fn()
+            if _refresh_due(kind, path, interval, _load_meta(source), now, source):
+                fn() if source == tarkovdata.DEFAULT_SOURCE else fn(source=source)
                 ran.append(kind)
         except Exception as e:
             print(f'[refresh] {kind}: {e}')
@@ -3071,7 +3274,7 @@ def refresh_cycle(now=None):
     except Exception as e:
         print(f'[refresh] task logs: {e}')
     try:
-        if _load_meta()['catalog_pending'] and not _index_build_state['running']:
+        if _load_meta(tarkovdata.DEFAULT_SOURCE)['catalog_pending'] and not _index_build_state['running']:
             _queue_catalog_update()
     except Exception as e:
         print(f'[refresh] catalog: {e}')

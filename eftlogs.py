@@ -464,15 +464,21 @@ def replay(records, mode, known_ids=None):
             'events': n, 'last_event_at': last, 'event_at': event_at}
 
 
-def latest_mode(records):
-    """The mode of the most recent session that says one."""
+def latest_session_mode(records):
+    """``(mode, time)`` of the most recent session that says one, ``(None, None)`` if none does.
+    The time is that of its last ``Session mode:`` line (None when only the backend host said)."""
     for rec in sorted(records, key=lambda r: r.get('start') or 0, reverse=True):
         modes = rec.get('modes') or ()
         if modes:
-            return modes[-1][1]
+            return modes[-1][1], modes[-1][0]
         if rec.get('host_mode'):
-            return rec['host_mode']
-    return DEFAULT_MODE
+            return rec['host_mode'], None
+    return None, None
+
+
+def latest_mode(records):
+    """The mode of the most recent session that says one."""
+    return latest_session_mode(records)[0] or DEFAULT_MODE
 
 
 def _requirement_ids(task, statuses):
@@ -701,6 +707,8 @@ _LINE_TS_RE = re.compile(rb'^(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d)(?:\.\d+)?(?: ([+
 RAID_FIRST_READ_MAX = 4 * 1024 * 1024        # a first look at an old, huge log reads only its tail
 RAID_FOLDER_RECHECK_S = 5.0                  # how often the Logs folder is listed for a newer session
 RAID_HISTORY_MAX = 512
+_MODE_MARK_B = _MODE_MARK.encode()
+MODE_HEAD_READ = 256 * 1024                   # where "Session mode:" is logged: the first lines of the session
 
 
 class RaidState:
@@ -720,6 +728,8 @@ class RaidState:
         self._state = 'lobby'
         self._since = None
         self._history = []             # [(ts, state)] transitions, oldest first
+        self._mode = None              # 'pvp' | 'pve' | 'season' from the latest "Session mode:" line
+        self._mode_since = None
         self._checked = -1e9
         self._ok = False
 
@@ -734,6 +744,19 @@ class RaidState:
             if not self._ok:
                 return None
             return {'state': self._state, 'since': self._since, 'source': 'logs'}
+
+    def mode(self):
+        """``{'mode': 'pvp'|'pve'|'season', 'since', 'source': 'log'}`` - the game mode the newest
+        session announced (``Session mode:`` lines; the latest one wins when the player switches),
+        or None when the logs cannot be read or that session has not said yet."""
+        with self._lock:
+            try:
+                self._poll()
+            except Exception:
+                self._ok = False
+            if not self._ok or self._mode is None:
+                return None
+            return {'mode': self._mode, 'since': self._mode_since, 'source': 'log'}
 
     def in_raid(self):
         """True / False from the logs, None when unknown (callers fall back to the menu-bar check)."""
@@ -758,6 +781,7 @@ class RaidState:
     def _reset_session(self):
         self._path, self._offset = None, 0
         self._state, self._since, self._history = 'lobby', None, []
+        self._mode = self._mode_since = None
 
     def _newest_folder(self, inst):
         best, best_ts = None, None
@@ -807,6 +831,7 @@ class RaidState:
         mid_line = False
         if start == 0 and size > RAID_FIRST_READ_MAX:
             start, mid_line = size - RAID_FIRST_READ_MAX, True
+            self._read_head_mode()
         with open(self._path, 'rb') as f:
             f.seek(start)
             data = f.read(size - start)
@@ -818,12 +843,41 @@ class RaidState:
         for line in (lines[1:] if mid_line else lines):
             self._feed(line)
 
+    def _read_head_mode(self):
+        """A huge log is only read from its tail; the mode is announced at the top - read that."""
+        try:
+            with open(self._path, 'rb') as f:
+                head = f.read(MODE_HEAD_READ).decode('utf-8', 'replace')
+            modes = extract_session_modes(head)
+            if modes:
+                self._mode_since, self._mode = modes[-1][0], modes[-1][1]
+        except OSError:
+            pass
+
     def _reset_session_keep_path(self):
         path = self._path
         self._reset_session()
         self._path = path
 
+    @staticmethod
+    def _line_ts(line):
+        m = _LINE_TS_RE.match(line)
+        if m:
+            try:
+                return parse_log_time(m.group(1).decode(), m.group(2).decode(),
+                                      m.group(3).decode() if m.group(3) else None)
+            except ValueError:
+                pass
+        return None
+
     def _feed(self, line):
+        i = line.find(_MODE_MARK_B)
+        if i >= 0:
+            word = line[i + len(_MODE_MARK_B):].decode('utf-8', 'replace').strip().split()
+            if word:
+                self._mode = normalize_mode(word[0])
+                self._mode_since = self._line_ts(line)
+            return
         new = None
         for mark, state in _RAID_EVENTS:
             if mark in line:
@@ -831,14 +885,7 @@ class RaidState:
                 break
         if new is None or new == self._state:
             return
-        ts = None
-        m = _LINE_TS_RE.match(line)
-        if m:
-            try:
-                ts = parse_log_time(m.group(1).decode(), m.group(2).decode(),
-                                    m.group(3).decode() if m.group(3) else None)
-            except ValueError:
-                pass
+        ts = self._line_ts(line)
         if ts is None:
             ts = self._clock()
         self._state, self._since = new, ts

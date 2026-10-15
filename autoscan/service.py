@@ -66,13 +66,14 @@ def _below_normal_priority():
 class AutoScanner:
     def __init__(self, scan_fn, get_settings, busy_fn=None, win32=None, capture=None,
                  detector=None, clock=time.monotonic, wall=time.time, collect_dir=None, progressive=False,
-                 raid_state_fn=None):
+                 raid_state_fn=None, mode_fn=None):
         # frame_bgr -> sell-scan payload dict.  With ``progressive`` the scan runs in a worker thread
         # and is called as ``scan_fn(frame, publish=cb, cancel=fn)``: ``cb(payload)`` publishes a
         # provisional result (own seq), the return value is the final one (next seq); ``fn()`` turns
         # true when a newer view superseded the scan, which then raises / returns and is dropped.
         self.scan_fn = scan_fn
         self.raid_state_fn = raid_state_fn        # () -> {'state', 'since', 'source'} from the game's log, or None
+        self.mode_fn = mode_fn                    # () -> game-mode info dict (detected / effective), for the status
         self._raid_state = None
         self.progressive = progressive
         self._job = None                          # (thread, cancel Event) of the running progressive scan
@@ -144,7 +145,16 @@ class AutoScanner:
                   message=MESSAGES.get(st.get('state'), ''), raid_state=self._log_raid_state(),
                   backend=self.capture.backend_name, detect_ms=round(self._last_detect_ms, 1),
                   grab_ms=round(self._last_grab_ms, 1))
+        st['mode'] = self._mode_info()
         return st
+
+    def _mode_info(self):
+        if self.mode_fn is None:
+            return None
+        try:
+            return self.mode_fn()
+        except Exception:
+            return None
 
     def result(self, since: int = 0) -> dict:
         with self._lock:

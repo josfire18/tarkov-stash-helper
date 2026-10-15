@@ -30,6 +30,14 @@ def _no_network_no_real_data(monkeypatch, tmp_path):
             monkeypatch.setattr(app, '_log_progress',
                                 {'key': None, 'result': None, 'error': None, 'scanned': False})
             monkeypatch.setattr(eftlogs, 'find_install_dir', lambda override=None: None)
+        # ... and never let a cached real install / detected game mode leak into a test.
+        if hasattr(app, '_install_cache'):
+            monkeypatch.setattr(app, '_install_cache', {'at': -1e9, 'dir': None})
+        if hasattr(app, '_mode_cache'):
+            monkeypatch.setattr(app, '_mode_cache', {'at': -1e9, 'val': None})
+        if hasattr(app, 'raid_state'):
+            import eftlogs
+            monkeypatch.setattr(app, 'raid_state', eftlogs.RaidState(None))
 
 
 @pytest.fixture(autouse=True)

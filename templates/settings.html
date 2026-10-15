@@ -290,8 +290,9 @@ const SECTIONS = [
       { key: 'auto_task_progress', type: 'switch', label: 'Track tasks from Tarkov’s logs',
         help: 'Read completed/failed tasks from Tarkov’s log files automatically.' },
       { key: 'game_mode', type: 'select', label: 'Game mode',
-        options: [{ value: 'auto', label: 'Auto-detect' }, { value: 'pvp', label: 'PvP' }, { value: 'pve', label: 'PvE' }, { value: 'season', label: 'Seasonal PvP' }],
-        help: 'Which profile’s progress to follow; leave it on Auto unless you play both and it picks the wrong one.' },
+        options: [{ value: 'auto', label: 'Auto-detect' }, { value: 'pvp', label: 'PvP' }, { value: 'pve', label: 'PvE' }, { value: 'season', label: 'PvP Season' }],
+        detected: true,
+        help: 'Prices, quests and hand-ins for this profile. Leave it on Auto: the game log says which one you are in. Seasonal PvP uses the PvP market.' },
       { key: 'faction', type: 'select', label: 'Faction',
         options: [{ value: 'auto', label: 'Auto-detect' }, { value: 'BEAR', label: 'BEAR' }, { value: 'USEC', label: 'USEC' }],
         help: 'Your PMC faction – a few tasks and rewards differ between BEAR and USEC.' },
@@ -418,6 +419,7 @@ function buildRow(row) {
     });
     ctl.append(select);
     if (row.action) ctl.append(el('button', { type: 'button', text: row.action.label, onclick: row.action.run }));
+    if (row.detected) ctl.append(el('span', { class: 'unit', id: 'mode-detected' }));
     entry.sync = s => {
       const v = get(s);
       const i = row.options.findIndex(o => o.value === v);
@@ -694,6 +696,16 @@ async function pollScan() {
 }
 
 function pollStatuses() { return Promise.allSettled([pollLifecycle(), pollProgress(), pollScan()]); }
+
+// The detected game mode next to the Game mode select (the header chip owns the status poll).
+function paintDetectedMode(m) {
+  const n = document.getElementById('mode-detected');
+  if (!n || !m) return;
+  n.textContent = m.detected_source === 'default' ? 'No game log found yet' : `Detected: ${m.detected_label}`
+    + (m.mismatch ? ' (you picked another)' : '');
+}
+document.addEventListener('tsh:status', ev => paintDetectedMode(ev.detail && ev.detail.mode));
+document.addEventListener('tsh:mode', () => { reload(['game_mode']); pollData(); pollProgress(); });
 
 // ---------------------------------------------------------------------------
 // Data section
