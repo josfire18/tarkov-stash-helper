@@ -404,6 +404,8 @@ document.addEventListener('tsh:status', ev => {
   else if (btn.dataset.busy !== '1') { btn.disabled = false; btn.textContent = 'Scan now'; }
 });
 fetchResult();
+// Another game mode = other prices: price the view on screen again.
+document.addEventListener('tsh:mode', () => { if (scan) api('POST', '/api/autoscan/rescan').catch(() => {}); });
 
 // Push: the server says "a new result" the moment it exists; the 1.5 s status poll above is the fallback.
 (function stream() {

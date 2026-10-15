@@ -55,5 +55,7 @@ Merged: grid recall (#16), coverage (#17, v0.4.2 released), cut-tile certificati
 Strict lean eval: 1030 / 0 wrong / 31 Check / 2 missed; certified 537, certified-but-wrong 0.
 Next: panel bottom-clip detection misses items cut by the panel/image bottom (Hawk gunpowder, fuel tank segmented too short); hideout screen; real raid frames still needed.
 
+Game mode (`feat/game-mode`): the app knows PvP / PvP Season / PvE. Detected from the live application log (`Session mode:` via `eftlogs.RaidState.mode()`, fallback: newest session in the log records); `app.effective_mode()` = the `game_mode` setting or, on auto, the detected one. Prices, tasks, hideout, traders and flea rules come from json.tarkov.dev `regular/` (PvP and Season - there is no seasonal data set) or `pve/`; caches and ETag meta are per data source (`*_pve.json`; regular filenames unchanged), only the active mode is refreshed, the icon catalog stays shared. Header chip + menu, `/api/mode`, `mode` in `/api/autoscan/status`. Not per mode yet: `progress.json` (manual task/hideout ticks and have-counts) is one file for all profiles.
+
 ## Parked
 - Build pricing: the user opens the weapon inspect/modding window so the attachment icons along the bottom are visible; identify each attachment (plain items -> exact via icon hash) and sum a build value. Parked by the user 2026-10-13.

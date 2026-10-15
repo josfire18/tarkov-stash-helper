@@ -42,6 +42,10 @@ import time
 import requests
 
 JSON_BASE = 'https://json.tarkov.dev/regular/'
+# json.tarkov.dev serves one set of documents per game profile family.  PvP and the seasonal PvP
+# profile share the ``regular`` documents (there is no seasonal data set); PvE has its own.
+DATA_SOURCES = {'regular': JSON_BASE, 'pve': 'https://json.tarkov.dev/pve/'}
+DEFAULT_SOURCE = 'regular'
 SOURCE_NAME = 'json.tarkov.dev'
 HTTP_TIMEOUT = 60
 USER_AGENT = 'TarkovStashHelper (+https://github.com/josfire18/tarkov-stash-helper)'
@@ -77,6 +81,22 @@ ITEM_OBJECTIVES = ('giveItem', 'findItem', 'plantItem')   # GraphQL's TaskObject
 TASKS_SCHEMA = 3
 FLEA_KEYS = ('minPlayerLevel', 'enabled', 'sellOfferFeeRate', 'sellRequirementFeeRate',
              'foundInRaidRequired', 'reputationLevels')
+
+
+def source_for_mode(mode):
+    """The data source ('regular' | 'pve') that prices a game mode ('pvp' | 'pve' | 'season')."""
+    return 'pve' if mode == 'pve' else DEFAULT_SOURCE
+
+
+def source_path(path, source):
+    """The cache file of ``source`` next to ``path`` (the regular one): ``prices_cache.json`` stays
+    as is, the PvE copy is ``prices_cache_pve.json``."""
+    if source in (None, DEFAULT_SOURCE):
+        return path
+    if source not in DATA_SOURCES:
+        raise ValueError(f'unknown data source {source!r}')
+    root, ext = os.path.splitext(path)
+    return f'{root}_{source}{ext}'
 
 
 class SourceError(Exception):
@@ -132,14 +152,14 @@ def save_meta(path, meta):
     write_json_atomic(path, meta, indent=1)
 
 
-def fetch_doc(doc, etag=None, timeout=HTTP_TIMEOUT):
+def fetch_doc(doc, etag=None, timeout=HTTP_TIMEOUT, source=DEFAULT_SOURCE):
     """GET one document.  Returns ``('unchanged', None, etag)`` on 304, ``('fresh', body, etag)``
     on 200.  Anything else raises SourceError."""
     headers = {'Accept-Encoding': 'gzip', 'User-Agent': USER_AGENT}
     if etag:
         headers['If-None-Match'] = etag
     try:
-        r = _http_get(JSON_BASE + doc, headers, timeout)
+        r = _http_get(DATA_SOURCES[source] + doc, headers, timeout)
     except requests.RequestException as e:
         raise SourceError(f'{doc}: {e}') from e
     if r.status_code == 304:
@@ -155,20 +175,20 @@ def fetch_doc(doc, etag=None, timeout=HTTP_TIMEOUT):
     return 'fresh', body, (r.headers or {}).get('ETag')
 
 
-def fetch_pair(meta, doc, en_doc, conditional):
+def fetch_pair(meta, doc, en_doc, conditional, source=DEFAULT_SOURCE):
     """A document and its English translations, conditionally.  ``None`` when both are
     unchanged.  When only one changed the other is fetched again unconditionally (a data
     set cannot be converted from half a pair).  Returns ``(body, en_body, etags)``; the
     caller commits ``etags`` to the meta once the converted result is safely written."""
     etags = meta['etags'] if conditional else {}
-    s1, b1, t1 = fetch_doc(doc, etags.get(doc))
-    s2, b2, t2 = fetch_doc(en_doc, etags.get(en_doc))
+    s1, b1, t1 = fetch_doc(doc, etags.get(doc), source=source)
+    s2, b2, t2 = fetch_doc(en_doc, etags.get(en_doc), source=source)
     if s1 == 'unchanged' and s2 == 'unchanged':
         return None
     if s1 == 'unchanged':
-        s1, b1, t1 = fetch_doc(doc)
+        s1, b1, t1 = fetch_doc(doc, source=source)
     if s2 == 'unchanged':
-        s2, b2, t2 = fetch_doc(en_doc)
+        s2, b2, t2 = fetch_doc(en_doc, source=source)
     return b1, b2, {doc: t1, en_doc: t2}
 
 
@@ -221,11 +241,12 @@ def convert_traders(traders_body, traders_en_body):
     return names, rules
 
 
-def refresh_traders(meta):
+def refresh_traders(meta, source=DEFAULT_SOURCE):
     """Trader names + pay rates, from the JSON (conditional) or the meta's last copy.
     Never raises: item prices must refresh even when traders cannot."""
     try:
-        got = fetch_pair(meta, 'traders', 'traders_en', conditional=bool(meta.get('trader_names')))
+        got = fetch_pair(meta, 'traders', 'traders_en', conditional=bool(meta.get('trader_names')),
+                         source=source)
         if got is not None:
             names, rules = convert_traders(got[0], got[1])
             if names:
@@ -301,7 +322,7 @@ def validate_items(items, previous_items=None, skipped=0):
         raise SourceError('too few items carry image links and sizes')
 
 
-def refresh_prices(prices_path, meta, previous, now=None):
+def refresh_prices(prices_path, meta, previous, now=None, source=DEFAULT_SOURCE):
     """Bring ``prices_path`` up to date from json.tarkov.dev.
 
     ``previous`` is the cache currently on disk (None if absent or unusable; then nothing is
@@ -311,8 +332,8 @@ def refresh_prices(prices_path, meta, previous, now=None):
     now = time.time() if now is None else now
     prev_items = (previous or {}).get('items') or None
     conditional = bool(prev_items)
-    trader_names, trader_rules = refresh_traders(meta)
-    got = fetch_pair(meta, 'items', 'items_en', conditional)
+    trader_names, trader_rules = refresh_traders(meta, source)
+    got = fetch_pair(meta, 'items', 'items_en', conditional, source)
     if got is None:
         meta['checked']['prices'] = now
         return {'status': 'unchanged', 'cache': previous, 'new_ids': []}
@@ -320,6 +341,8 @@ def refresh_prices(prices_path, meta, previous, now=None):
     items, skipped = convert_items(items_body, en_body, trader_names)
     validate_items(items, prev_items, skipped)
     cache = {'timestamp': now, 'source': SOURCE_NAME, 'items': items}
+    if source != DEFAULT_SOURCE:
+        cache['data_source'] = source
     rules = convert_rules(items_body, trader_rules) or (previous or {}).get('rules')
     if rules:
         cache['rules'] = rules
@@ -418,7 +441,7 @@ def validate_stations(stations, previous=None):
         raise SourceError('no item requirements in the hideout data')
 
 
-def refresh_tasks(tasks_path, meta, previous, item_names, now=None):
+def refresh_tasks(tasks_path, meta, previous, item_names, now=None, source=DEFAULT_SOURCE):
     """Bring the tasks/hideout cache up to date.  Tasks and hideout are independent halves:
     an unchanged half is carried over, a half that fails validation keeps its previous
     content (error raised only if nothing usable results).  Same return contract as
@@ -426,12 +449,12 @@ def refresh_tasks(tasks_path, meta, previous, item_names, now=None):
     now = time.time() if now is None else now
     prev_tasks = (previous or {}).get('tasks') or None
     prev_stations = (previous or {}).get('hideoutStations') or None
-    trader_names, _ = refresh_traders(meta)
+    trader_names, _ = refresh_traders(meta, source)
 
     tasks, stations, etags, errors = prev_tasks, prev_stations, {}, []
     changed = False
     old_layout = (previous or {}).get('schema', 1) < TASKS_SCHEMA     # no ``items`` lists yet
-    got = fetch_pair(meta, 'tasks', 'tasks_en', bool(prev_tasks) and not old_layout)
+    got = fetch_pair(meta, 'tasks', 'tasks_en', bool(prev_tasks) and not old_layout, source)
     if got is not None:
         try:
             new = convert_tasks(got[0], got[1], trader_names, item_names)
@@ -440,7 +463,7 @@ def refresh_tasks(tasks_path, meta, previous, item_names, now=None):
             etags.update(got[2])
         except SourceError as e:
             errors.append(f'tasks: {e}')
-    got = fetch_pair(meta, 'hideout', 'hideout_en', bool(prev_stations))
+    got = fetch_pair(meta, 'hideout', 'hideout_en', bool(prev_stations), source)
     if got is not None:
         try:
             new = convert_hideout(got[0], got[1], item_names)
@@ -458,6 +481,8 @@ def refresh_tasks(tasks_path, meta, previous, item_names, now=None):
         return {'status': 'unchanged', 'cache': previous}
     cache = {'timestamp': now, 'source': SOURCE_NAME, 'schema': TASKS_SCHEMA,
              'tasks': tasks, 'hideoutStations': stations}
+    if source != DEFAULT_SOURCE:
+        cache['data_source'] = source
     write_json_atomic(tasks_path, cache)
     _commit_etags(meta, etags)
     meta['sources']['tasks'] = SOURCE_NAME
