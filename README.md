@@ -179,6 +179,15 @@ Truth files (`<name>.truth.full.json`) label *every* item with its pixel rectang
 items you cannot identify from the crop as `"uncertain": true` (excluded from accuracy, still
 counted for segmentation). See `identify/evaltools.py` for the format.
 
+## Local API for other tools
+
+While the app is open it serves a small read-only API on `http://127.0.0.1:8877` (this PC only).
+`GET /api/v1/needs` returns what the **Needs** page shows, as JSON: every item your open quests and
+hideout levels still need (`needed`, `fir_needed`, `have`, `still_needed`, and `sources` naming each
+quest or station), plus unacquired pins. The [Rocko](https://github.com/josfire18/rocko) Discord bot's
+Tarkov add-on uses it for `/needs`. The `v1` shape only ever gains fields; a breaking change would
+come as `/api/v2/needs`. The other `/api/...` routes are the app's internals and can change anytime.
+
 ## Known limitations
 
 - Windows only (screen capture region math, hotkey listener, and the default

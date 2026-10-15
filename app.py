@@ -2435,6 +2435,36 @@ def api_tasks():
     view['auto_done'] = progress.get('auto_done') or []
     return jsonify(view)
 
+@app.route('/api/v1/needs', methods=['GET'])
+def api_v1_needs():
+    """Read-only summary of what the player still needs, for other tools such as the Rocko Discord
+    bot's /needs. This shape is a contract: add fields freely, but never rename or remove one here.
+    A breaking change gets a new /api/v2/needs instead."""
+    try:
+        cache = get_tasks()
+    except Exception as e:
+        return jsonify({'version': 1, 'error': str(e)}), 503
+    settings = load_json(SETTINGS_PATH, default_settings)
+    kappa_only = bool(settings.get('kappa_only_tasks', False))
+    view = compute_tasks_view(cache, effective_progress(cache), kappa_only=kappa_only)
+    items = []
+    for rec in view['aggregate']:
+        have = min(rec['have'], rec['total_needed'])
+        if rec['total_needed'] - have <= 0:
+            continue
+        items.append({
+            'id': rec['item_id'], 'name': rec['name'], 'short_name': rec['shortName'],
+            'needed': rec['total_needed'], 'fir_needed': rec['fir_needed'], 'have': have,
+            'still_needed': rec['total_needed'] - have,
+            'sources': [{'type': s['type'], 'name': s['name'], 'count': s['count'], 'fir': s['fir']}
+                        for s in rec['sources']],
+        })
+    pins = [{'name': it.get('name') or '?', 'category': cat.get('label') or cat.get('id')}
+            for cat in load_json(KEEPLIST_PATH, default_keep_list).get('categories', [])
+            for it in cat.get('items', []) if not it.get('acquired')]
+    return jsonify({'version': 1, 'app_version': APP_VERSION, 'kappa_only': kappa_only,
+                    'items': items, 'pins': pins})
+
 @app.route('/api/tasks/refresh', methods=['POST'])
 def api_tasks_refresh():
     try:
