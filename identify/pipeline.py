@@ -42,7 +42,7 @@ from . import dino as dino_mod
 from . import digits as digits_mod
 from . import ocr as ocr_mod
 from .catalog import Catalog, load_catalog
-from .config import EngineSettings, LEARNED_PATH, SLOT
+from .config import EngineSettings, LEARNED_PATH, SLOT, STAGE1_SLOT
 from . import eft_hash
 from .learned import LearnedNames, content_key
 from .fir import detect_fir
@@ -172,6 +172,9 @@ class Engine:
         self.s = settings or EngineSettings()
         self.cat = catalog if catalog is not None else load_catalog()
         self.store: dino_mod.EmbeddingStore | None = None
+        self._store_lock = threading.Lock()
+        self._builds_lock = threading.RLock()
+        self._builds_done = False
         ocr_mod.set_tesseract_cmd(self.s.tesseract_cmd)
         self._lock = threading.Lock()      # scans are serialised (hotkey + button can race)
         self._api = None
@@ -656,8 +659,7 @@ class Engine:
         Both sides have their label / bottom bands painted with the background colour.
         Un-clipped, un-rotated candidates use the disk-cached catalog embeddings; rotated
         ones and everything for viewport-clipped tiles are embedded on the fly."""
-        if self.store is None:
-            self.store = dino_mod.EmbeddingStore(self.cat)
+        self._embedding_store()
         self._associate_builds()
         q_imgs, q_idx = [], []
         for i, w in enumerate(work):
@@ -715,7 +717,11 @@ class Engine:
         non-weapon build is assigned to the api item of the same footprint whose DINO embedding
         is very close *and* clearly closer than any differently-named item.  Weapon builds
         (modded guns) are never assigned: their identity is the label's job.  In-memory only."""
-        if getattr(self, '_builds_done', False) or self.store is None:
+        with self._builds_lock:                  # the start-up warm-up and the first scan can race here
+            self._associate_builds_locked()
+
+    def _associate_builds_locked(self) -> None:
+        if self._builds_done or self.store is None:
             return
         self._builds_done = True
         c = self.cat
@@ -725,9 +731,12 @@ class Engine:
             return
         Eb = self.store.get(builds)
         Ea = self.store.get([int(r) for r in api])
+        by_fp: dict = {}
+        for j, a in enumerate(api):
+            by_fp.setdefault((int(c.tw[a]), int(c.th[a])), []).append(j)
         for i, r in enumerate(builds):
-            same = [j for j, a in enumerate(api)
-                    if (c.tw[a], c.th[a]) == (c.tw[r], c.th[r]) or (c.tw[a], c.th[a]) == (c.th[r], c.tw[r])]
+            fp = (int(c.tw[r]), int(c.th[r]))
+            same = sorted(set(by_fp.get(fp, ())) | set(by_fp.get(fp[::-1], ())))
             if len(same) < 2:
                 continue
             sims = Ea[same] @ Eb[i]
@@ -740,6 +749,52 @@ class Engine:
                 for arr in (c.ids, c.names, c.shorts, c.cats):
                     arr[r] = arr[a]
                 c.src[r] = 'cache'
+
+    def _embedding_store(self):
+        with self._store_lock:
+            if self.store is None:
+                self.store = dino_mod.EmbeddingStore(self.cat)
+            return self.store
+
+    def _warm_matching(self) -> int:
+        """Run stage 1 once over a blank tile of every catalog footprint: that builds the rotated
+        template stacks and (GPU) uploads the stacks the first real scan would otherwise pay for."""
+        n = 0
+        for (W, H) in sorted(self.cat.stacks):
+            try:
+                tile = Tile(np.full((STAGE1_SLOT * H, STAGE1_SLOT * W, 3), 40, np.uint8), W, H,
+                            bg=np.full(3, 40.0, np.float32))
+                stage1(self.cat, tile, top_k=None, rotations=True)
+                n += 1
+            except Exception as e:                       # priming is best effort
+                print(f'[v2] warm-up: stage 1 {W}x{H} skipped: {e}')
+        return n
+
+    # ------------------------------------------------------------------
+    def warm(self, log=print) -> dict:
+        """Do every one-time cost before the first scan needs it (called from the app's start-up
+        thread, off the scan path): the DINO model, the build-template association and the DINO
+        embedding of every catalog icon (cached on disk, so a normal launch only loads them).
+        Returns what was done, for logging / tests."""
+        out = {'dino': False, 'embedded': 0, 'cached': 0, 'footprints': 0}
+        t = time.perf_counter()
+        out['footprints'] = self._warm_matching()
+        log(f'[v2] warm-up: stage 1 primed for {out["footprints"]} footprints in {time.perf_counter() - t:.1f}s')
+        if not self._use_dino():
+            return out
+        out['dino'] = True
+        store = self._embedding_store()
+        out['cached'] = store.loaded
+        t = time.perf_counter()
+        with dino_mod.low_impact():
+            dino_mod.embed([np.zeros((64, 64, 3), np.uint8)])      # CUDA / cuDNN / kernels load now, not on the first scan
+            self._associate_builds()
+            # the remaining rows (weapons, presets, cache renders, ...) are embedded lazily by the
+            # first scan otherwise; do them now, in small chunks the scan can interleave with
+            out['embedded'] = store.precompute(log=lambda *a: None)
+        log(f'[v2] warm-up: dino ready in {time.perf_counter() - t:.1f}s '
+            f'({store.loaded} cached, {out["embedded"]} embedded)')
+        return out
 
     # ------------------------------------------------------------------
     def _prepare_pool(self, w) -> None:

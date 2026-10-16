@@ -82,6 +82,9 @@ def category_of(types) -> str:
 # data model
 # --------------------------------------------------------------------------
 
+FULL_CACHE_MAX = 600       # decoded full-size icons kept for reuse (they are ~30-300 KB each)
+
+
 @dataclass
 class SizeStack:
     """All templates of one footprint at stage-1 resolution (premultiplied)."""
@@ -139,8 +142,9 @@ class Catalog:
         return self._rot_cache[key]
 
     # -- full resolution --------------------------------------------------
-    def full_icon(self, row: int) -> np.ndarray | None:
-        """Full-resolution BGRA icon of a catalog row (re-read from its source)."""
+    def full_icon(self, row: int, keep: bool = True) -> np.ndarray | None:
+        """Full-resolution BGRA icon of a catalog row (re-read from its source).  ``keep=False``
+        (bulk passes such as embedding the whole catalog) reads without filling the cache."""
         if row in self._full_cache:
             return self._full_cache[row]
         path = self.meta.get('paths', {}).get(int(row))
@@ -151,9 +155,10 @@ class Catalog:
                 img = cv2.resize(img, (SLOT * W + 1, SLOT * H + 1), interpolation=cv2.INTER_AREA)
         else:
             img = None
-        if len(self._full_cache) > 4000:
-            self._full_cache.clear()
-        self._full_cache[row] = img
+        if keep:
+            if len(self._full_cache) > FULL_CACHE_MAX:
+                self._full_cache.clear()
+            self._full_cache[row] = img
         return img
 
 

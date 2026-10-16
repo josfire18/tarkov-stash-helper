@@ -314,6 +314,7 @@ class TMPRenderer:
         return rgb, al
 
 
+SPRITE_CACHE_BYTES = 48 << 20   # glyph sprites kept (cleared when over)
 QUANT = 8               # sub-pixel positions of cached glyph sprites (1/8 px)
 
 
@@ -346,8 +347,10 @@ class SpriteRenderer(TMPRenderer):
         fa = np.clip((dt - sh['ef']) * s / sh['wf'] + 0.5, 0, 1) * inside
         ua = sh['au'] * np.clip((dt - sh['eu']) * s / sh['wu'] + 0.5, 0, 1) * (1 - fa) * inside
         sp = (fa.astype(np.float32), (fa + ua).astype(np.float32))
-        if len(self._spr) > 50000:
-            self._spr.clear()
+        self._spr_bytes = getattr(self, '_spr_bytes', 0) + sp[0].nbytes + sp[1].nbytes
+        if len(self._spr) > 50000 or self._spr_bytes > SPRITE_CACHE_BYTES:
+            self._spr.clear()                    # bounded by bytes too: a 4K frame's sprites are 4x larger
+            self._spr_bytes = sp[0].nbytes + sp[1].nbytes
         self._spr[key] = sp
         return sp
 
