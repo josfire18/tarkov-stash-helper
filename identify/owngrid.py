@@ -94,7 +94,7 @@ def _run(line: np.ndarray, start: int, gap: int) -> int:
     return end - start
 
 
-def _snap_frame(box, sh, sv, weak_v, weak_h, pitch, top_clip_y=None):
+def _snap_frame(box, sh, sv, weak_v, weak_h, pitch, top_clip_y=None, exact=False):
     """Panel lattice (xs, ys, clip_top, clip_bottom) of one frame, or None when it is not a cell
     group.  The extent comes from the *runs* of the top and left frame lines (a long UI bar glued to
     a corner of the frame must not enlarge it)."""
@@ -135,6 +135,16 @@ def _snap_frame(box, sh, sv, weak_v, weak_h, pitch, top_clip_y=None):
             ys = [yt, yb]
             nr = 1
         return xs, ys, True, False
+    if exact:
+        # a grid whose frame also holds a scroll bar / ends in a cut row (the scav-transfer SHOWCASE window:
+        # 10 columns + a bar, 13.7 rows): the lattice is the true pitch from the top-left corner, NOT the
+        # frame stretched over a rounded cell count (857 px / 10 = 85.7 put every column 7 px off by col 4)
+        clip = abs(ly - nr * pitch) > 0.04 * pitch
+        if clip:
+            nr = max(1, int(np.ceil(ly / pitch - 0.1)))
+        xs = [int(round(xl + i * pitch)) for i in range(nc + 1)]
+        ys = [int(round(yt + j * pitch)) for j in range(nr)] + [int(yt + ly) if clip else int(round(yt + nr * pitch))]
+        return xs, ys, False, clip
     if abs(ly - nr * pitch) > SNAP_TOL * pitch * max(1.0, nr ** 0.5) or nr < 1:
         nr = int(np.ceil(ly / pitch - 0.1))
         clip = True                                    # the viewport cuts the last row
@@ -161,7 +171,7 @@ def _snap_frame(box, sh, sv, weak_v, weak_h, pitch, top_clip_y=None):
 
 
 def region_panels(frame: np.ndarray, bbox, pitch: float, windows=(), strong: int = STRONG,
-                  linemask: bool = True, min_abs: int = 0):
+                  linemask: bool = True, min_abs: int = 0, exact: bool = False):
     """Panels of the cell groups inside ``bbox`` (x, y, w, h) of ``frame``: [Panel].  ``strong`` /
     ``linemask`` / ``min_abs`` tune what counts as a drawn frame line (the in-raid loot grid: bright
     outer frame, near invisible inner lines, no stash border colour)."""
@@ -198,7 +208,7 @@ def region_panels(frame: np.ndarray, bbox, pitch: float, windows=(), strong: int
         # per-frame profiles restricted to the frame so neighbouring frames do not leak in
         sub_wv = (wv | sv)[box[1]:box[3] + 1].sum(0)
         sub_wh = (wh | sh)[:, box[0]:box[2] + 1].sum(1)
-        snapped = _snap_frame(box, sh, sv, sub_wv, sub_wh, pitch, top_clip_y)
+        snapped = _snap_frame(box, sh, sv, sub_wv, sub_wh, pitch, top_clip_y, exact)
         if snapped is None:
             continue
         xs, ys, clip_top, clip = snapped
@@ -206,7 +216,8 @@ def region_panels(frame: np.ndarray, bbox, pitch: float, windows=(), strong: int
         ys = [int(v) + y0 for v in ys]
         nc, nr = len(xs) - 1, len(ys) - 1
         panels.append(Panel(x0=xs[0], y0=ys[0], x1=xs[-1] + 1, y1=ys[-1] + 1, ox=float(xs[0]), oy=float(ys[0]),
-                            pitch_x=(xs[-1] - xs[0]) / nc, pitch_y=pitch if (clip or clip_top) else (ys[-1] - ys[0]) / nr,
+                            pitch_x=pitch if exact else (xs[-1] - xs[0]) / nc,
+                            pitch_y=pitch if (clip or clip_top or exact) else (ys[-1] - ys[0]) / nr,
                             n_cols=nc, n_rows=nr, xs=xs, ys=ys, clip_top=clip_top, clip_bottom=clip, strength=1.0))
     panels.sort(key=lambda p: (p.y0, p.x0))
     return panels

@@ -1092,7 +1092,7 @@ def _own_gear_pieces(out: list, grid_result: GridResult, scene: SceneInfo, frame
     for reg in scene.regions:
         if not _is_gear(reg):
             continue
-        for p in region_panels(frame_bgr, reg.bbox, pitch, wins):
+        for p in region_panels(frame_bgr, reg.bbox, pitch, wins, exact=(reg.role == 'incoming' and reg.title == 'SHOWCASE')):
             if any(_overlap_frac(p, q) > 0.5 for q, _ in mine):
                 continue
             if _in_box(scene.stash_bbox, p) or (reg.title != 'SHOWCASE' and _in_box(scene.side_bbox, p)):
