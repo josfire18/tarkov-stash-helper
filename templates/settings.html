@@ -342,7 +342,7 @@ const SECTIONS = [
     rows: [
       { key: 'live_in_raid', type: 'switch', label: 'Work in raid',
         dimWhen: s => !s.auto_scan,
-        help: 'Read your inventory and the loot you open in a raid: what is worth grabbing, and what to drop when your pockets are full. Scans only while an inventory is on screen.' },
+        help: 'Off (recommended): during a raid the app does nothing at all - no screen capture, no scanning, no cost to your frame rate - and wakes up again in the lobby. On: read your inventory and the loot you open in a raid (what is worth grabbing, what to drop); a first look takes a few seconds and every capture costs some frame time.' },
       { key: 'live_top_n', type: 'number', label: 'Items to highlight', min: 1, max: 20,
         dimWhen: s => !s.auto_scan || !s.live_in_raid,
         help: 'How many “worth grabbing” items to show at most (items a quest or the hideout needs always come first).' },
