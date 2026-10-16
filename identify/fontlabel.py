@@ -43,29 +43,23 @@ GAME_DIRS = [r'C:\Battlestate Games\Escape from Tarkov', r'C:\Battlestate Games\
 # font extraction (first run)
 # --------------------------------------------------------------------------
 
+INSTALL_OVERRIDE: str | None = None    # the "Tarkov folder" setting; the app sets it before the engine starts
+
+
 def game_data_dirs(extra: list | None = None) -> list[str]:
+    """Every ``EscapeFromTarkov_Data`` folder holding ``resources.assets``: the given folders, the
+    setting, then every install eftlogs can find (BSG launcher, Steam, other drives)."""
+    import eftlogs
+    roots = [d for d in list(extra or []) + [INSTALL_OVERRIDE] if d]
+    try:
+        roots += eftlogs.install_candidates()
+    except Exception:                    # noqa: BLE001 - detection must never break the engine
+        pass
     out = []
-    for d in list(extra or []) + GAME_DIRS:
-        if not d:
-            continue
+    for d in roots + GAME_DIRS:
         for cand in (os.path.join(d, 'EscapeFromTarkov_Data'), d):
             if os.path.isfile(os.path.join(cand, 'resources.assets')) and cand not in out:
                 out.append(cand)
-    try:                                 # the launcher records the install path in the registry
-        import winreg
-        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-            for sub in (r'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\EscapeFromTarkov',
-                        r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\EscapeFromTarkov'):
-                try:
-                    with winreg.OpenKey(root, sub) as k:
-                        loc = winreg.QueryValueEx(k, 'InstallLocation')[0]
-                except OSError:
-                    continue
-                cand = os.path.join(loc, 'EscapeFromTarkov_Data')
-                if os.path.isfile(os.path.join(cand, 'resources.assets')) and cand not in out:
-                    out.append(cand)
-    except ImportError:
-        pass
     return out
 
 

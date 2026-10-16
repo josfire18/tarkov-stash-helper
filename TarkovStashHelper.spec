@@ -19,7 +19,7 @@ Flavour (environment variable TSH_FLAVOUR):
 Everything that must be *read* at run time and is not a Python module is listed in ``datas``:
 templates/ (Flask templates) and identify/assets/ (digit prototypes read via
 ``os.path.dirname(__file__)`` in identify/digits.py - without it stack counts silently stop
-being read).  data/ is NOT bundled: it lives next to the exe (identify/config.py ROOT, app.py BASE).
+being read).  data/ is NOT bundled: it lives in %LOCALAPPDATA%/TarkovStashHelper (paths.py), wherever the exe sits.
 """
 import os
 
@@ -64,7 +64,18 @@ if importlib.util.find_spec('UnityPy'):
     hidden += collect_submodules('UnityPy')
     unity_datas = collect_data_files('UnityPy')
 
-hidden += ['lifecycle', 'winreg']
+hidden += ['lifecycle', 'winreg', 'paths', 'dpi', 'gamelang', 'tess']
+
+# Tesseract OCR travels inside the exe as ONE zip (scripts/vendor_tesseract.py makes it); tess.py
+# unpacks it once into the data folder, so nobody installs anything and a onefile exe does not copy
+# 125 MB of DLLs to %TEMP% on every launch.  A release build without it would silently lose OCR.
+tess_zip = os.path.join(SPECPATH, 'vendor', 'tesseract.zip')
+tess_datas = []
+if os.path.isfile(tess_zip):
+    tess_datas = [(tess_zip, '.')]
+elif os.environ.get('TSH_NO_TESSERACT') != '1':
+    raise SystemExit('vendor/tesseract.zip is missing: run  python scripts/vendor_tesseract.py  first '
+                     '(or set TSH_NO_TESSERACT=1 for a build without the bundled OCR).')
 for mod in ('sellcalc',):
     if os.path.exists(os.path.join(SPECPATH, mod + '.py')):
         hidden.append(mod)
@@ -78,7 +89,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('templates', 'templates'),
-           (os.path.join('identify', 'assets'), os.path.join('identify', 'assets'))] + unity_datas,
+           (os.path.join('identify', 'assets'), os.path.join('identify', 'assets'))] + unity_datas + tess_datas,
     hiddenimports=hidden,
     hookspath=[],
     runtime_hooks=[],

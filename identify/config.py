@@ -26,10 +26,12 @@ LINE_TOL = 14                  # per-channel tolerance when masking line pixels
 MIN_PITCH = 20.0               # smallest supported px/slot (very small windows)
 MAX_PITCH = 220.0              # largest supported px/slot (4K + big UI scale)
 
-# data/ lives next to the .exe when frozen (PyInstaller extracts code to a temp dir)
+# ROOT: the exe's / repo's folder; data lives elsewhere when packaged (paths.py)
 ROOT = (os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
         else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DATA_DIR = os.path.join(ROOT, 'data')
+import paths                   # noqa: E402 - top-level module, importable because app.py's folder is on sys.path
+
+DATA_DIR = paths.default_data_dir()   # %LOCALAPPDATA%\TarkovStashHelper when packaged; TSH_DATA_DIR overrides
 TMPL_SRC_DIR = os.path.join(DATA_DIR, 'tmpl_src')
 PRICES_PATH = os.path.join(DATA_DIR, 'prices_cache.json')
 CATALOG_PATH = os.path.join(DATA_DIR, 'identify_catalog_v2.npz')

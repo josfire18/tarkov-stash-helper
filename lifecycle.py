@@ -98,8 +98,16 @@ def run_key() -> str:
     return os.environ.get('TSH_RUN_KEY') or RUN_KEY
 
 
+_data_dir_cache: dict = {}
+
+
 def data_dir() -> str:
-    return os.path.join(BASE, 'data')
+    """Same folder the app uses (paths.py); never migrates anything - the app does that."""
+    key = (BASE, FROZEN, os.environ.get('TSH_DATA_DIR'))
+    if _data_dir_cache.get('key') != key:
+        import paths
+        _data_dir_cache.update(key=key, val=paths.resolve_data_dir(FROZEN, BASE, BASE, migrate=False))
+    return _data_dir_cache['val']
 
 
 def settings_path() -> str:
@@ -640,7 +648,9 @@ def ensure_autostart(settings, win=None) -> bool:
     if not with_defaults(settings)['start_with_windows']:
         return False
     first = not is_registered()
-    register()
+    moved = register() and not first         # the exe was moved / re-downloaded: the old watcher still runs from (and locks) the old path
+    if moved and watcher_running(win):
+        stop_watcher(win)
     if not watcher_running(win):
         spawn_watcher()
     return first
