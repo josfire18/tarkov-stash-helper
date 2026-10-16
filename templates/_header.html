@@ -64,6 +64,7 @@ window.TSH = (() => {
       case 'minimized': cls = ''; msg = 'Tarkov minimized'; break;
       case 'covered': cls = 'warn'; msg = 'Window covers the game'; tip = 'Move this window off the game.'; break;
       case 'scanning': case 'busy': cls = 'busy'; msg = 'Scanning…'; break;
+      case 'in_raid': cls = ''; msg = 'In raid · paused'; tip = 'Nothing is captured or scanned during a raid (Settings > Live > Work in raid).'; break;
       case 'raid_inventory': cls = 'warn'; msg = 'Raid inventory not scanned'; tip = 'Settings > Live > Work in raid.'; break;
       case 'failed': case 'error': case 'blank': cls = 'bad'; msg = 'Scan failed'; tip = st.detail || st.message || ''; break;
       case 'scanned': if (st.last_scan_ts) msg = 'Updated ' + T.ago(Date.now() / 1000 - st.last_scan_ts); break;

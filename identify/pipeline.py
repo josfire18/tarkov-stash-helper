@@ -66,6 +66,7 @@ LABEL_PARTIAL_CAP = 94.0   # best score a non-exact label match can get (exact =
 LABEL_RIVAL_GAP = 5.0      # a label this much better than the chosen item's gets a say
 LITERAL_RES = 5.0          # a stage-1 residual this low with LITERAL_DINO is a near pixel-exact match
 LITERAL_DINO = 0.85
+PROGRESS_EVERY_S = 2.0       # while certifying, re-publish the partly certified view at most this often (live view)
 ANCHOR_SHORTLIST = 6       # icon-cache renders checked exactly per tile (Anchor 1)
 TIE_MARGIN = 0.1           # fused-score gap below which two differently named items are indistinguishable
 TIE_CONF_CAP = 0.5         # ...and the answer is a coin flip, so it may not be reported as certain
@@ -610,7 +611,23 @@ class Engine:
         # ---- anchors: exact game render / exact game-font label --------------------------
         self._phases = {}
         t = time.perf_counter()
-        self._certify_all(img_bgr, work, cancel)
+        progress = None
+        if on_provisional is not None and work:
+            def progress():
+                """Re-publish the first look with every tile certified so far FINAL: a view that is left
+                before certification ends still shows what was firmed up, and the list fills in."""
+                try:
+                    cur = list(cached)
+                    for w in work:
+                        d = w.get('det')
+                        if d is None:
+                            continue
+                        cur.append(d if w.get('certified') else dataclasses.replace(d, provisional=True, uncertain=True))
+                    cur.sort(key=lambda d: (d.panel, d.row, d.col))
+                    on_provisional(ScanResult(cur, grid, [it for it, _ in items], dict(T), list(warnings), regions))
+                except Exception as e:                   # a broken progress report never costs the scan
+                    print(f'[v2] progress report failed: {e}')
+        self._certify_all(img_bgr, work, cancel, progress)
         T['anchors'] = time.perf_counter() - t
         dets.sort(key=lambda d: (d.panel, d.row, d.col))
         T['total'] = time.perf_counter() - t0
@@ -634,9 +651,11 @@ class Engine:
         except Exception as e:                           # a broken first look never costs the scan
             print(f'[v2] provisional pass failed: {e}')
 
-    def _certify_all(self, img_bgr, work, cancel=None) -> None:
+    def _certify_all(self, img_bgr, work, cancel=None, progress=None) -> None:
         # Sequential on purpose: certifying tiles in a thread pool measured SLOWER (4 workers:
         # 5.1 s -> 7.0 s on an 87-item view; the label / render maths is GIL- and BLAS-contended).
+        n_det = sum(1 for w in work if w.get('det') is not None)
+        done, last = 0, time.perf_counter()
         for w in work:
             if w.get('det') is None:
                 continue
@@ -651,6 +670,12 @@ class Engine:
                 d.confidence = min(d.confidence, 0.5)
                 d.evidence['note'] = 'drawn dimmed (trader screen): not named confidently'
             self.tile_cache.put(w['key'], _to_cache(w['det']))
+            w['certified'] = True
+            done += 1
+            now = time.perf_counter()
+            if progress is not None and done < n_det and now - last >= PROGRESS_EVERY_S:
+                last = now
+                progress()
 
     # ------------------------------------------------------------------
     def _dino_pass(self, img_bgr, work) -> None:

@@ -209,3 +209,23 @@ def test_own_panel_splits_empty_cells_one_by_one():
 def test_free_cells_counts_area_not_footprints():
     g = [{'role': 'own_rig', 'cells': [(0, 0, 1, 2, True), (0, 0, 2, 2, False)], 'rows': 2, 'cols': 2, 'panel': 0}]
     assert liveadvice.free_cells(g) == 2
+
+
+def test_showcase_frame_with_scroll_bar_and_cut_row_keeps_the_true_pitch():
+    """The scav-transfer SHOWCASE window is 10 cells + a scroll bar wide and ends in a cut row: its
+    lattice is the stash pitch from the top-left corner, not the frame stretched over a rounded
+    cell count (857 px / 10 = 85.7 put every column 7 px off by column 4 and no item was found)."""
+    import numpy as np
+    from identify.owngrid import _snap_frame
+    H, W = 1250, 900
+    sh, sv = np.zeros((H, W), bool), np.zeros((H, W), bool)
+    x0, y0, x1, y1 = 10, 10, 10 + 857, 10 + 1149
+    sh[y0, x0:x1 + 1] = True
+    sv[y0:y1 + 1, x0] = True
+    sv[y0:y1 + 1, x1] = True                        # viewport cut: no bottom line
+    args = ((x0, y0, x1, y1), sh, sv, sv[y0:y1 + 1].sum(0), sh[:, x0:x1 + 1].sum(1), 84.0)
+    xs, ys, clip_top, clip = _snap_frame(*args, None, True)
+    assert [b - a for a, b in zip(xs, xs[1:])] == [84] * 10
+    assert len(ys) == 15 and clip and ys[1] - ys[0] == 84 and not clip_top
+    old = _snap_frame(*args, None, False)[0]        # what the stretched fit did
+    assert old[4] - old[0] != 4 * 84

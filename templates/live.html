@@ -25,7 +25,7 @@
   display: flex; align-items: center; justify-content: center; padding: var(--s3); overflow: hidden;
 }
 .frame { position: relative; flex: none; border: 1px solid var(--line-2); transition: opacity .2s; }
-.frame.stale { opacity: .85; }
+.frame.stale { opacity: .6; }
 .frame img { display: block; width: 100%; height: 100%; }
 .tile {
   position: absolute; border: 2px solid var(--acc); background: color-mix(in srgb, var(--acc) 14%, transparent);
@@ -118,6 +118,8 @@ const TRADER_COLORS = {
 const FALLBACK_TRADER = 'rgb(180, 120, 20)';
 const MONEY = new Set(['Roubles', 'Dollars', 'Euros']);
 
+let raidOn = false;         // Settings > Live > "Work in raid": when off the page shows no Grab / Drop / raid wording
+let pausedBefore = false;
 let scan = null;            // last payload
 let seq = 0;
 let filterText = '';
@@ -131,7 +133,7 @@ const OWN_LABEL = { own_rig: 'Tactical rig', own_pockets: 'Pockets', own_backpac
   own_special: 'Special slots', own_other: 'Equipment', loot: 'Loot', unknown: 'Unclear' };
 function classify(results, onYou, adv) {
   const g = { flea: [], traders: new Map(), none: [], keep: [], check: [], pending: [], own: onYou || [],
-              grab: (adv && adv.grab) || [], drop: (adv && adv.drop) || [] };
+              grab: (raidOn && adv && adv.grab) || [], drop: (raidOn && adv && adv.drop) || [] };
   for (const r of results) {
     if (MONEY.has(r.matched_name)) continue;                 // cash is not something to sell
     if (r.provisional && r.recommend === 'keep') g.pending.push(r);      // first look, certification pending
@@ -149,7 +151,7 @@ const matches = r => !filterText || ((r.matched_name || r.name) + ' ' + (r.trade
 // ---- summary --------------------------------------------------------------------------------
 function renderSummary(g, res) {
   const el = $('summary');
-  if (res.advice) {                                          // in a raid: loot advice instead of a sell total
+  if (res.advice && raidOn) {                                // in a raid: loot advice instead of a sell total
     const a = res.advice, bits = [];
     if (a.grab.length) bits.push(`<b>Grab ${a.grab.length}</b> · <b>${rubShort(a.grab.reduce((t, r) => t + r.value, 0))}</b>`);
     else bits.push('<b>Nothing worth grabbing</b>');
@@ -161,11 +163,12 @@ function renderSummary(g, res) {
   const sellRows = [...g.flea, ...[...g.traders.values()].flat()];
   const bits = [];
   if (sellRows.length) bits.push(`<b>Sell ${units(sellRows)} item${units(sellRows) === 1 ? '' : 's'}</b> · <b>${rubShort(sum(sellRows))}</b>`);
+  else if (g.pending.length) bits.push(`<b>Checking ${g.pending.length} item${g.pending.length === 1 ? '' : 's'}…</b>`);   // first look: no verdict yet, never "Nothing to sell"
   else bits.push('<b>Nothing to sell</b>');
   const extra = [];
   if (g.keep.length) extra.push(`Keep ${units(g.keep)}`);
   if (g.check.length) extra.push(`Check ${g.check.length}`);
-  if (g.pending.length) extra.push(`Verifying ${g.pending.length}…`);
+  if (g.pending.length) extra.push(`Checking ${g.pending.length} more…`);
   if (extra.length) bits.push(`<span class="more">${extra.join(' · ')}</span>`);
   const w = res.warnings && res.warnings[0];
   if (w) bits.push(`<span class="warn" title="${esc(res.warnings.join('\n'))}">${esc(w.length > 60 ? w.slice(0, 58) + '…' : w)}</span>`);
@@ -199,11 +202,11 @@ function rowEl(r, kind, acc) {
     amt = rubShort(r.per_slot) + '/slot';
     sub = r.flag ? (r.flag === 'Quest' ? 'Needed for a quest' : 'Needed for the hideout')
                  : `${rubShort(r.value)}${r.slots > 1 ? ' · ' + r.slots + ' slots' : ''}`;
-    if (r.provisional) more.push('Verifying — read from the first look only');
+    if (r.provisional) more.push('Checking — read from the first look only');
     if (kind === 'drop' && r.why) more.push(esc(r.why));
     if (kind === 'grab' && !r.flag) more.push(`${rubShort(r.value)} for ${r.slots} slot${r.slots === 1 ? '' : 's'}`);
   } else if (kind === 'pending') {
-    sub = 'Verifying…';
+    sub = 'Checking… not advice yet';
   } else if (kind === 'own') {
     sub = OWN_LABEL[r.role] || 'On you';
     if (r.uncertain) more.push('Not sure which item this is');
@@ -264,7 +267,7 @@ function renderList(g) {
   groupEl(list, 'No buyer', g.none, 'none', 'var(--faint)', false);
   groupEl(list, 'Keep', g.keep, 'keep', 'var(--keep)', false);
   groupEl(list, 'Check', g.check, 'check', 'var(--check)', false);
-  groupEl(list, 'Verifying', g.pending, 'pending', 'var(--faint)', false);
+  groupEl(list, 'Checking…', g.pending, 'pending', 'var(--faint)', false);
   groupEl(list, 'On you', g.own, 'own', 'var(--faint)', false);
   if (!list.children.length) {
     list.innerHTML = `<div class="none">${filterText ? 'No items match' : 'No items found'}</div>`;
@@ -280,8 +283,9 @@ function tileColor(r) {
   if (!r.trader_name) return '#777';
   return TRADER_COLORS[r.trader_name] || FALLBACK_TRADER;
 }
+let picW = 0, picH = 0;        // natural size of the picture the outlines belong to (the preloaded one, never the <img> that may still be swapping)
 function renderTiles(res) {
-  const img = $('img'), W = img.naturalWidth, H = img.naturalHeight;
+  const W = picW, H = picH;
   if (!W) return;
   const box = (r, cls, acc) => {
     const t = document.createElement('div');
@@ -292,7 +296,7 @@ function renderTiles(res) {
   };
   const tiles = $('tiles'); tiles.innerHTML = '';
   for (const s of res.skipped || []) tiles.append(box(s, 'skip', '#777'));
-  const adv = res.advice || { grab: [], drop: [] };
+  const adv = (raidOn && res.advice) || { grab: [], drop: [] };
   for (const o of res.on_you || []) {
     const t = box(o, (o.side === 'own' || /^own_/.test(o.role)) ? 'own' : o.role === 'loot' ? 'lootg' : 'skip', '#777');
     t.title = o.matched_name || ''; tiles.append(t);
@@ -341,29 +345,34 @@ function flash(k) {
 }
 
 function fit() {
-  const img = $('img'), frame = $('frame'), stage = $('stage');
-  if (!img.naturalWidth) return;
+  const frame = $('frame'), stage = $('stage');
+  if (!picW) return;
   const cw = stage.clientWidth - 24, ch = stage.clientHeight - 24;
-  const s = Math.min(cw / img.naturalWidth, ch / img.naturalHeight);
-  frame.style.width = Math.floor(img.naturalWidth * s) + 'px';
-  frame.style.height = Math.floor(img.naturalHeight * s) + 'px';
+  const s = Math.min(cw / picW, ch / picH);
+  frame.style.width = Math.floor(picW * s) + 'px';
+  frame.style.height = Math.floor(picH * s) + 'px';
 }
 new ResizeObserver(fit).observe($('stage'));
 
 // ---- apply a payload ------------------------------------------------------------------------
+let applyToken = 0;
 function apply(res) {
   if (res.error || res.grid_failed || !(res.image || res.frame_url)) {
     $('summary').innerHTML = `<span class="warn">${esc(res.error || (res.warnings && res.warnings[0]) || 'Stash not found on screen')}</span>`;
     return;
   }
-  scan = res;
-  const g = classify(res.results || [], res.on_you, res.advice);
-  renderSummary(g, res);
-  renderList(g);
-  const img = $('img');
+  // The list, the summary and the outlines change TOGETHER, once the picture they belong to has loaded
+  // (a result arriving while the previous picture was still on screen used to show new names over old tiles).
+  const tok = ++applyToken;
   const pre = new Image();
   pre.onload = () => {
-    img.src = pre.src;
+    if (tok !== applyToken) return;                       // a newer result superseded this one while it loaded
+    scan = res;
+    const g = classify(res.results || [], res.on_you, res.advice);
+    renderSummary(g, res);
+    renderList(g);
+    $('img').src = pre.src;
+    picW = pre.naturalWidth; picH = pre.naturalHeight;
     $('frame').hidden = false; $('empty').hidden = true;
     fit(); renderTiles(res);
   };
@@ -389,6 +398,7 @@ function paintEmpty(st) {
   else if (!st.enabled) { t = 'Auto-scan is off'; btn = '<button class="primary" id="turn-on">Turn on</button>'; }
   else if (st.state === 'no_game') t = 'Waiting for Tarkov';
   else if (st.state === 'minimized') t = 'Tarkov is minimized';
+  else if (st.state === 'in_raid') t = 'In a raid · Live is paused until you are back in the lobby';
   e.innerHTML = `<div class="t">${t}</div>${btn}`;
   const b = $('turn-on');
   if (b) b.onclick = async () => { await api('POST', '/api/autoscan/toggle', { enabled: true }); };
@@ -397,8 +407,17 @@ function paintEmpty(st) {
 
 document.addEventListener('tsh:status', ev => {
   const st = ev.detail;
+  const was = raidOn;
+  raidOn = !!(st && st.live_in_raid);
   if (st && st.seq !== undefined && st.seq !== seq && st.seq > 0) fetchResult();
+  if (was !== raidOn && scan) { renderList(classify(scan.results || [], scan.on_you, scan.advice)); renderTiles(scan); renderSummary(classify(scan.results || [], scan.on_you, scan.advice), scan); }
   paintEmpty(st);
+  const paused = !!(st && st.enabled && st.state === 'in_raid');        // in a raid with "Work in raid" off: nothing is scanned
+  const behind = !!(st && st.enabled && (st.state === 'settling' || st.state === 'scanning'));   // the picture shown is not the current screen yet
+  $('frame').classList.toggle('stale', paused || behind);
+  if (paused) $('summary').innerHTML = '<span class="warn">In a raid · Live is paused until you are back in the lobby</span>';
+  else if (pausedBefore && scan) renderSummary(classify(scan.results || [], scan.on_you, scan.advice), scan);
+  pausedBefore = paused;
   const btn = $('scan-now');
   if (st && st.state === 'scanning' ) { btn.disabled = true; btn.textContent = 'Scanning…'; }
   else if (btn.dataset.busy !== '1') { btn.disabled = false; btn.textContent = 'Scan now'; }

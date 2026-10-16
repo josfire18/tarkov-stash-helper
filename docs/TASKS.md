@@ -59,5 +59,31 @@ Game mode (`feat/game-mode`): the app knows PvP / PvP Season / PvE. Detected fro
 
 Profiles (`feat/profiles`): PvP, PvP Season and PvE are separate characters. `data/profiles/<mode>/` holds `progress.json` (task ticks, hideout levels, have-counts), `keep_list.json` (Collector hand-ins + pins) and `settings.json` (`prestige`, `faction`, `trader_levels`, `intel_center_level`, `hideout_management_level`, `flea_offer_slots`); every other setting stays in `data/settings.json`. The active profile is the effective mode; all access goes through `app.profile_path / load_progress / load_keep_list / _load_settings / _save_settings`. The pre-profile files migrate once into the profile active at that moment (old ones kept as `*.migrated.bak`, log in `data/profiles/migration.log`).
 
+## How it plays (what the app does at each step of a session)
+Raids are won on frame time and views change every few seconds, so the app works in the lobby only.
+
+1. **Game starts** - the tray watcher opens the app; it warms the item catalog, the font and the icon-hash index in the
+   background (a few seconds when warm). The pill says "Waiting for Tarkov" until the game window exists.
+2. **Lobby, stash / gear screen** - when a view stays still for ~0.5 s the whole frame is scanned. A **first look**
+   arrives after ~2-3 s: every tile with a name ("Looks like ..."), listed under *Checking...*, outlined dotted grey,
+   **never** as sell advice and never in a total ("Checking 55 items..." replaces the headline). Certified tiles then
+   turn into real rows as they finish (a progress report every ~2 s); the **final** result (all tiles certified,
+   sell / keep / Check groups, totals) lands ~8-10 s after a new view (0.4 s when nothing changed: unchanged tiles
+   come from the tile cache). Each new view cancels the pending certification of the old one, so while you scroll you
+   see first looks (the picture dims as "not the current screen yet"); stop for ~10 s and you get the final.
+3. **Open a container / the item-search window / the backpack in the stash screen** - same flow; the window's grid is
+   advised like the stash (items you own), your rig / pockets / backpack are listed under *On you* only.
+4. **Trader screen (sell tab)** - the stash is dimmed for items the trader will not buy; dimmed tiles are never named
+   confidently (they show as Check), everything the trader buys is final like in the stash.
+5. **Flea market: offer creation** - the item picker on the left is scanned like a stash (dimmed = not listable).
+6. **After a raid: scav loot transfer ("Receive all")** - the incoming window is read at the true cell pitch
+   (scroll bar and cut row do not stretch the lattice) so every incoming item gets a final result next to your stash.
+7. **In a raid** - nothing at all: with the game log saying `in_raid` (and *Work in raid* off, the default) the app
+   stops capturing, detecting, scanning and collecting frames, releases the screen duplication and only re-reads the
+   log tail every 2 s; the pill says "In raid - paused". When the log says lobby again the first inventory view
+   is scanned fresh. *Work in raid* (opt-in) restores the old behaviour: grab / drop advice from the loot you open
+   (a first look takes seconds and every capture costs frame time, which is why it is off).
+8. **Game exits** - the watcher closes the app ~15 s later.
+
 ## Parked
 - Build pricing: the user opens the weapon inspect/modding window so the attachment icons along the bottom are visible; identify each attachment (plain items -> exact via icon hash) and sum a build value. Parked by the user 2026-10-13.

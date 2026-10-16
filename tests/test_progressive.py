@@ -182,3 +182,17 @@ def test_a_failing_progressive_scan_reports_an_error_and_a_superseded_one_does_n
     assert _wait(lambda: s.status()['state'] in ('error', 'failed'))
     assert 'boom' in s.status()['detail']
     s.stop()
+
+
+def test_certification_reports_progress_with_certified_tiles_final(world, monkeypatch):
+    import identify.pipeline as pl
+    monkeypatch.setattr(pl, 'PROGRESS_EVERY_S', 0.0)
+    cat, img, n = _synthetic(world)
+    seen = []
+    res = engine(cat).scan(img, on_provisional=lambda r: seen.append([d.provisional for d in r.detections]))
+    assert len(seen) >= 2                                            # the first look, then progress reports
+    assert all(seen[0])                                              # first look: everything provisional
+    assert any(any(s) and not all(s) for s in seen[1:])              # a report with some tiles already final
+    assert not any(d.provisional for d in res.detections)           # the final result never carries the flag
+    plain = engine(cat).scan(img)
+    assert [d.item_id for d in res.detections] == [d.item_id for d in plain.detections]   # progress changes nothing

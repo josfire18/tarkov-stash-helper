@@ -941,7 +941,7 @@ def default_settings():
         'auto_scan_in_raid': False,  # also scan the in-raid inventory (off: only the lobby stash)
         # Live page (identify inventory grids on the fly; the live viewer owns what these do)
         'live_viewer': True,               # identify inventory grids on the fly and show them on the Live page
-        'live_in_raid': True,              # also work in raid: what is worth grabbing / what to drop
+        'live_in_raid': False,             # OFF by default: nothing is captured/scanned while the game log says raid. On: also grab/drop advice in a raid
         'live_top_n': 5,                   # how many 'worth grabbing' items to highlight (1-20)
         'live_min_value_per_slot': 10000,  # roubles: ignore loot worth less than this per slot
     }
@@ -3416,7 +3416,9 @@ def _sell_payload(raw_detections, panels, grid_failed, warnings, scene_info, set
     on_you = []
     raid = bool(scene_info.get('in_raid')) or str(scene_info.get('scene') or '').startswith('raid')
     live_advice = None
-    if raid:           # grab / drop advice from the raw detections; nothing is sold from a raid view
+    if raid and (settings.get('live_in_raid') or settings.get('auto_scan_in_raid')):
+        # grab / drop advice from the raw detections; nothing is sold from a raid view.  Off by default:
+        # a scan that still reaches here with raid off (hotkey / "Scan now") shows the view without advice.
         try:
             import liveadvice
             live_advice = liveadvice.compute_advice(

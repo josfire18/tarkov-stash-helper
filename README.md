@@ -129,8 +129,10 @@ on every new result / state change; the 1.5 s status poll stays as the fallback)
 (`/api/autoscan/result`, ~50 KB) and the frame JPEG separately (`/api/autoscan/frame?seq=N`, encoded on first
 request, cached by seq). A view is scanned ~0.5 s after it stops changing (4 Hz polling, two identical polls); only the
 tiles whose pixels changed are re-identified (`identify/tilecache.py`: key = tile pixel hash + pitch, LRU of 20 000
-results), so scrolling or moving one item re-reads one or two tiles. In a raid (Settings > Live > Work in raid,
-`live_in_raid`, default on) the inventory / loot you open is scanned too and the payload carries `advice`
+results), so scrolling or moving one item re-reads one or two tiles. **In a raid nothing runs** (the game log says
+`in_raid`: no capture, no scan, no frame collection, the screen duplication is released; the pill says "In raid -
+paused"). Opt in with Settings > Live > Work in raid (`live_in_raid`, default **off**): then the inventory / loot you
+open is scanned too and the payload carries `advice`
 (`liveadvice.py`): **grab** = loot ranked by value per slot (best of trader and flea net, flea only when allowed;
 at most `live_top_n`, at least `live_min_value_per_slot`; items an open quest / the hideout needs come first,
 flagged); **drop** = only when the best grab does not fit into the free cells of rig / pockets / backpack: the
@@ -196,6 +198,12 @@ python test_scan.py --prefill data/eval/new.png                # draft truth + c
 python test_scan.py --relabel data/eval/new.png fixes.json     # apply the corrections you read off the sheets
 python -m identify.calibrate data/eval/new.png                 # refit the confidence calibration
 ```
+
+Your own frames (`data/scenes/live/`, saved by the auto-scan) make the real test set: `python scripts/build_user_truth.py
+FRAME.png` labels every tile from the exact icon-render oracle plus your own reading of the contact sheets
+(`data/eval/user/`), `python scripts/score_user_truth.py --cold` grades the live path (`app._autoscan_scan`, final and
+first look) on them and `python scripts/replay_real_frames.py T0 T1` replays a recorded session through the real
+`AutoScanner` and prints what the Live page showed second by second.
 
 Truth files (`<name>.truth.full.json`) label *every* item with its pixel rectangle and mark
 items you cannot identify from the crop as `"uncertain": true` (excluded from accuracy, still

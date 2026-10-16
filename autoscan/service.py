@@ -8,6 +8,9 @@ Cost rules (Tarkov is main-thread bound; frame drops are the one thing this must
     one process lookup every 3 s while the game is not running;
   * detection runs on decimated data (autoscan.detect), a few ms per poll;
   * the identify pipeline runs only on a settled, menu-context inventory frame, never in a raid;
+  * while the game log says RAID (and Settings > Live > "Work in raid" is off, the default) NOTHING runs:
+    no capture, detection, scan or frame collection, the screen duplication is released, the loop only
+    re-reads the log tail every POLL_RAID_S;
   * the thread runs at THREAD_PRIORITY_BELOW_NORMAL; the duplication is released when the game
     is gone, the feature is switched off or the app quits.
 """
@@ -33,7 +36,8 @@ POLL_RAID_S = 2.0            # after RAID_BACKOFF idle polls with no menu bar: g
 POLL_NO_GAME_S = 3.0
 RAID_BACKOFF = 30
 RELOCATE_S = 5.0
-PROV_WAIT_S = 60.0           # a new view waits at most this long for the running scan's first look before cancelling it
+RAID_MAX_S = 2 * 3600.0      # a log that has said "in raid" for longer than this lost its exit line: stop trusting it
+PROV_WAIT_S = 60.0          # a new view waits at most this long for the running scan's first look before cancelling it
 
 MESSAGES = {
     'disabled': 'Auto-scan off',
@@ -44,6 +48,7 @@ MESSAGES = {
     'blank': 'Capture returned black frames',
     'waiting': 'Waiting for stash',
     'raid_inventory': 'Raid inventory open - live view in raid is off (Settings > Live)',
+    'in_raid': 'In a raid - Live is paused until you are back in the lobby',
     'settling': 'Inventory found - waiting for it to settle',
     'scanning': 'Scanning...',
     'verifying': 'First look ready - verifying items...',
@@ -76,6 +81,7 @@ class AutoScanner:
         self.raid_state_fn = raid_state_fn        # () -> {'state', 'since', 'source'} from the game's log, or None
         self.mode_fn = mode_fn                    # () -> game-mode info dict (detected / effective), for the status
         self._raid_state = None
+        self._was_in_raid = False
         self.progressive = progressive
         self._job = None                          # (thread, cancel Event) of the running progressive scan
         self._prov = threading.Event()            # the running scan has published (or no longer can publish) its first look
@@ -112,9 +118,9 @@ class AutoScanner:
 
     def _opts(self) -> dict:
         s = self.get_settings() or {}
-        # Settings > Live "work in raid" (default on); the older auto_scan_in_raid still counts
+        # Settings > Live "work in raid" (default OFF: nothing is captured or scanned while the game log says raid); the older auto_scan_in_raid still counts
         return {'exe': s.get('auto_scan_exe') or GAME_EXE,
-                'allow_raid': bool(s.get('live_in_raid', True) or s.get('auto_scan_in_raid', False))}
+                'allow_raid': bool(s.get('live_in_raid', False) or s.get('auto_scan_in_raid', False))}
 
     # -- public ------------------------------------------------------------------------------
     def start(self):
@@ -148,6 +154,7 @@ class AutoScanner:
                   backend=self.capture.backend_name, detect_ms=round(self._last_detect_ms, 1),
                   grab_ms=round(self._last_grab_ms, 1))
         st['mode'] = self._mode_info()
+        st['live_in_raid'] = self._opts()['allow_raid']          # the Live page hides its raid wording / groups when off
         return st
 
     def _mode_info(self):
@@ -233,6 +240,25 @@ class AutoScanner:
         self._raid_state = st
         return st
 
+    def _in_raid_by_log(self) -> bool:
+        """The game's own log says a raid is running (False when the log is unreadable or the 'raid' is
+        older than RAID_MAX_S, i.e. the exit line was never logged)."""
+        st = self._log_raid_state()
+        if not st or st.get('state') != 'in_raid':
+            return False
+        since = st.get('since')
+        return not (since and self.wall() - since > RAID_MAX_S)
+
+    def _pause_for_raid(self, game_info):
+        """Release everything a raid must not pay for: the running scan, the screen duplication."""
+        if not self._was_in_raid:
+            self._was_in_raid = True
+            self._supersede(wait_first_look=False)
+            self.capture.close()
+            self.trigger.reset_view()                 # the first lobby view afterwards is scanned afresh
+            self._idle_polls = 0
+        self._set('in_raid', game=game_info)
+
     def _locate(self, now: float, exe: str):
         if self._game is None or now - self._game_ts >= RELOCATE_S:
             self._game = locate_game(self.win, exe, os.getpid())
@@ -254,6 +280,13 @@ class AutoScanner:
             self._set('no_game')
             return POLL_NO_GAME_S
         game_info = {'pid': game.pid, 'size': game.size, 'monitor': game.monitor.device}
+        if not opts['allow_raid'] and self._in_raid_by_log():
+            # Raid: no capture, no detection, no scan, no frame collection - nothing runs next to the
+            # game (raids are won by frame time; views change every few seconds, so a scan would never
+            # finish anyway).  Only the log tail (a stat() every POLL_RAID_S) is read, to notice the exit.
+            self._pause_for_raid(game_info)
+            return POLL_RAID_S
+        self._was_in_raid = False
         if game.iconic:
             self.capture.close()
             self._set('minimized', game=game_info)

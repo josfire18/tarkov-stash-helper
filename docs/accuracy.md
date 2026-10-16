@@ -321,3 +321,54 @@ sees colour. A look-alike same-name variant in the shortlist now needs the colou
 the lean path's **1034 / 0 / 27 / 2**. DINO therefore no longer earns its warm-up and memory cost:
 `EngineSettings.use_dino` defaults to False everywhere (the exe never had it); opt in with
 `"identify_v2": {"use_dino": true}` in settings.json.
+
+## Real frames: the user's own 1440p captures (2026-10-16)
+
+The eval set above is mostly other people's screenshots. `scripts/build_user_truth.py` labels the user's own
+frames from `data/scenes/live` from two independent sources: the **exact oracle** (a tile whose pixels match a
+hash-named icon-cache render at aligned residual < 1.5 with a >= 2.5x runner-up gap IS that item) and a **human
+reading the printed label** on contact sheets (`data/eval/user/<frame>.manual.json`; tiles a human cannot tell -
+dimmed trader tiles, tiles the segmentation merged - are `?` and excluded). Six diverse frames, 396 labelled
+tiles (`scripts/score_user_truth.py --cold`, the real `app._autoscan_scan`, lean / DINO off):
+
+| frame | labelled | FINAL correct / wrong / Check (right+wrong) / missed | FIRST LOOK names right / wrong (always "Checking", never advice) | first look / final |
+|---|---|---|---|---|
+| 23:53 lobby gear + stash (the frame of last night) | 64 | 60 / 0 / 4+0 / 0 | 63 / 1 | 2.9 s / 10.2 s |
+| gear + stash, rig contents | 87 | 84 / 0 / 3+0 / 0 | 86 / 1 | 2.9 s / 9.7 s |
+| trader (sell tab, stash dimmed) | 23 | 1 / 0 / 9+13 / 0 | 10 / 13 | 2.3 s / 7.9 s |
+| scav loot transfer ("Receive all") | 78 | 77 / 0 / 1+0 / 0 | 76 / 2 | 3.4 s / 9.4 s |
+| flea offer creation | 47 | 41 / 0 / 6+0 / 0 | 47 / 0 | 2.6 s / 8.2 s |
+| item-search window over gear | 97 | 89 / 0 / 0+8 / 0 | 89 / 8 | 3.7 s / 8.8 s |
+| **total** | **396** | **352 / 0 / 23+21 / 0** | **371 / 25** | |
+
+Zero wrong. The 23 right-but-Check + 21 wrong-but-Check are exactly the tiles the app declines to commit to: dimmed
+trader tiles (the trader screen draws a price over the label and darkens the art: a human cannot read them either), the
+top row of the item-search window (flagged "clipped" although complete: its label is not read, so the Morphine
+stimulant stays a Check instead of SJ9) and look-alike colour variants. The pre-PR #31 code (DINO on, run on the
+same frames) scores 344 / 0 / 23+20: **identification itself was not what failed last night**.
+
+What was wrong:
+
+* **Scav loot transfer: the incoming items were not found at all** (0 of 9 outlined, no advice for them). The
+  SHOWCASE window is 10 cells plus a scroll bar wide and ends in a cut row; `identify/owngrid.py` stretched the
+  frame (857 px) over 10 columns / 14 rows = a lattice of 85.7 x 82.1 px instead of 84.0, 7 px off by column 4, no
+  item border matched and the whole window segmented as two blobs. It now uses the true pitch from the top-left corner:
+  9 / 9 items final (RUB, GreenBat x3, BEAR Buddy, Cyclon, Hawk, Finances).
+* **What the user most likely saw** (`scripts/replay_real_frames.py` over the recorded 23:53 session through the real
+  `AutoScanner`): views changed every 3-4 s and a final takes 8-10 s, so each new view cancelled the previous
+  certification. The pre-#31 code showed nothing at all for the first 14 s, then the first look; the current code
+  showed first looks only ("Looks like ...", all grey, headline "Nothing to sell" - a headline that was simply wrong),
+  stale by one view, until the view rested for ~17 s. First looks are ~94 % right by name but every name is unverified
+  by design, so the page looked like "3 of 4 right, the rest wrong". Fixes: certified tiles are now reported as they
+  finish (sell rows fill in over ~6 s instead of all at once at the end), pending tiles say "Checking...", the headline
+  is "Checking N items...", the picture dims while it is not the current screen, and the list, totals and outlines
+  now switch together once the new picture has loaded (they used to change one by one, with the old picture
+  underneath).
+* **Live page placement**: verified on the real frame in the browser (outlines vs the picture's own cell borders: 66 of
+  67 left edges within 1 px, DOM rectangles equal the payload to 0.03 px, devicePixelRatio 1, letterboxed stage). No
+  misplacement; the tile sizes come from the preloaded picture rather than the `<img>` that may still be swapping.
+
+Not changed (documented): merged identical neighbours in the item-search window (four 1x1 Morphine tiles without
+cell borders between them segment as one 4x1 -> Check), clipped tops with a readable label, the trader screen's
+dimmed tiles. Regression: `accuracy_report.py --no-dino --quiet` on the old eval stays **1034 / 0 / 27 / 2**,
+certified-but-wrong 0 (`--user` adds the user's frames through that report's no-scene scan: 0 wrong as well).

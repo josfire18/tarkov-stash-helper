@@ -25,9 +25,14 @@ import cv2  # noqa: E402
 import test_scan as T  # noqa: E402
 
 
-def eval_images():
+def eval_images(include_user=False):
+    """The labelled screenshots.  data/eval/user/ (the user's own frames, scripts/build_user_truth.py) is
+    graded by scripts/score_user_truth.py through the live path; this report's no-scene scan is not that
+    path, so they are only included with ``--user``."""
     out = []
     for tp in sorted(glob.glob(os.path.join(ROOT, 'data', 'eval', '**', '*.truth.full.json'), recursive=True)):
+        if not include_user and os.sep + 'user' + os.sep in tp:
+            continue
         img = tp[:-len('.truth.full.json')] + '.png'
         if os.path.exists(img):
             out.append(img)
@@ -115,8 +120,9 @@ def main():
     ap.add_argument('--no-ocr', action='store_true')
     ap.add_argument('--json')
     ap.add_argument('--quiet', action='store_true', help='no per-failure lines')
+    ap.add_argument('--user', action='store_true', help="also grade data/eval/user (the user's own frames)")
     a = ap.parse_args()
-    imgs = a.images or eval_images()
+    imgs = a.images or eval_images(a.user)
     cats = T._categories()
     tot = {'correct': 0, 'wrong': 0, 'uncertain': 0, 'missed': 0, 'n': 0, 'time': 0.0,
            'cert_render': 0, 'cert_label': 0, 'cert_both': 0, 'cert_wrong': 0}
