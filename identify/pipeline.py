@@ -1068,9 +1068,18 @@ class Engine:
         if item_id == '':
             z -= 4.0
         twin_ok = twin_gap is not None and twin_gap >= (TWIN_GAP_OK if have_dino else TWIN_GAP_OK_RES)
+        lookalike_open = have_dino and not self._lookalike_twins_settled(w, chosen_row, pool_rows)
+        if twins > 1 and twin_ok and lookalike_open:
+            # DINO's lead is a feature-space opinion and barely sees colour: a look-alike twin of the
+            # same label (a colour variant: Bastion Armor Black vs OD Green) needs the colour evidence
+            twin_ok = False
         if twins > 1 and not twin_ok:
             z -= 1.5 * math.log(twins)
         conf = _sigmoid(z)
+        if lookalike_open:
+            # the same holds without an exact label: DINO alone never settles a colour variant
+            conf = min(conf, TIE_CONF_CAP)
+            evidence['note'] = 'look-alike variant not separated by colour'
         if twins > 1 and not twin_ok:
             # same-label twins the picture did not separate: the choice is a coin flip
             conf = min(conf, TIE_CONF_CAP)
@@ -1210,6 +1219,27 @@ class Engine:
                 cg = self._colour_gap(w, me, r)
                 if rk[me] - rk[r] < 0.0 or cg is None or cg < COLOUR_GAP_OK:
                     return False
+        return True
+
+    def _lookalike_twins_settled(self, w, me_row: int, pool_rows) -> bool:
+        """False when a same-label rival in the shortlist draws a look-alike silhouette (a colour
+        variant) and the colour-only comparison does not clearly prefer the pick."""
+        cat = self.cat
+        me_id = str(cat.ids[me_row])
+        me = self._id_row.get(me_id)
+        if me is None:
+            return True
+        me_short = str(cat.shorts[me_row])
+        for r_, _rot, nm, _s in (pool_rows or ()):
+            rid = str(cat.ids[r_])
+            r = self._id_row.get(rid)
+            if r is None or rid == me_id or nm == str(cat.names[me_row]) or str(cat.shorts[r_]) != me_short:
+                continue
+            if self._shape_distinct(w, me, r):
+                continue
+            cg = self._colour_gap(w, me, r)
+            if cg is None or cg < COLOUR_GAP_OK:
+                return False
         return True
 
     def _colour_gap(self, w, me: int, rival: int):
