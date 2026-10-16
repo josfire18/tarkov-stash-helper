@@ -435,34 +435,33 @@ $('scan-now').addEventListener('click', async () => {
   setTimeout(() => { btn.dataset.busy = ''; btn.disabled = false; btn.textContent = 'Scan now'; }, 2500);
 });
 
-// ---- first-run banner: one thing at a time, only when relevant ------------------------------
+// ---- first-run banner: one plain sentence at a time, with at most one button ----------------
 let bannerTimer;
 async function checkBanner() {
-  let ms = null, h = null;
-  try { [ms, h] = await Promise.all([api('GET', '/api/icons/matcher-status'), api('GET', '/api/health')]); } catch (_) {}
+  let st = null;
+  try { st = await api('GET', '/api/setup'); } catch (_) {}
   const b = $('banner'), txt = $('banner-text'), btn = $('banner-btn');
   btn.hidden = true; btn.onclick = null;
   let next = 30000;
-  if (ms && ms.running) {
-    const pct = ms.total ? Math.round(100 * ms.done_count / ms.total) : 0;
-    txt.textContent = ms.phase === 'catalog' ? 'Building the item database…' : `Building the item database… ${pct}%`;
+  if (st && st.problem) {
+    txt.textContent = st.problem.text;
+    b.className = 'banner'; b.hidden = false; next = 8000;
+    const bt = st.problem.button;
+    if (bt) {
+      btn.hidden = false; btn.disabled = false; btn.textContent = bt.label;
+      btn.onclick = async () => {
+        btn.disabled = true;
+        const r = await api('POST', bt.action === 'choose-folder' ? '/api/setup/choose-folder' : '/api/setup/retry');
+        if (r && r.error) toast(r.error, 'bad', 5000);
+        checkBanner();
+      };
+    }
+  } else if (st && st.busy) {
+    txt.textContent = st.busy + (st.pct != null ? ` ${st.pct}%` : '') + '… the first start takes a few minutes';
     b.className = 'banner info'; b.hidden = false; next = 2000;
-  } else if (ms && !ms.ready) {
-    txt.textContent = ms.error ? 'The item database failed to build' : 'The item database isn’t built yet';
-    b.className = 'banner'; b.hidden = false;
-    btn.hidden = false; btn.textContent = ms.error ? 'Retry' : 'Build now';
-    btn.onclick = async () => { btn.disabled = true; await api('POST', '/api/icons/build-index'); checkBanner(); };
-    btn.disabled = false; next = 8000;
-  } else if (h && h.tesseract === false) {
-    txt.textContent = 'Item names can’t be read: Tesseract OCR isn’t installed';
-    b.className = 'banner'; b.hidden = false;
-    btn.hidden = false; btn.textContent = 'Copy install command';
-    btn.onclick = async () => {
-      const cmd = 'winget install UB-Mannheim.TesseractOCR';
-      try { await navigator.clipboard.writeText(cmd); toast('Copied. Run it in a terminal, then restart the app.', 'ok', 4000); }
-      catch (_) { window.prompt('Run this in a terminal:', cmd); }
-    };
-    next = 15000;
+  } else if (st && st.notices && st.notices.length) {
+    txt.textContent = st.notices[0];
+    b.className = 'banner info'; b.hidden = false;
   } else b.hidden = true;
   clearTimeout(bannerTimer); bannerTimer = setTimeout(checkBanner, next);
 }

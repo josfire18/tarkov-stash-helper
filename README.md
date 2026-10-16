@@ -1,37 +1,50 @@
 # Tarkov Stash Helper
 
-A local desktop tool for Escape from Tarkov that identifies items in your stash
-from a screenshot (via icon + OCR matching) and tells you whether to sell to a
-trader or the flea market.
+A local desktop tool for Escape from Tarkov that reads your stash from the screen (icon + OCR matching)
+and tells you whether to sell each item to a trader or on the flea market, what your quests and hideout still
+need, and what to grab in a raid.
 
-Everything runs on your own machine — screen capture, OCR, and item
-identification all happen locally. Nothing about your game or your stash is
-sent anywhere except public item-price lookups against [tarkov.dev](https://tarkov.dev).
+## Download & install
 
-## Using the app (recommended: download the release)
+1. Download **`TarkovStashHelper.exe`** from the [latest release](../../releases/latest) (one file, ~110 MB).
+2. Double-click it. Windows may say "Windows protected your PC" because the exe isn't code-signed:
+   click **More info -> Run anyway**.
 
-1. Grab the latest `TarkovStashHelper.exe` from the [Releases](../../releases) page.
-2. Install **Tesseract OCR** (needed for reading item names off the screen):
-   ```
-   winget install UB-Mannheim.TesseractOCR
-   ```
-3. Double-click `TarkovStashHelper.exe` once. A window opens — no browser, no URL,
-   no console window. From then on it **opens with Tarkov and closes when Tarkov exits**:
-   the first launch registers a tiny watcher (~2 MB, no window) that Windows starts at
-   sign-in; it starts the app when `EscapeFromTarkov.exe` appears, and the app closes
-   itself ~15 s after the game is gone. Closing the window minimizes it to the tray;
-   tray **Quit** closes it until the next Tarkov launch, **Quit and stop auto-launch**
-   (or the Settings toggles `start_with_windows` / `follow_tarkov`) turns that off.
-   Launching the app by hand while Tarkov is not running keeps it open until the game
-   has started and exited.
-4. Open Tarkov and your stash. The **Live** page shows the captured screen with every item outlined by what to
-   do with it (sell on flea, sell to a trader, keep, check) and updates by itself. **Needs** lists what your
-   quests (read from the game logs), hideout, Kappa and pins still require; **Settings** has the rest. On the very
-   first run the item database builds itself (a few minutes, needs internet; a banner on Live shows progress).
+That is all. Put the file anywhere (Downloads, Desktop, a folder of your own); no installer, no extra
+software, nothing to configure. Needs Windows 10 / 11 (64-bit), Escape from Tarkov installed through the
+Battlestate launcher or Steam, and an internet connection the first time.
 
-Windows may show a SmartScreen warning on first run because the exe isn't
-code-signed — click "More info" → "Run anyway". This is a local, open-source
-tool; check the source in this repo if you want to verify that yourself.
+**First start** (a few minutes, the banner on the Live page shows progress and then disappears): the app finds
+your Tarkov install and language by itself, downloads prices and quests from [tarkov.dev](https://tarkov.dev),
+downloads the item pictures, builds its item database and prepares the game's label font from your own install
+(read-only). From then on it **opens when Tarkov starts and closes when Tarkov exits** (a tiny background
+watcher, ~2 MB, is added to Windows start-up; closing the window sends it to the tray, tray **Quit** closes it
+until the next Tarkov launch). Open your stash and the **Live** page outlines every item by what to do with
+it; **Needs** lists what your quests (read from the game's logs), hideout and Kappa still require.
+
+If something can't be done automatically the app says so in one sentence with one button, for example
+"Tarkov not found - Choose folder".
+
+**Privacy.** Screen capture, OCR and identification happen on your PC. The only network traffic is public
+data downloads from tarkov.dev (prices, items, quests, pictures), the Collector list from the Escape from
+Tarkov wiki, and a check of this repo's GitHub releases for updates. Nothing about your game or stash is
+sent anywhere.
+
+**Different setups.** The UI scale is measured from the screen, so 1080p to 4K, ultrawide, windowed /
+borderless / fullscreen, display scaling of 125 % / 150 % and a game on a second monitor all work; the app
+makes itself per-monitor DPI aware before it captures anything. If your client language is Latin script
+(German, French, Spanish, Polish, Czech, ...) it reads item labels in that language; for Russian, Japanese,
+Korean or Chinese it can't read labels and identifies items by their picture only (the Live page says so).
+
+**Troubleshooting.** Everything the app writes lives in `%LOCALAPPDATA%\TarkovStashHelper` (paste that into
+the Explorer address bar): `app.log` (what the app did, including errors) and `lifecycle.log` (open/close with
+Tarkov). To stop it opening with Tarkov, right-click its tray icon -> **Quit and stop auto-launch** (or
+Settings -> turn off *Start with Windows*). If the item database fails to build, check your internet and press
+**Try again** in the banner. Moving or re-downloading the exe loses nothing: your data is not stored next to it,
+and the next start re-points the start-up entry to the new location.
+
+**Uninstall.** Tray icon -> **Quit and stop auto-launch**, delete `TarkovStashHelper.exe`, then delete the
+folder `%LOCALAPPDATA%\TarkovStashHelper`.
 
 ## Running from source
 
@@ -39,7 +52,7 @@ Requires Python 3.11+ (developed and tested on 3.12).
 
 ```
 pip install -r requirements.txt
-winget install UB-Mannheim.TesseractOCR
+python scripts/vendor_tesseract.py      # downloads + unpacks (does not install) the Tesseract OCR the exe bundles; or install your own
 python app.py
 ```
 
@@ -52,13 +65,23 @@ catalog the first time takes ~3 min.
 
 ## Packaging
 
-`build.bat` (or `pyinstaller TarkovStashHelper.spec`, which is what CI runs) produces the single
-file `dist\TarkovStashHelper.exe` in an isolated venv. The release exe is the **lean** flavour:
-no torch/transformers, so stage 1 runs on the CPU and DINO is off (the engine degrades by itself;
-measured on 12 labelled screenshots: end-to-end 96.3% vs 97.1%, sell decision 97.0% vs 98.0%),
-and it is ~74 MB. `TarkovStashHelper.exe --selftest [report.json]` checks a built exe without
-opening the window (bundled templates and `identify/assets`, data dir, engine imports). `data/`
-always lives next to the exe, so settings and the item database survive updates.
+`build.bat` (or `python scripts/vendor_tesseract.py` then `pyinstaller TarkovStashHelper.spec`, which is what
+CI runs) produces the single file `dist\TarkovStashHelper.exe` in an isolated venv. The release exe is the
+**lean** flavour: no torch/transformers, so stage 1 runs on the CPU and DINO is off (the engine degrades by
+itself; measured on 12 labelled screenshots: end-to-end 96.3% vs 97.1%, sell decision 97.0% vs 98.0%).
+
+It bundles Tesseract OCR (UB Mannheim build 5.4.0, Apache-2.0; `scripts/vendor_tesseract.py` unpacks the pinned,
+SHA-256-checked installer with 7-Zip without installing it and keeps only `tesseract.exe`, its DLLs and
+`eng.traineddata`, about 39 MB zipped). `tess.py` unpacks it once into the data folder; a Tesseract on PATH or
+in Program Files is only the fallback. `TarkovStashHelper.exe --selftest [report.json]` checks a built exe
+without opening the window (bundled templates and `identify/assets`, data dir, engine imports, and that the
+bundled Tesseract really reads text; CI runs it before publishing).
+
+Data lives in `%LOCALAPPDATA%\TarkovStashHelper` (`paths.py`) wherever the exe sits, so settings and the item
+database survive moving, re-downloading and self-updates. An older install that kept `data\` next to the exe is
+moved there on first start. If that folder isn't writable the system temp folder is used. The environment
+variable `TSH_DATA_DIR` overrides the location (tests, portable use); running from source keeps using
+`<repo>\data`.
 
 ## How it works
 
@@ -99,8 +122,7 @@ the normal sell scan on the **whole frame** - no capture region, no hotkey, no s
 refreshes the picture and action list by itself when a new result arrives, and the status pill in the header says
 what the watcher is doing ("Tarkov not running" / "Watching" / "Scanning..." / "Updated 12 s ago"). **Scan now**
 (or the scan hotkey) rescans the view on screen.
-Turn it off in Settings, or `"auto_scan": false` in `data/settings.json`
-(`"auto_scan_exe"` overrides the process name).
+Turn it off in Settings (`auto_scan_exe` in the settings file overrides the process name).
 
 **Live view.** The page subscribes to `GET /api/autoscan/stream` (Server-Sent Events: `{"seq", "state", "scene"}`
 on every new result / state change; the 1.5 s status poll stays as the fallback), fetches the lean result
@@ -190,8 +212,11 @@ come as `/api/v2/needs`. The other `/api/...` routes are the app's internals and
 
 ## Known limitations
 
-- Windows only (screen capture region math, hotkey listener, and the default
-  Tesseract path are all Windows-specific).
+- Windows only (screen capture, hotkey listener, tray and start-up registration are Windows-specific).
+- Item labels in Russian, Japanese, Korean and Chinese clients can't be read (picture-only identification).
+  Latin-script languages other than English use tarkov.dev's translated short names; they are supported but
+  have only been verified with an English client. The Steam install is found from Steam's own library files;
+  that and display scaling above 100 % have been unit-tested but not checked on real hardware.
 - OCR accuracy depends on screen resolution/scaling — a native-resolution
   capture of the stash region reads noticeably better than a downscaled one.
 - v2 needs about 50 px/slot or more (1080p UI scale 80%+) and, for JPEG captures, quality 70+;

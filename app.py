@@ -32,6 +32,7 @@ import numpy as np
 import sellcalc
 import tarkovdata
 import lifecycle    # open/close with the game (stdlib + ctypes only)
+import gamelang    # the client's language (labels are printed in it)
 # The sell-advice economics live in sellcalc.py (pure functions); the historical
 # names stay importable from here (test_scan.py scores sell decisions via app.*).
 from sellcalc import (best_trader_price, calc_flea_fee, price_420, flea_block_reason,  # noqa: F401
@@ -41,10 +42,9 @@ APP_VERSION = '0.4.5'
 
 FROZEN = getattr(sys, 'frozen', False)
 
-# When run from source, data/ lives next to app.py. When packaged with
-# PyInstaller (--onefile), __file__ resolves inside the temp extraction dir,
-# so data/ must instead live next to the .exe or user settings/caches would
-# vanish every launch.
+# Where data lives is decided by paths.py: <repo>/data from source, %LOCALAPPDATA%\TarkovStashHelper
+# when packaged (a --onefile exe's __file__ is a temp extraction dir that vanishes every launch, and
+# the folder the exe happens to sit in may be read-only or move).
 if FROZEN:
     BASE = os.path.dirname(sys.executable)
     # templates/ (and any other bundled read-only assets) still ship inside
@@ -56,7 +56,8 @@ else:
 
 app = Flask(__name__, template_folder=os.path.join(BUNDLE, 'templates'))
 
-DATA = os.path.join(BASE, 'data')
+import paths    # noqa: E402
+DATA = paths.default_data_dir()   # %LOCALAPPDATA%\TarkovStashHelper when packaged (never next to the exe); TSH_DATA_DIR overrides
 SETTINGS_PATH  = os.path.join(DATA, 'settings.json')
 KEEPLIST_PATH  = os.path.join(DATA, 'keep_list.json')
 PRICES_PATH    = os.path.join(DATA, 'prices_cache.json')
@@ -69,14 +70,9 @@ TMPL_SRC_DIR   = os.path.join(DATA, 'tmpl_src')        # transparent per-slot ba
 os.makedirs(DATA, exist_ok=True)
 os.makedirs(TMPL_SRC_DIR, exist_ok=True)
 
-# Tesseract-OCR is an external (non-pip) dependency the user must install
-# separately. pytesseract only finds it automatically if it's on PATH; fall
-# back to the default Windows install location so a fresh setup doesn't
-# require manually editing PATH.
-if not shutil.which(pytesseract.pytesseract.tesseract_cmd):
-    _default_tesseract = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-    if os.path.exists(_default_tesseract):
-        pytesseract.pytesseract.tesseract_cmd = _default_tesseract
+# Tesseract OCR ships inside the exe (tess.py); a copy on PATH / in the usual folders is the fallback.
+import tess    # noqa: E402
+tess.configure(pytesseract, data_dir=DATA)
 
 PRICE_CACHE_TTL      = 1800  # seconds (30 min): older and a scan refreshes on demand (the refresher normally beats this)
 PRICE_REFRESH_INTERVAL = 900   # seconds (15 min): background refresh of items/prices (a 304 when nothing changed)
@@ -398,7 +394,7 @@ def refresh_prices(force=False, source=None):
             meta['etags'] = {}
         try:
             try:
-                res = tarkovdata.refresh_prices(path, meta, previous, source=source)
+                res = tarkovdata.refresh_prices(path, meta, previous, source=source, lang=_label_lang_doc())
                 res['source'] = tarkovdata.SOURCE_NAME
             except Exception as json_err:      # network, bad payload, a converter bug: all fall back
                 if pve:
@@ -730,11 +726,9 @@ def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None, on_p
     from identify.pipeline import Engine
     if not os.path.exists(PRICES_PATH) or next(os.scandir(TMPL_SRC_DIR), None) is None:
         # clean install: the catalog is built from the price list + tarkov.dev base images
-        raise ScanError("The item database isn't built yet. Open the Sell Advisor page and click "
-                        "'Build Icon DB' first (needs internet; takes a few minutes the first time).")
-    es = EngineSettings.from_settings(settings)
-    if tesseract_path_override():
-        es.tesseract_cmd = tesseract_path_override()
+        raise ScanError("The item database is still being set up. It builds itself the first time "
+                        "(a few minutes, needs internet) - try again when the banner on Live is gone.")
+    es = _engine_settings(settings)
     key = repr(es)
     if _v2_engine[0] != key:
         _v2_engine[:] = [key, Engine(es)]
@@ -791,6 +785,54 @@ def _region_grids(res):
         out.append({'panel': pi, 'role': reg.role, 'cols': panel.n_cols, 'rows': panel.n_rows,
                     'clip_bottom': bool(panel.clip_bottom), 'cells': cells})
     return out
+
+
+def _game_language(settings=None):
+    """The client's language (gamelang.describe): Game.ini, the launcher's setting, else English."""
+    try:
+        return gamelang.detect((settings or _global_raw()).get('game_language') or None)
+    except Exception:                                          # noqa: BLE001
+        return gamelang.describe('en')
+
+
+def _label_lang_doc():
+    """tarkov.dev translation suffix whose short names the stash labels use (None: English, or
+    a language whose labels cannot be read, where the picture alone identifies items)."""
+    lang = _game_language()
+    return lang['doc'] if (lang['supported'] and lang['label_ok']) else None
+
+
+def _engine_settings(settings):
+    """EngineSettings for the current machine: the Tesseract that was found, and picture-only
+    identification when the client's labels are in a script that cannot be read."""
+    from identify.config import EngineSettings
+    es = EngineSettings.from_settings(settings)
+    if tesseract_path_override():
+        es.tesseract_cmd = tesseract_path_override()
+    lang = _game_language(settings)
+    if not (lang['supported'] and lang['label_ok']):
+        es.use_ocr = False
+        es.extra = {**es.extra, 'label_anchor': False}
+    else:
+        es.extra = {**es.extra, 'font': _font_ready(settings)}    # a game installed later rebuilds the engine once
+    return es
+
+
+_font_try = {'at': -1e9, 'ok': False}
+
+
+def _font_ready(settings=None):
+    """True once the game's label font is extracted into data/fonts (done here, from the install
+    found via the setting / BSG launcher / Steam).  Without the game it is retried every 60 s."""
+    from identify import fontlabel
+    fontlabel.INSTALL_OVERRIDE = (settings or {}).get('eft_install_dir') or None
+    if not _font_try['ok'] and time.time() - _font_try['at'] > 60:
+        _font_try['at'] = time.time()
+        try:
+            _font_try['ok'] = fontlabel.ensure_font(log=lambda *a: print('[font]', *a)) is not None
+        except Exception as e:                                  # noqa: BLE001
+            print(f'[font] {e}')
+    return _font_try['ok']
 
 
 def tesseract_path_override():
@@ -867,6 +909,7 @@ def default_settings():
         'kappa_only_tasks': False,
         'auto_task_progress': True,  # read completed/failed quests from EFT's logs (eftlogs.py)
         'eft_install_dir': None,     # None = find the install via the registry / common paths
+        'game_language': None,       # None = the client's language (Game.ini); a client code ('de', 'ru', ...) overrides
         'game_mode': 'auto',         # 'auto' (the mode the game log says) | 'pvp' | 'pve' | 'season'
         'faction': 'auto',           # 'auto' (from faction-only quests in the logs) | 'BEAR' | 'USEC'
         'debug_dumps': True,  # save raw frame + detections of the last few scans under data/debug/
@@ -2165,8 +2208,8 @@ def run_keep_scan(from_calibration=False):
                       for cat in keep_list['categories'] for e in cat['items']}
 
         if not tesseract_available():
-            warnings.append('Tesseract OCR not installed — label reading disabled '
-                            '(winget install UB-Mannheim.TesseractOCR)')
+            warnings.append('The text reader is missing - item names cannot be read '
+                            '(download the app again from the Releases page).')
 
         img, img_bgr = capture_for_scan(settings, from_calibration,
                                         require_region=False, warnings=warnings)
@@ -2586,7 +2629,7 @@ _SETTING_RULES = {
     'intel_center_level': _s_int(0, 3, nullable=True), 'hideout_management_level': _s_int(0, 51),
     'skip_traders': _s_name_list, 'trader_levels': _s_trader_levels,
     'auto_scan': _s_bool, 'auto_scan_in_raid': _s_bool, 'auto_scan_exe': _s_text,
-    'auto_task_progress': _s_bool, 'eft_install_dir': _s_text,
+    'auto_task_progress': _s_bool, 'eft_install_dir': _s_text, 'game_language': _s_text,
     'game_mode': _s_enum(('auto', 'pvp', 'pve', 'season')), 'faction': _s_enum(('auto', 'BEAR', 'USEC')),
     'start_with_windows': _s_bool, 'follow_tarkov': _s_bool, 'show_window_on_game_start': _s_bool,
     'ignore_task_items': _s_bool, 'ignore_hideout_items': _s_bool,
@@ -3144,8 +3187,10 @@ def start_icon_db_build(reason='manual'):
 
 
 def _has_catalog():
-    """True once this install has built its item catalog (so the app should keep it current)."""
-    return catalog_summary() is not None
+    """True once this install has built a usable item catalog (so the app should keep it current).
+    A catalog with no tarkov.dev item in it (built before the pictures were downloaded) does not count."""
+    summary = catalog_summary()
+    return bool(summary and summary['items'] > 0)
 
 
 def _queue_catalog_update():
@@ -3180,6 +3225,136 @@ def icons_matcher_status():
         'ready':      summary is not None,
         'item_count': summary['items'] if summary else 0,
     })
+
+
+# ---------------------------------------------------------------------------
+# First run / machine differences: ONE plain sentence (and at most one button) per problem
+# ---------------------------------------------------------------------------
+
+_OFFLINE_HINTS = ('connection', 'resolve', 'timed out', 'timeout', 'getaddrinfo', 'unreachable', 'max retries',
+                  'name or service', 'network', 'ssl', 'http')
+
+
+def plain_error(msg):
+    """A raw error string as a sentence for the user (details stay in data/app.log)."""
+    low = str(msg or '').lower()
+    if any(h in low for h in _OFFLINE_HINTS):
+        return "Can't reach tarkov.dev - check your internet connection."
+    return 'Something went wrong while downloading the item data.'
+
+
+_prices_flags_memo = {'sig': None, 'val': (False, None)}
+
+
+def _prices_flags():
+    """(prices cache usable, its label_lang_error) - re-read only when the file changed."""
+    try:
+        st = os.stat(PRICES_PATH)
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return False, None
+    if _prices_flags_memo['sig'] != sig:
+        cache = _usable_prices(_load_cache(PRICES_PATH))
+        _prices_flags_memo.update(sig=sig, val=(bool(cache), (cache or {}).get('label_lang_error')))
+    return _prices_flags_memo['val']
+
+
+def setup_status():
+    """What the first run is doing, or what stops it, for the banner on Live:
+    ``{'busy': 'text'|None, 'pct': 0-100|None, 'problem': {'text', 'button': {'label','action'}|None}|None,
+    'notices': [str]}``.  Never raises; a problem always has a plain sentence and, when the user can do
+    something about it, one button."""
+    out = {'busy': None, 'pct': None, 'problem': None, 'notices': []}
+    try:
+        lang = _game_language()
+        note = gamelang.notice(lang)
+        if note:
+            out['notices'].append(note)
+        st = _index_build_state
+        have_prices, label_err = _prices_flags()
+        if label_err and lang['supported'] and lang['label_ok'] and lang['doc']:
+            out['notices'].append(f"Couldn't download the item names in {lang['name']}, so English names are used.")
+        err = (_rstate('prices', tarkovdata.DEFAULT_SOURCE) or {}).get('error')
+        if st['running']:
+            if st.get('phase') == 'images':
+                out['busy'] = 'Downloading item pictures'
+                out['pct'] = round(100 * st['done'] / st['total']) if st['total'] else 0
+            elif st.get('phase') == 'catalog':
+                out['busy'] = 'Building the item database'
+            else:
+                out['busy'] = 'Starting the item reader'
+        elif not _has_catalog():
+            if st.get('error') or (not have_prices and err):
+                out['problem'] = {'text': plain_error(st.get('error') or err) + ' The item database is not built yet.',
+                                  'button': {'label': 'Try again', 'action': 'build'}}
+            else:
+                out['busy'] = 'Downloading item prices' if not have_prices else 'Getting ready'
+        if out['problem'] is None and not tesseract_available():
+            out['problem'] = {'text': "Item names can't be read because the text reader is missing. "
+                                      "Download the app again from the Releases page.", 'button': None}
+        if out['problem'] is None and not _eft_install_dir():
+            if not eftlogs.find_install_dir(_global_raw().get('eft_install_dir') or None, require_logs=False):
+                out['problem'] = {'text': 'Tarkov not found.',
+                                  'button': {'label': 'Choose folder', 'action': 'choose-folder'}}
+    except Exception as e:                                    # noqa: BLE001
+        print(f'[setup] status failed: {e}')
+    return out
+
+
+@app.route('/api/setup', methods=['GET'])
+def api_setup():
+    return jsonify(setup_status())
+
+
+@app.route('/api/setup/retry', methods=['POST'])
+def api_setup_retry():
+    """The "Try again" button: forget the back-off and build (downloading the data first if needed)."""
+    _first_build.update(at=0.0, tries=0)
+    _index_build_state['error'] = None
+    for kind in ('prices', 'tasks'):
+        try:
+            _rstate(kind, tarkovdata.DEFAULT_SOURCE)['attempt'] = 0
+        except Exception:                                      # noqa: BLE001
+            pass
+    start_icon_db_build('manual')
+    return jsonify({'ok': True})
+
+
+@app.route('/api/setup/choose-folder', methods=['POST'])
+def api_setup_choose_folder():
+    """The "Choose folder" button: pick the Tarkov folder in a normal Windows dialog."""
+    window = _desktop.get('window')
+    if window is None:
+        return jsonify({'ok': False, 'error': 'Open the app window first, then try again.'})
+    try:
+        import webview
+        picked = window.create_file_dialog(webview.FOLDER_DIALOG)
+    except Exception as e:                                    # noqa: BLE001
+        print(f'[setup] folder dialog failed: {e}')
+        return jsonify({'ok': False, 'error': "Couldn't open the folder picker."})
+    if not picked:
+        return jsonify({'ok': False, 'cancelled': True})
+    return jsonify(set_install_dir(picked[0] if isinstance(picked, (list, tuple)) else picked))
+
+
+def set_install_dir(path):
+    """Use ``path`` as the Tarkov folder if it is one (the folder with EscapeFromTarkov.exe, or its
+    Logs / EscapeFromTarkov_Data folder, or the launcher's games folder that contains it)."""
+    path = os.path.normpath(str(path or '').strip().strip('"'))
+    found = None
+    for cand in (path, os.path.dirname(path), os.path.join(path, eftlogs.GAME_NAME), os.path.join(path, 'EFT')):
+        if eftlogs.is_install(cand) or eftlogs._has_logs(cand):
+            found = cand
+            break
+    if not found:
+        return {'ok': False, 'error': "That folder doesn't look like Tarkov (EscapeFromTarkov.exe not found in it)."}
+    s = _global_raw()
+    s['eft_install_dir'] = found
+    _save_settings(s)
+    _install_cache['at'] = -1e9
+    _font_try.update(at=-1e9, ok=False)
+    threading.Thread(target=scan_task_logs, kwargs={'full': True}, daemon=True).start()
+    return {'ok': True, 'dir': found}
 
 
 @app.route('/api/sell-scan', methods=['POST'])
@@ -3452,10 +3627,10 @@ def _startup_maintenance():
 
 def _warm_v2_engine():
     try:
-        if os.path.exists(PRICES_PATH):
-            from identify.config import EngineSettings
+        # a clean install has prices before it has pictures: the first-run build warms the engine itself
+        if os.path.exists(PRICES_PATH) and next(os.scandir(TMPL_SRC_DIR), None) is not None:
             from identify.pipeline import Engine
-            es = EngineSettings.from_settings(_load_settings())
+            es = _engine_settings(_load_settings())
             _v2_engine[:] = [repr(es), Engine(es)]
             print('[v2] identification engine ready')
     except Exception as e:
@@ -3472,7 +3647,8 @@ def _refresh_due(kind, path, interval, meta, now, source=tarkovdata.DEFAULT_SOUR
     included - is at least RETRY_BACKOFF (or the interval, if shorter) back."""
     cache = _load_cache(path)
     confirmed = max((cache or {}).get('timestamp', 0), meta['checked'].get(kind) or 0) if cache else 0
-    if now - confirmed < interval:
+    wrong_language = bool(cache) and kind == 'prices' and (cache.get('label_lang') or None) != _label_lang_doc()
+    if now - confirmed < interval and not wrong_language:
         return False
     attempt = max(meta['attempted'].get(kind) or 0, _rstate(kind, source)['attempt'])
     return now - attempt >= min(RETRY_BACKOFF, interval)
@@ -3511,12 +3687,31 @@ def refresh_cycle(now=None):
     return ran
 
 
+_first_build = {'at': 0.0, 'tries': 0}
+
+
+def _maybe_first_build(now):
+    """A clean install has no item catalog: build it by itself, without anyone clicking.  A failed
+    attempt (no internet, tarkov.dev down) is retried with a growing pause, 5 min up to 1 h."""
+    if _index_build_state['running'] or _has_catalog():
+        return False
+    wait = min(RETRY_BACKOFF * 2 ** max(0, _first_build['tries'] - 1), 3600) if _first_build['tries'] else 0
+    if now - _first_build['at'] < wait:
+        return False
+    _first_build.update(at=now, tries=_first_build['tries'] + 1)
+    return start_icon_db_build('first run')
+
+
 _refresher = {'thread': None, 'stop': threading.Event()}
 
 
 def _refresher_loop(stop, poll=60):
     while not stop.is_set():
         refresh_cycle()
+        try:
+            _maybe_first_build(time.time())          # only the real app: unit tests call refresh_cycle directly
+        except Exception as e:                       # noqa: BLE001
+            print(f'[refresh] first catalog build: {e}')
         stop.wait(poll)
 
 
@@ -3695,6 +3890,8 @@ def _run_app():
 
 
 if __name__ == '__main__':
+    import dpi
+    DPI_MODE = dpi.ensure()     # per-monitor aware before any window or screen capture (125 % / 150 % desktops, mixed-DPI monitors)
     if '--selftest' in sys.argv:    # packaged-build smoke test: no window/tray/hotkey (selftest.py)
         import selftest
         sys.exit(selftest.main(sys.modules[__name__], sys.argv[sys.argv.index('--selftest') + 1:]))

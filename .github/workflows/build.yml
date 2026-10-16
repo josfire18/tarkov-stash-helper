@@ -30,6 +30,21 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pyinstaller
 
+      # Tesseract OCR travels inside the exe (nobody installs anything): download the pinned UB Mannheim
+      # installer, unpack it with 7-Zip (not installed), keep tesseract.exe + its DLLs + eng.traineddata
+      # and zip them to vendor/tesseract.zip, which the spec bundles.  Cached by the script's hash (it
+      # pins the installer version and SHA-256).
+      - name: Cache Tesseract bundle
+        id: tess-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: tesseract-bundle-${{ hashFiles('scripts/vendor_tesseract.py') }}
+
+      - name: Prepare bundled Tesseract
+        if: steps.tess-cache.outputs.cache-hit != 'true'
+        run: python scripts/vendor_tesseract.py
+
       - name: Unit tests
         run: python -m pytest tests -q
 
@@ -41,13 +56,18 @@ jobs:
         run: pyinstaller --noconfirm --clean TarkovStashHelper.spec
 
       # Runs the built exe without opening a window: checks that templates, identify/assets,
-      # the desktop-shell modules and the engine imports survived packaging.
+      # the desktop-shell modules, the engine imports and the bundled Tesseract survived packaging.
       - name: Smoke-test the exe
         shell: pwsh
         run: |
+          # TSH_DATA_DIR: a throw-away data folder, as on a clean machine (the bundled Tesseract unpacks
+          # into it and must read text; the selftest requires that in a packaged build)
+          $env:TSH_DATA_DIR = Join-Path $env:RUNNER_TEMP 'tsh-selftest-data'
           $p = Start-Process dist\TarkovStashHelper.exe -ArgumentList '--selftest','selftest.json' -Wait -PassThru
           if (Test-Path selftest.json) { Get-Content selftest.json }
           if ($p.ExitCode -ne 0) { throw "selftest failed (exit code $($p.ExitCode))" }
+          $r = Get-Content selftest.json -Raw | ConvertFrom-Json
+          if (-not $r.checks.tesseract.ok) { throw "bundled Tesseract failed: $($r.checks.tesseract.detail)" }
           Get-Item dist\TarkovStashHelper.exe | Select-Object Name, Length
 
       - uses: actions/upload-artifact@v4
@@ -61,3 +81,6 @@ jobs:
         with:
           files: dist/TarkovStashHelper.exe
           generate_release_notes: true
+          body: |
+            **Download `TarkovStashHelper.exe` below and double-click it.** If Windows says "Windows protected your PC", click **More info**, then **Run anyway** (the exe isn't code-signed). Nothing else to install: the first start sets itself up in a few minutes.
+

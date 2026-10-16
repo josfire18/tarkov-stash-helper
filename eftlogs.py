@@ -81,39 +81,168 @@ _REGISTRY_KEYS = (
     (r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\EscapeFromTarkov', 'HKLM'),
     (r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\EscapeFromTarkov', 'HKCU'),
 )
+_UNINSTALL_ROOTS = (
+    (r'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM'),
+    (r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM'),
+    (r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU'),
+)
+_STEAM_KEYS = (
+    (r'Software\Valve\Steam', 'HKCU', 'SteamPath'),
+    (r'SOFTWARE\WOW6432Node\Valve\Steam', 'HKLM', 'InstallPath'),
+    (r'SOFTWARE\Valve\Steam', 'HKLM', 'InstallPath'),
+)
 _COMMON_SUBPATHS = (
     r'Battlestate Games\Escape from Tarkov',
     r'Games\Battlestate Games\Escape from Tarkov',
     r'Program Files\Battlestate Games\Escape from Tarkov',
     r'Program Files (x86)\Battlestate Games\Escape from Tarkov',
     r'Program Files (x86)\Steam\steamapps\common\Escape from Tarkov',
+    r'Program Files\Steam\steamapps\common\Escape from Tarkov',
     r'SteamLibrary\steamapps\common\Escape from Tarkov',
     r'Steam\steamapps\common\Escape from Tarkov',
+    r'Games\SteamLibrary\steamapps\common\Escape from Tarkov',
+    r'Games\Escape from Tarkov',
     r'EFT',
 )
+GAME_NAME = 'Escape from Tarkov'
+GAME_EXE_NAME = 'EscapeFromTarkov.exe'
+DATA_DIR_NAME = 'EscapeFromTarkov_Data'
+
+try:                                    # Windows only; tests replace it with a fake
+    import winreg
+except ImportError:                     # pragma: no cover
+    winreg = None
+
+
+def _hive(name):
+    return winreg.HKEY_LOCAL_MACHINE if name == 'HKLM' else winreg.HKEY_CURRENT_USER
+
+
+def _reg_values(hive, key, names):
+    """{value name: str} of the values that exist in a registry key ({} when it does not)."""
+    out = {}
+    if winreg is None:
+        return out
+    try:
+        with winreg.OpenKey(_hive(hive), key) as k:
+            for n in names:
+                try:
+                    v, _ = winreg.QueryValueEx(k, n)
+                except OSError:
+                    continue
+                v = str(v).strip().strip('"')
+                if v:
+                    out[n] = v
+    except OSError:
+        pass
+    return out
 
 
 def _registry_install_dirs():
-    """InstallLocation (or the folder of UninstallString) from the uninstall registry keys."""
-    if sys.platform != 'win32':
-        return []
-    try:
-        import winreg
-    except ImportError:
-        return []
+    """Battlestate launcher installs: InstallLocation (or the folder of UninstallString) from the
+    uninstall registry key."""
     out = []
     for key, hive in _REGISTRY_KEYS:
+        v = _reg_values(hive, key, ('InstallLocation', 'UninstallString'))
+        if 'InstallLocation' in v:
+            out.append(v['InstallLocation'])
+        if 'UninstallString' in v:
+            out.append(os.path.dirname(v['UninstallString']))
+    return out
+
+
+def _launcher_install_dirs(appdata=None):
+    """The BSG launcher records its games folder (``gamesRootDir``) in its own settings file; an
+    install moved to another drive is only known there."""
+    appdata = appdata if appdata is not None else os.environ.get('APPDATA')
+    if not appdata:
+        return []
+    try:
+        with open(os.path.join(appdata, 'Battlestate Games', 'BsgLauncher', 'settings'), encoding='utf-8') as f:
+            root = (json.load(f) or {}).get('gamesRootDir')
+    except (OSError, ValueError, AttributeError):
+        return []
+    if not root or not isinstance(root, str):
+        return []
+    return [os.path.join(root, GAME_NAME), os.path.join(root, 'EFT')]
+
+
+_VDF_PATH_RE = re.compile(r'"path"\s+"((?:[^"\\]|\\.)*)"', re.I)
+_ACF_RE = re.compile(r'"(name|installdir)"\s+"((?:[^"\\]|\\.)*)"', re.I)
+
+
+def _unvdf(s):
+    return s.replace('\\\\', '\\')
+
+
+def steam_library_dirs(steam_path):
+    """Every Steam library folder: Steam's own plus those in ``steamapps/libraryfolders.vdf``."""
+    out = [steam_path] if steam_path else []
+    try:
+        with open(os.path.join(steam_path, 'steamapps', 'libraryfolders.vdf'), encoding='utf-8', errors='replace') as f:
+            out += [_unvdf(m) for m in _VDF_PATH_RE.findall(f.read())]
+    except OSError:
+        pass
+    seen, uniq = set(), []
+    for d in out:
+        k = os.path.normcase(os.path.normpath(d))
+        if k not in seen:
+            seen.add(k)
+            uniq.append(os.path.normpath(d))
+    return uniq
+
+
+def _is_tarkov_folder_name(name):
+    n = name.lower()
+    return n.startswith(GAME_NAME.lower()) and 'arena' not in n
+
+
+def _steam_install_dirs():
+    """Steam installs: every library's ``steamapps/common/Escape from Tarkov*`` folder, plus the
+    folder named by an ``appmanifest_*.acf`` for the game (a renamed install dir), plus the
+    Steam app's own Uninstall key."""
+    out = []
+    steam = None
+    for key, hive, val in _STEAM_KEYS:
+        v = _reg_values(hive, key, (val,))
+        if v.get(val):
+            steam = v[val].replace('/', '\\')
+            break
+    for lib in steam_library_dirs(steam) if steam else []:
+        apps = os.path.join(lib, 'steamapps')
+        common = os.path.join(apps, 'common')
         try:
-            with winreg.OpenKey(getattr(winreg, 'HKEY_LOCAL_MACHINE' if hive == 'HKLM' else 'HKEY_CURRENT_USER'),
-                                key) as k:
-                for value in ('InstallLocation', 'UninstallString'):
+            for name in os.listdir(common):
+                if _is_tarkov_folder_name(name):
+                    out.append(os.path.join(common, name))
+        except OSError:
+            pass
+        try:
+            for fn in os.listdir(apps):
+                if fn.startswith('appmanifest_') and fn.endswith('.acf'):
+                    with open(os.path.join(apps, fn), encoding='utf-8', errors='replace') as f:
+                        kv = {k.lower(): _unvdf(v) for k, v in _ACF_RE.findall(f.read())}
+                    if kv.get('installdir') and _is_tarkov_folder_name(kv.get('name', '')):
+                        out.append(os.path.join(common, kv['installdir']))
+        except OSError:
+            pass
+    for key, hive in _UNINSTALL_ROOTS:                       # "Steam App <id>" entries
+        if winreg is None:
+            break
+        try:
+            with winreg.OpenKey(_hive(hive), key) as root:
+                i = 0
+                while True:
                     try:
-                        v, _ = winreg.QueryValueEx(k, value)
+                        sub = winreg.EnumKey(root, i)
                     except OSError:
+                        break
+                    i += 1
+                    if not sub.startswith('Steam App '):
                         continue
-                    v = str(v).strip().strip('"')
-                    if v:
-                        out.append(os.path.dirname(v) if value == 'UninstallString' else v)
+                    v = _reg_values(hive, key + '\\' + sub, ('DisplayName', 'InstallLocation'))
+                    if _is_tarkov_folder_name(v.get('DisplayName', '')) and v.get('InstallLocation'):
+                        out.append(v['InstallLocation'])
         except OSError:
             continue
     return out
@@ -129,19 +258,61 @@ def _has_logs(path):
     return bool(path) and os.path.isdir(os.path.join(path, LOG_DIR_NAME))
 
 
-def find_install_dir(override=None):
-    """The EFT install folder (the one that has ``Logs\\``): the ``eft_install_dir`` setting, then
-    the registry, then the usual places.  A setting that points at the ``Logs`` folder itself is
-    accepted too.  None when nothing is found."""
+def is_install(path):
+    """A folder that looks like an EFT install (the game exe or its data folder), Arena excluded."""
+    if not path or not os.path.isdir(path):
+        return False
+    if 'arena' in os.path.basename(os.path.normpath(path)).lower():
+        return False
+    return (os.path.isfile(os.path.join(path, GAME_EXE_NAME))
+            or os.path.isdir(os.path.join(path, DATA_DIR_NAME)))
+
+
+def _candidates(override=None):
+    out = []
     if override:
         o = os.path.normpath(str(override).strip().strip('"'))
-        if _has_logs(o):
-            return o
-        if os.path.basename(o).lower() == LOG_DIR_NAME.lower() and os.path.isdir(o):
-            return os.path.dirname(o)
-    for cand in _registry_install_dirs() + _common_install_dirs():
+        if os.path.basename(o).lower() == LOG_DIR_NAME.lower():
+            o = os.path.dirname(o)
+        out.append(o)
+    for fn in (_registry_install_dirs, _launcher_install_dirs, _steam_install_dirs, _common_install_dirs):
+        try:
+            out += fn()
+        except Exception:                                    # noqa: BLE001 - one broken source must not hide the rest
+            continue
+    seen, uniq = set(), []
+    for i, c in enumerate(out):
+        k = os.path.normcase(os.path.normpath(c))
+        if override and i == 0:                              # the user's own choice is never second-guessed
+            pass
+        elif 'arena' in os.path.basename(k):                 # Escape from Tarkov: Arena is another game
+            continue
+        if k not in seen:
+            seen.add(k)
+            uniq.append(os.path.normpath(c))
+    return uniq
+
+
+def install_candidates(override=None):
+    """Every folder that looks like an EFT install, best first (ones that have logs lead)."""
+    c = [d for d in _candidates(override) if is_install(d) or _has_logs(d)]
+    return sorted(c, key=lambda d: not _has_logs(d))
+
+
+def find_install_dir(override=None, require_logs=True):
+    """The EFT install folder: the ``eft_install_dir`` setting, then the BSG launcher's registry
+    key and settings file, Steam libraries, and the usual places on every drive.  A setting that
+    points at the ``Logs`` folder itself is accepted too.  With ``require_logs`` (the log reader)
+    the folder must have been played from at least once (``Logs\\`` exists); without it any
+    install qualifies (font extraction), preferring one that has logs.  None when nothing is found."""
+    cands = _candidates(override)
+    for cand in cands:
         if _has_logs(cand):
-            return os.path.normpath(cand)
+            return cand
+    if not require_logs:
+        for cand in cands:
+            if is_install(cand):
+                return cand
     return None
 
 

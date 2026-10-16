@@ -18,6 +18,9 @@ build/
 data/*
 !data/.gitkeep
 
+# Tesseract OCR copy the exe bundles (scripts/vendor_tesseract.py downloads + prepares it)
+vendor/
+
 # Virtual envs
 venv/
 .venv/

@@ -32,6 +32,11 @@ if not exist "%VENV%\Scripts\python.exe" (
 echo Regenerating app icon...
 "%VENV%\Scripts\python.exe" icon_asset.py || exit /b 1
 
+if not exist "vendor	esseract.zip" (
+  echo Fetching the Tesseract OCR copy the exe bundles...
+  "%VENV%\Scripts\python.exe" scriptsendor_tesseract.py || exit /b 1
+)
+
 echo Building TarkovStashHelper.exe (%TSH_FLAVOUR%)...
 "%VENV%\Scripts\python.exe" -m PyInstaller --noconfirm --clean TarkovStashHelper.spec || exit /b 1
 

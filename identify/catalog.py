@@ -220,7 +220,7 @@ def _items_signature(prices_path: str) -> str:
     try:
         with open(prices_path, encoding='utf-8') as f:
             items = json.load(f)['items']
-        rows = sorted((it['id'], it.get('name') or '', it.get('shortName') or '',
+        rows = sorted((it['id'], it.get('name') or '', it.get('labelShort') or it.get('shortName') or '',
                        it.get('backgroundColor') or '', it.get('width'), it.get('height'),
                        sorted(it.get('types') or ())) for it in items)
         return hashlib.sha1(json.dumps(rows).encode()).hexdigest()
@@ -270,7 +270,7 @@ def build_catalog(prices_path: str = PRICES_PATH, tmpl_dir: str = TMPL_SRC_DIR,
             img = cv2.resize(img, (SLOT * W + 1, SLOT * H + 1), interpolation=cv2.INTER_AREA)
         prem, al = to_stage1(img, W, H)
         r = len(rows)
-        rows.append(dict(id=it['id'], name=it.get('name') or '', short=it.get('shortName') or '',
+        rows.append(dict(id=it['id'], name=it.get('name') or '', short=it.get('labelShort') or it.get('shortName') or '',
                          tint=it.get('backgroundColor') or 'default',
                          cat=category_of(it.get('types')), src='api', W=W, H=H,
                          preset='preset' in (it.get('types') or ())))
@@ -357,7 +357,7 @@ def build_catalog(prices_path: str = PRICES_PATH, tmpl_dir: str = TMPL_SRC_DIR,
                                cat=base['cat'], preset=base['preset'])
                 else:
                     it = item_by_id[iid]
-                    row = dict(id=iid, name=it.get('name') or '', short=it.get('shortName') or '',
+                    row = dict(id=iid, name=it.get('name') or '', short=it.get('labelShort') or it.get('shortName') or '',
                                tint=it.get('backgroundColor') or 'default', cat=category_of(it.get('types')),
                                preset='preset' in (it.get('types') or ()))
                 r = len(rows)

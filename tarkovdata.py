@@ -261,10 +261,13 @@ def refresh_traders(meta, source=DEFAULT_SOURCE):
 # Items / prices / rules
 # ---------------------------------------------------------------------------
 
-def convert_items(items_body, en_body, trader_names):
+def convert_items(items_body, en_body, trader_names, label_body=None):
     """The ``items`` document -> ``(records, skipped)`` in the old ``PRICE_QUERY`` shape.
-    Items whose name cannot be resolved are skipped (counted) rather than guessed."""
+    Items whose name cannot be resolved are skipped (counted) rather than guessed.  With
+    ``label_body`` (an ``items_<lang>`` document) a record whose short name differs in that
+    language also carries ``labelShort``: the text the client prints on the stash tile."""
     tr = translator(en_body)
+    tr_label = translator(label_body) if label_body else None
     out, skipped = [], 0
     for iid, it in ((items_body.get('data') or {}).get('items') or {}).items():
         name = tr(it.get('name'))
@@ -285,6 +288,7 @@ def convert_items(items_body, en_body, trader_names):
         if last_low and 'noFlea' not in types:
             sell_for.append({'vendor': {'name': 'Flea Market'}, 'price': last_low,
                              'currency': 'RUB', 'priceRUB': last_low})
+        label = tr_label(it.get('shortName')) if tr_label else None
         out.append({
             'id': it.get('id') or iid, 'name': name, 'shortName': short,
             'basePrice': it.get('basePrice'), 'avg24hPrice': it.get('avg24hPrice'),
@@ -292,6 +296,7 @@ def convert_items(items_body, en_body, trader_names):
             'iconLink': it.get('iconLink'), 'width': it.get('width'), 'height': it.get('height'),
             'backgroundColor': it.get('backgroundColor'), 'gridImageLink': it.get('gridImageLink'),
             'baseImageLink': it.get('baseImageLink'), 'types': types, 'sellFor': sell_for,
+            **({'labelShort': label} if label and label != short else {}),
         })
     return out, skipped
 
@@ -322,25 +327,60 @@ def validate_items(items, previous_items=None, skipped=0):
         raise SourceError('too few items carry image links and sizes')
 
 
-def refresh_prices(prices_path, meta, previous, now=None, source=DEFAULT_SOURCE):
+def fetch_docs(meta, docs, conditional, source=DEFAULT_SOURCE):
+    """Several documents, conditionally.  ``None`` when all are unchanged; otherwise
+    ``(bodies, etags)`` with every document fetched (one that was unchanged is fetched again,
+    unconditionally: a data set cannot be converted from part of its documents)."""
+    etags = meta['etags'] if conditional else {}
+    got = [fetch_doc(d, etags.get(d), source=source) for d in docs]
+    if all(g[0] == 'unchanged' for g in got):
+        return None
+    for i, g in enumerate(got):
+        if g[0] == 'unchanged':
+            got[i] = fetch_doc(docs[i], source=source)
+    return [g[1] for g in got], {d: g[2] for d, g in zip(docs, got)}
+
+
+def refresh_prices(prices_path, meta, previous, now=None, source=DEFAULT_SOURCE, lang=None):
     """Bring ``prices_path`` up to date from json.tarkov.dev.
 
     ``previous`` is the cache currently on disk (None if absent or unusable; then nothing is
-    conditional).  Returns ``{'status': 'unchanged'|'updated', 'cache': dict, 'new_ids': [...]}``.
+    conditional).  ``lang`` is a tarkov.dev translation suffix (``'de'``): the records then carry
+    ``labelShort`` (the short name as the client prints it) and the cache says which language it
+    holds (``label_lang``); a failed translation download keeps English and records
+    ``label_lang_error`` instead of failing the refresh.  Returns
+    ``{'status': 'unchanged'|'updated', 'cache': dict, 'new_ids': [...]}``.
     Raises SourceError and leaves the cache and the stored ETags untouched when the data is
     unreachable or fails validation.  The caller saves the meta."""
     now = time.time() if now is None else now
     prev_items = (previous or {}).get('items') or None
-    conditional = bool(prev_items)
+    lang = lang or None
+    # a cache holding another language than the one wanted is converted again
+    conditional = (bool(prev_items) and (previous or {}).get('label_lang') == lang
+                   and not (previous or {}).get('label_lang_error'))
     trader_names, trader_rules = refresh_traders(meta, source)
-    got = fetch_pair(meta, 'items', 'items_en', conditional, source)
+    label_doc = f'items_{lang}' if lang else None
+    label_err = None
+    try:
+        got = fetch_docs(meta, ['items', 'items_en'] + ([label_doc] if label_doc else []), conditional, source)
+    except SourceError as e:
+        if not label_doc:
+            raise
+        label_err, label_doc = str(e), None              # translation unavailable: English labels
+        got = fetch_docs(meta, ['items', 'items_en'], conditional, source)
     if got is None:
         meta['checked']['prices'] = now
         return {'status': 'unchanged', 'cache': previous, 'new_ids': []}
-    items_body, en_body, etags = got
-    items, skipped = convert_items(items_body, en_body, trader_names)
+    bodies, etags = got
+    items_body, en_body = bodies[0], bodies[1]
+    label_body = bodies[2] if label_doc else None
+    items, skipped = convert_items(items_body, en_body, trader_names, label_body)
     validate_items(items, prev_items, skipped)
     cache = {'timestamp': now, 'source': SOURCE_NAME, 'items': items}
+    if label_body:
+        cache['label_lang'] = lang
+    elif label_err:
+        cache['label_lang_error'] = label_err
     if source != DEFAULT_SOURCE:
         cache['data_source'] = source
     rules = convert_rules(items_body, trader_rules) or (previous or {}).get('rules')

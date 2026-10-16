@@ -9,8 +9,9 @@ reading stack counts).  This runs every such check without opening the window, t
 or the hotkey listener, writes a JSON report (a windowed exe has no console) and exits 0 when
 every *required* check passed.  CI runs it against the freshly built exe before publishing it.
 
-Checks marked ``required`` fail the run; the others (Tesseract, torch) are reported only,
-because a lean build is *meant* to run without torch and CI has no Tesseract.
+Checks marked ``required`` fail the run; the others (torch, the machine report) are reported only,
+because a lean build is *meant* to run without torch.  Tesseract is required in a packaged build (the
+exe bundles it) and reported only from source.
 """
 from __future__ import annotations
 
@@ -44,7 +45,7 @@ def run(app_mod) -> dict:
     C = report['checks']
 
     def paths():
-        # data/ must be the same folder for the app and the engine, and next to the exe when frozen
+        # data/ must be the same folder for the app and the engine (and not depend on where the exe sits)
         assert os.path.normcase(config.DATA_DIR) == os.path.normcase(app_mod.DATA), \
             f'engine data dir {config.DATA_DIR} != app data dir {app_mod.DATA}'
         if report['frozen']:
@@ -143,10 +144,33 @@ def run(app_mod) -> dict:
     _check(C, 'catalog_sources', catalog)
 
     def tesseract():
+        # The release exe carries its own Tesseract (tess.py): in a packaged build this is REQUIRED and
+        # must actually read text, so a bundle that lost a DLL or the language data fails CI.
+        import cv2
+        import numpy as np
+        import tess
         ok = bool(app_mod.tesseract_available())
-        assert ok, 'Tesseract not found (install it: winget install UB-Mannheim.TesseractOCR)'
-        return app_mod.pytesseract.pytesseract.tesseract_cmd
-    _check(C, 'tesseract', tesseract, required=False)
+        assert ok, 'Tesseract not found'
+        cmd = app_mod.pytesseract.pytesseract.tesseract_cmd
+        if report['frozen']:
+            assert os.path.normcase(cmd).startswith(os.path.normcase(os.path.join(app_mod.DATA, 'tesseract'))),                 f'frozen build is not using its bundled Tesseract: {cmd}'
+        img = np.full((60, 260, 3), 255, np.uint8)
+        cv2.putText(img, 'AK74 MAG', (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 0), 2, cv2.LINE_AA)
+        text = app_mod.pytesseract.image_to_string(img, config='--psm 7').strip().upper().replace(' ', '')
+        assert 'AK74' in text and 'MAG' in text, f'OCR read {text!r}'
+        return {'cmd': cmd, 'read': text, 'bundled': bool(tess.bundled_dir(app_mod.DATA, getattr(sys, "_MEIPASS", None)))}
+    _check(C, 'tesseract', tesseract, required=report['frozen'])
+
+    def machine():
+        # What differs between machines, reported (never failing): DPI awareness, the game install
+        # and the client language the app found, the data folder in use.
+        import dpi
+        import eftlogs
+        import gamelang
+        return {'dpi': dpi.current(), 'install': eftlogs.find_install_dir(require_logs=False),
+                'language': gamelang.detect(), 'data_dir': app_mod.DATA,
+                'setup': app_mod.setup_status()}
+    _check(C, 'machine', machine, required=False)
 
     def accel():
         from identify import dino, match

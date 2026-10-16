@@ -221,6 +221,8 @@ class Engine:
                                                          hash_items=hash_items)
         except Exception as e:                     # pragma: no cover - never fatal
             print(f'[anchors] icon-cache index unavailable: {e}')
+        if not ex.get('label_anchor', True):       # labels in a script the font / OCR cannot read
+            return
         try:
             self.labeler = fontlabel_mod.LabelRenderer.create(log=lambda *a: None)
         except Exception as e:                     # pragma: no cover

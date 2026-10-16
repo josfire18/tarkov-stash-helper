@@ -334,7 +334,7 @@ const SECTIONS = [
       { key: 'hotkey', type: 'hotkey', label: 'Scan hotkey',
         help: 'Rescan from inside the game. Use Ctrl/Alt/Shift plus a key.' },
       { key: 'debug_dumps', type: 'switch', label: 'Keep debug captures',
-        help: 'Save the screenshots and results of the last few scans to the data/debug folder – handy for a bug report.' },
+        help: 'Save the screenshots and results of the last few scans to the debug folder in the app's data folder – handy for a bug report.' },
     ],
     build: buildScanStatus },
 
@@ -869,7 +869,7 @@ function buildAbout(card) {
       el('p', { class: 'row-help', text: 'Updates are downloaded from this project’s GitHub releases; nothing about your game or stash is sent.' }), result),
     actions);
   const info = el('div', { class: 'status-block' },
-    el('p', { class: 'row-help' }, 'Closing the window only minimises the helper to the system tray – right-click the tray icon to reopen or quit. Your settings live in ', el('code', { text: 'data/settings.json' }), ' next to the app.'),
+    el('p', { class: 'row-help' }, 'Closing the window only minimises the helper to the system tray – right-click the tray icon to reopen or quit. Your settings live in ', el('code', { text: '%LOCALAPPDATA%\\TarkovStashHelper' }), '.'),
     tess);
   card.append(head, info);
   setTimeout(() => check(false), 600);
