@@ -16,13 +16,16 @@ Design notes
 * The label and bottom bands are painted with the tile's background colour before
   embedding *both* sides, so printed names / counts do not leak into similarity.
 * Catalog embeddings (icon composited over its rarity tint, same band blanking)
-  are cached on disk (``EMB_PATH``, keyed by catalog row + catalog build time) and
+  are cached on disk (``EMB_PATH``, keyed by icon file + tint + model id) and
   filled lazily; rotated candidates are embedded on the fly.
 * GPU if available (fp16), CPU otherwise.
 """
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import os
+import threading
 import time
 
 import cv2
@@ -64,6 +67,36 @@ def available(device: str | None = None) -> bool:
         _state['err'] = f'{type(e).__name__}: {e}'
         _state['ok'] = False
     return _state['ok']
+
+
+@contextlib.contextmanager
+def low_impact():
+    """Run background work (the start-up warm-up) without hurting a game running next to it: this
+    thread drops to below-normal priority and torch's CPU pool shrinks to a quarter of the cores
+    (restored afterwards).  Never fatal."""
+    old_threads = None
+    try:
+        k = ctypes.WinDLL('kernel32')
+        k.GetCurrentThread.restype = ctypes.c_void_p
+        k.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        k.SetThreadPriority(k.GetCurrentThread(), -1)      # THREAD_PRIORITY_BELOW_NORMAL
+    except Exception:
+        pass
+    try:
+        if _state.get('torch') is not None:
+            t = _state['torch']
+            old_threads = t.get_num_threads()
+            t.set_num_threads(max(1, (os.cpu_count() or 4) // 4))
+    except Exception:
+        old_threads = None
+    try:
+        yield
+    finally:
+        if old_threads is not None:
+            try:
+                _state['torch'].set_num_threads(old_threads)
+            except Exception:
+                pass
 
 
 def device() -> str | None:
@@ -117,39 +150,79 @@ def composite_icon(bgra: np.ndarray, bg, rotate: int = 0) -> np.ndarray:
     return np.clip(rgb * a + (1 - a) * np.asarray(bg, np.float32), 0, 255).astype(np.uint8)
 
 
+EMB_VERSION = 2            # bump when the embedded picture changes (tint table, band blanking, resolution)
+_CHUNK = 192               # icons decoded + embedded per step (bounds memory: never thousands of renders at once)
+
+
 class EmbeddingStore:
-    """Lazy, disk-cached embeddings of catalog icons (rotation 0, rarity tint bg)."""
+    """Lazy, disk-cached embeddings of catalog icons (rotation 0, rarity tint bg).
+
+    The cache is keyed by the *icon itself* (source file name + size + mtime, rarity tint,
+    footprint) plus the model id, not by catalog row / build time: rebuilding the catalog (new
+    prices, a new game cache) keeps every embedding whose icon file is unchanged, and only new or
+    changed icons are embedded again.  Vectors are held and written as float16 (about 1.5 KB each)."""
 
     def __init__(self, catalog, path: str = EMB_PATH):
         self.cat = catalog
         self.path = path
-        self.stamp = float(catalog.meta.get('built', 0.0))
-        self.vecs: dict[int, np.ndarray] = {}
+        self.lock = threading.RLock()
+        self.by_key: dict[str, np.ndarray] = {}        # icon key -> float16 [768]
+        self._row_keys: dict[int, str | None] = {}
         self.dirty = False
+        self.loaded = 0
         self._load()
 
+    # -- keys ---------------------------------------------------------------
+    def _key(self, row: int) -> str | None:
+        k = self._row_keys.get(row, '')
+        if k != '':
+            return k
+        try:
+            path = self.cat.meta.get('paths', {}).get(int(row))
+            st = os.stat(path) if path else None
+        except OSError:
+            st = None
+        if st is None:
+            k = None
+        else:
+            k = (f'{os.path.basename(path)}|{st.st_size}|{st.st_mtime_ns // 1000}|{self.cat.tint[row]}'
+                 f'|{int(self.cat.tw[row])}x{int(self.cat.th[row])}')
+        self._row_keys[row] = k
+        return k
+
+    def has(self, row: int) -> bool:
+        k = self._key(row)
+        return k is not None and k in self.by_key
+
+    # -- disk ---------------------------------------------------------------
     def _load(self) -> None:
         try:
             if os.path.exists(self.path):
                 z = np.load(self.path, allow_pickle=False)
-                if abs(float(z['stamp']) - self.stamp) < 1e-3:
-                    rows, vecs = z['rows'], z['vecs']
-                    self.vecs = {int(r): v for r, v in zip(rows, vecs.astype(np.float32))}
+                if 'keys' in z.files and int(z['version']) == EMB_VERSION and str(z['model']) == MODEL_ID:
+                    keys, vecs = z['keys'], z['vecs']
+                    self.by_key = {str(k): v for k, v in zip(keys, vecs.astype(np.float16))}
+                    self.loaded = len(self.by_key)
         except Exception:
-            self.vecs = {}
+            self.by_key = {}
 
     def save(self) -> None:
-        if not self.dirty or not self.vecs:
-            return
-        rows = np.array(sorted(self.vecs), np.int32)
-        vecs = np.stack([self.vecs[int(r)] for r in rows]).astype(np.float16)
+        with self.lock:
+            if not self.dirty or not self.by_key:
+                return
+            keys = np.array(sorted(self.by_key))
+            vecs = np.stack([self.by_key[k] for k in keys]).astype(np.float16)
+            self.dirty = False
         tmp = self.path + '.tmp.npz'
-        np.savez_compressed(tmp, rows=rows, vecs=vecs, stamp=np.array(self.stamp))
-        os.replace(tmp, self.path)
-        self.dirty = False
+        try:
+            np.savez_compressed(tmp, keys=keys, vecs=vecs, version=np.array(EMB_VERSION),
+                                model=np.array(MODEL_ID))
+            os.replace(tmp, self.path)
+        except OSError:
+            self.dirty = True
 
     def _icon_image(self, row: int) -> np.ndarray | None:
-        full = self.cat.full_icon(row)
+        full = self.cat.full_icon(row, keep=False)
         if full is None:
             return None
         W, H = int(self.cat.tw[row]), int(self.cat.th[row])
@@ -157,30 +230,52 @@ class EmbeddingStore:
         comp = composite_icon(full, bg)
         return blank_bands(comp, bg, comp.shape[1] / W)
 
+    def missing(self, rows) -> list[int]:
+        with self.lock:
+            return [r for r in rows if self._key(r) is not None and self._key(r) not in self.by_key]
+
     def get(self, rows: list[int]) -> np.ndarray:
-        """Embeddings for catalog rows (computed + cached on demand)."""
-        need = [r for r in rows if r not in self.vecs]
+        """float32 [n, 768] embeddings for catalog rows (computed + cached on demand; rows with
+        no readable icon come back as zeros)."""
+        need = self.missing(rows)
         if need:
-            imgs, keep = [], []
-            for r in need:
+            self._embed_rows(need)
+        zero = np.zeros(768, np.float32)
+        with self.lock:
+            out = [(self.by_key.get(self._key(r)) if self._key(r) is not None else None) for r in rows]
+        return np.stack([zero if v is None else v.astype(np.float32) for v in out])
+
+    def _embed_rows(self, need: list[int], persist_every: int = 1536) -> None:
+        since_save = 0
+        for i in range(0, len(need), _CHUNK):
+            imgs, keys = [], []
+            for r in need[i:i + _CHUNK]:
                 im = self._icon_image(r)
                 if im is not None:
                     imgs.append(im)
-                    keep.append(r)
-            if imgs:
-                for r, v in zip(keep, embed(imgs)):
-                    self.vecs[r] = v
+                    keys.append(self._key(r))
+            if not imgs:
+                continue
+            vecs = embed(imgs).astype(np.float16)
+            del imgs
+            with self.lock:
+                for k, v in zip(keys, vecs):
+                    self.by_key[k] = v
                 self.dirty = True
-        return np.stack([self.vecs.get(r, np.zeros(768, np.float32)) for r in rows])
-
-    def precompute(self, log=print) -> None:
-        """Embed every catalog row (about half a minute on a GPU)."""
-        t = time.time()
-        rows = [r for r in range(len(self.cat)) if r not in self.vecs]
-        for i in range(0, len(rows), 512):
-            self.get(rows[i:i + 512])
+            since_save += len(keys)
+            if since_save >= persist_every:        # a long cold build survives being interrupted
+                self.save()
+                since_save = 0
         self.save()
-        log(f'[dino] embedded {len(rows)} icons in {time.time() - t:.1f}s')
+
+    def precompute(self, log=print, rows=None) -> int:
+        """Embed every catalog row that has no cached vector yet; returns how many were new."""
+        t = time.time()
+        todo = self.missing(range(len(self.cat)) if rows is None else rows)
+        if todo:
+            self._embed_rows(todo)
+        log(f'[dino] embedded {len(todo)} icons in {time.time() - t:.1f}s ({self.loaded} cached)')
+        return len(todo)
 
 
 if __name__ == '__main__':             # python -m identify.dino  -> embed the whole catalog once

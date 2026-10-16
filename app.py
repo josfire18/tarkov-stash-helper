@@ -713,6 +713,18 @@ def catalog_summary():
 # ---------------------------------------------------------------------------
 
 _v2_engine = [None, None]    # [settings key, Engine]
+_v2_engine_lock = threading.Lock()   # the start-up warm-up and the first scan must not both build one
+
+
+def _v2_engine_for(es, fresh=False):
+    """The identification engine for these settings (built once, under a lock).  ``fresh`` builds
+    a new one even for the same settings (the catalog was just rebuilt)."""
+    from identify.pipeline import Engine
+    with _v2_engine_lock:
+        key = repr(es)
+        if fresh or _v2_engine[0] != key:
+            _v2_engine[:] = [key, Engine(es)]
+        return _v2_engine[1]
 
 
 def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None, on_provisional=None, cancel=None):
@@ -723,15 +735,12 @@ def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None, on_p
     (cell_w/cell_h/origin_x/origin_y/...), and whether the grid was found at all.
     """
     from identify.config import EngineSettings
-    from identify.pipeline import Engine
     if not os.path.exists(PRICES_PATH) or next(os.scandir(TMPL_SRC_DIR), None) is None:
         # clean install: the catalog is built from the price list + tarkov.dev base images
         raise ScanError("The item database is still being set up. It builds itself the first time "
                         "(a few minutes, needs internet) - try again when the banner on Live is gone.")
     es = _engine_settings(settings)
-    key = repr(es)
-    if _v2_engine[0] != key:
-        _v2_engine[:] = [key, Engine(es)]
+    engine = _v2_engine_for(es)
     scene = None
     try:                                  # which grids are stash / own gear / loot / windows
         from identify.scene import analyze_scene
@@ -763,7 +772,7 @@ def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None, on_p
                 records, panels = adapt(res)
                 print(f"[v2] provisional {len(records)} items in {res.timings.get('provisional', 0):.2f}s")
                 on_provisional(records, panels)
-    res = _v2_engine[1].scan(img_bgr, scene, on_provisional=cb, cancel=cancel)
+    res = engine.scan(img_bgr, scene, on_provisional=cb, cancel=cancel)
     warnings.extend(res.warnings)
     records, panels = adapt(res)
     if not panels:
@@ -3629,10 +3638,12 @@ def _warm_v2_engine():
     try:
         # a clean install has prices before it has pictures: the first-run build warms the engine itself
         if os.path.exists(PRICES_PATH) and next(os.scandir(TMPL_SRC_DIR), None) is not None:
-            from identify.pipeline import Engine
             es = _engine_settings(_load_settings())
-            _v2_engine[:] = [repr(es), Engine(es)]
-            print('[v2] identification engine ready')
+            from identify import dino as dino_mod
+            with dino_mod.low_impact():       # below-normal priority, small torch pool: the game comes first
+                engine = _v2_engine_for(es, fresh=True)   # the catalog may just have been rebuilt
+                print('[v2] identification engine ready')
+                engine.warm()  # DINO model + icon embeddings (disk-cached) so the first scan is warm
     except Exception as e:
         print(f"[v2] warm-up skipped: {e}")
 

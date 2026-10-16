@@ -45,7 +45,7 @@ STAGE1_SLOT = 32               # px/slot of the stage-1 (MAD) template stacks
 @dataclass
 class EngineSettings:
     """Run-time knobs for :func:`identify.pipeline.scan`."""
-    use_dino: bool = True            # stage 2 (needs torch + transformers)
+    use_dino: bool = False           # stage 2 (needs torch + transformers); opt-in: it settled one colour variant wrongly and the lean path is as good (docs/accuracy.md)
     use_ocr: bool = True             # stage 3 (needs pytesseract + Tesseract)
     accelerate: bool = True          # run stage 1 on the GPU when torch+CUDA are importable
     top_k: int = 16                  # candidates handed from stage 1 to stage 2

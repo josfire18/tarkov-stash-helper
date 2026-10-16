@@ -311,3 +311,13 @@ contents and attachments are never read or added.
 * Result (no DINO): 1035 correct / 0 wrong / 26 Check / 2 missed -> 1034 / 0 / 27 / 2; certified 626, certified-but-wrong 0.
   The one tile that changed is the Desert Tech MDR 5.56 whose same-label twin (MDR 7.62) the picture does not separate
   and whose calibre is not readable: it is now Check instead of a coin flip.
+
+## DINO off by default (2026-10-16)
+
+With DINO active (source runs with torch installed), the strict eval had **1 wrong**: the Bastion
+helmet (Armor Black) settled as the OD Green variant at 0.909 — DINO's feature-space lead barely
+sees colour. A look-alike same-name variant in the shortlist now needs the colour-only evidence
+(`COLOUR_GAP_OK`) or the pick is capped at "Check"; that makes DINO mode 1027 / 0 / 34 / 2, below
+the lean path's **1034 / 0 / 27 / 2**. DINO therefore no longer earns its warm-up and memory cost:
+`EngineSettings.use_dino` defaults to False everywhere (the exe never had it); opt in with
+`"identify_v2": {"use_dino": true}` in settings.json.

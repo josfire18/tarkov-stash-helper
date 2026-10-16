@@ -33,6 +33,7 @@ POLL_RAID_S = 2.0            # after RAID_BACKOFF idle polls with no menu bar: g
 POLL_NO_GAME_S = 3.0
 RAID_BACKOFF = 30
 RELOCATE_S = 5.0
+PROV_WAIT_S = 60.0           # a new view waits at most this long for the running scan's first look before cancelling it
 
 MESSAGES = {
     'disabled': 'Auto-scan off',
@@ -77,6 +78,7 @@ class AutoScanner:
         self._raid_state = None
         self.progressive = progressive
         self._job = None                          # (thread, cancel Event) of the running progressive scan
+        self._prov = threading.Event()            # the running scan has published (or no longer can publish) its first look
         self.get_settings = get_settings
         self.busy_fn = busy_fn or (lambda: False)
         self.win = win32 if win32 is not None else Win32()
@@ -125,7 +127,7 @@ class AutoScanner:
     def stop(self):
         self._stop.set()
         self._wake.set()
-        self._supersede()
+        self._supersede(wait_first_look=False)
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=3)
         self.capture.close()
@@ -301,22 +303,33 @@ class AutoScanner:
         job = self._job
         return bool(job and job[0].is_alive())
 
-    def _supersede(self):
-        """Cancel the pending certification (a newer view arrived / shutdown) and wait for it."""
+    def _supersede(self, wait_first_look: bool = True):
+        """Cancel the pending certification (a newer view arrived / shutdown) and wait for it.
+
+        A scan that has not yet published its first look is let alone until it has (bounded by
+        ``PROV_WAIT_S``): otherwise a player who keeps changing view would cancel every scan
+        before anything was ever shown.  Once the first look is out, cancelling is free."""
         job = self._job
         if job is None:
             return
+        if wait_first_look and job[0] is not threading.current_thread():
+            deadline = time.monotonic() + PROV_WAIT_S
+            while job[0].is_alive() and not self._prov.is_set() and time.monotonic() < deadline:
+                self._prov.wait(0.05)
         with self._lock:
             job[1].set()                          # under the lock: a publish in flight is either done or dropped
         if job[0] is not threading.current_thread():
             job[0].join(timeout=15)
         self._job = None
 
-    def _publish(self, payload, frame, t0, game_info, final, cancel=None):
+    def _publish(self, payload, frame, t0, game_info, final, cancel=None, born_seq=None):
         payload['timing'] = {'scan_ms': round((time.perf_counter() - t0) * 1e3), 'final': final}
         with self._lock:
             if cancel is not None and cancel.is_set():
-                return                            # superseded while the payload was being built
+                # superseded while the payload was being built.  Its first look is still better than
+                # nothing while no newer result has been published (the newer scan is still working)
+                if final or born_seq is None or self._seq != born_seq or self._stop.is_set():
+                    return
             self._seq += 1
             self._last_scan_wall = self.wall()
             self._result = payload
@@ -326,18 +339,26 @@ class AutoScanner:
         with self._cond:
             self._cond.notify_all()
 
-    def _work(self, frame, cancel, t0, game_info):
+    def _work(self, frame, cancel, t0, game_info, prov=None):
+        prov = prov if prov is not None else self._prov
+        born_seq = self._seq
+
         def publish(payload):
             if isinstance(payload, dict):
-                self._publish(payload, frame, t0, game_info, False, cancel)
+                try:
+                    self._publish(payload, frame, t0, game_info, False, cancel, born_seq)
+                finally:
+                    prov.set()
 
         try:
             payload = self.scan_fn(frame, publish=publish, cancel=cancel.is_set)
         except Exception as e:
+            prov.set()
             if cancel.is_set():
                 return                            # superseded: not a failure
             self._fail(f'scan failed: {e}', game_info)
             return
+        prov.set()                                # a scan with nothing to show first has nothing to wait for
         if cancel.is_set():
             return
         if not isinstance(payload, dict) or payload.get('error') or payload.get('grid_failed'):
@@ -357,7 +378,8 @@ class AutoScanner:
             self._set('scanning', game=game_info)
             self.trigger.scan_started(thumb, now)
             cancel = threading.Event()
-            th = threading.Thread(target=self._work, args=(frame, cancel, t0, game_info),
+            self._prov = prov = threading.Event()
+            th = threading.Thread(target=self._work, args=(frame, cancel, t0, game_info, prov),
                                   name='autoscan-scan', daemon=True)
             self._job = (th, cancel)
             th.start()

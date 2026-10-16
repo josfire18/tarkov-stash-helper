@@ -32,6 +32,8 @@ import numpy as np
 from .config import DATA_DIR, SLOT
 from . import tmpfont
 
+RENDER_CACHE_BYTES = 96 << 20   # rendered label strips kept (cleared when over)
+
 FONT_DIR = os.path.join(DATA_DIR, 'fonts')
 PARAMS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'label_params.json')
 
@@ -155,6 +157,7 @@ class LabelRenderer:
         self.tmp = (tmpfont.SpriteRenderer(font, params.shade) if params.shade
                     else tmpfont.TMPRenderer(font, params.k, params.shade))
         self._cache: dict = {}
+        self._cache_bytes = 0
         self._lock = threading.Lock()
 
     @classmethod
@@ -200,8 +203,10 @@ class LabelRenderer:
             return hit
         out = self.tmp.render(vis, w, h, size, pen, base, color or self.p.color, self.p.bold, self.p.spacing)
         with self._lock:
-            if len(self._cache) > 4000:
-                self._cache.clear()
+            self._cache_bytes += sum(o.nbytes for o in out)
+            if len(self._cache) > 4000 or self._cache_bytes > RENDER_CACHE_BYTES:
+                self._cache.clear()              # bounded by bytes too (a 4K strip is ~4x a 1440p one)
+                self._cache_bytes = sum(o.nbytes for o in out)
             self._cache[key] = out
         return out
 

@@ -191,6 +191,16 @@ class AnchorResult:
     ranked: list = field(default_factory=list)   # [(score, Render, rot)] best first
 
 
+def _read_chunked(files: list, chunk: int = 256):
+    """Yield each file's image in order, decoding ``chunk`` files at a time on a small pool (the
+    index only keeps thumbnails, so holding every full render until it is built cost ~1 GB)."""
+    if not files:
+        return
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for i in range(0, len(files), chunk):
+            yield from ex.map(lambda p: cv2.imread(p, cv2.IMREAD_UNCHANGED), files[i:i + chunk])
+
+
 class CacheIndex:
     """Every icon-cache render, grouped by footprint, with a coarse thumbnail stack for
     shortlisting and an LRU of full-resolution images for the exact check."""
@@ -210,8 +220,7 @@ class CacheIndex:
             return
         files = sorted(glob.glob(os.path.join(cache_dir, '*.png')))
         idx0 = eft_hash.read_index(cache_dir) if hash_items else {}
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            imgs = list(ex.map(lambda p: cv2.imread(p, cv2.IMREAD_UNCHANGED), files))
+        imgs = _read_chunked(files)                   # streamed: never all ~8000 renders in memory at once
         exact: dict = {}
         if hash_items:
             # only index entries unchanged across the file scan (the game renumbers files)
