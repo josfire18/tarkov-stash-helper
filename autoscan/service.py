@@ -1,5 +1,7 @@
 """
-The auto-scan service: a below-normal-priority thread that polls the game window at <= 2 Hz,
+The scan service.  Two ways in: the scan hotkey (``request_scan``: one capture of what is on screen,
+scanned at once, the screen duplication released again when auto-scan is off) and auto-scan (off by
+default).  Auto-scan is a below-normal-priority thread that polls the game window at <= 2 Hz,
 runs the cheap inventory detector on the passively captured frame and - only when an inventory
 screen has settled - hands the full frame to the app's normal scan function.
 
@@ -11,8 +13,9 @@ Cost rules (Tarkov is main-thread bound; frame drops are the one thing this must
   * while the game log says the player is matching, loading or in a raid NOTHING runs: no capture,
     detection, scan or frame collection, the screen duplication is released, the loop only re-reads
     the log tail every POLL_RAID_S.  This is a stash helper; a raid never pays for it;
-  * the thread runs at THREAD_PRIORITY_BELOW_NORMAL; the duplication is released when the game
-    is gone, the feature is switched off or the app quits.
+  * the poll thread and the scan worker run at THREAD_PRIORITY_BELOW_NORMAL (the app also drops
+    its whole process to below normal, so OpenCV's worker threads give way to the game too); the
+    duplication is released when the game is gone, the feature is switched off or the app quits.
 """
 from __future__ import annotations
 
@@ -41,8 +44,11 @@ RAID_MAX_S = 2 * 3600.0      # a log that has said "in raid" for longer than thi
 PAUSE_STATES = ('matching', 'loading', 'in_raid')   # game log states in which nothing at all runs
 PROV_WAIT_S = 60.0          # a new view waits at most this long for the running scan's first look before cancelling it
 
+# states a hotkey scan leaves behind that "auto-scan off" must not paint over
+MANUAL_STATES = ('scanning', 'verifying', 'scanned', 'error', 'blank')
+
 MESSAGES = {
-    'disabled': 'Auto-scan off',
+    'disabled': 'Auto-scan off - press the scan hotkey in the game to scan',
     'starting': 'Auto-scan starting',
     'no_game': 'Waiting for Tarkov to start',
     'minimized': 'Tarkov is minimised',
@@ -59,6 +65,18 @@ MESSAGES = {
     'failed': 'Last scan failed',
     'error': 'Capture error',
 }
+
+
+def below_normal_process():
+    """Drop the whole process to BELOW_NORMAL_PRIORITY_CLASS: every thread of the helper (OpenCV's
+    and numpy's worker pools included) then gives way to the game the moment it wants a core."""
+    try:
+        k = ctypes.WinDLL('kernel32')
+        k.GetCurrentProcess.restype = ctypes.c_void_p
+        k.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        return bool(k.SetPriorityClass(k.GetCurrentProcess(), 0x4000))   # BELOW_NORMAL_PRIORITY_CLASS
+    except Exception:
+        return False
 
 
 def _below_normal_priority():
@@ -97,6 +115,7 @@ class AutoScanner:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._manual = threading.Event()          # the scan hotkey was pressed: scan the screen once
         self._thread: threading.Thread | None = None
         self._game = None
         self._game_ts = -1e9
@@ -116,7 +135,7 @@ class AutoScanner:
 
     # -- settings ----------------------------------------------------------------------------
     def enabled(self) -> bool:
-        return bool((self.get_settings() or {}).get('auto_scan', True))
+        return bool((self.get_settings() or {}).get('auto_scan', False))
 
     def _opts(self) -> dict:
         s = self.get_settings() or {}
@@ -142,6 +161,12 @@ class AutoScanner:
         """Settings changed - re-evaluate now."""
         self._wake.set()
 
+    def request_scan(self):
+        """Scan what is on screen now (the hotkey), whether auto-scan is on or off.  Runs on the
+        scan thread; returns at once."""
+        self._manual.set()
+        self._wake.set()
+
     def status(self) -> dict:
         with self._lock:
             st = dict(self._status)
@@ -154,6 +179,7 @@ class AutoScanner:
                   backend=self.capture.backend_name, detect_ms=round(self._last_detect_ms, 1),
                   grab_ms=round(self._last_grab_ms, 1))
         st['mode'] = self._mode_info()
+        st['hotkey'] = (self.get_settings() or {}).get('hotkey')
         return st
 
     def _mode_info(self):
@@ -267,11 +293,17 @@ class AutoScanner:
     def step(self) -> float:
         """One poll.  Returns the delay until the next one."""
         now = self.clock()
-        if not self.enabled():
-            self.capture.close()
-            self._set('disabled')
+        manual = self._manual.is_set()
+        self._manual.clear()
+        auto = self.enabled()
+        if not auto and not manual:
+            self.capture.close()                  # off: nothing is captured until the hotkey is pressed
+            if not self.scanning() and self._status.get('state') not in MANUAL_STATES:
+                self._set('disabled')
             return POLL_NO_GAME_S
         opts = self._opts()
+        if manual:
+            self._game_ts = -1e9                  # the window may have moved since the last look
         game = self._locate(now, opts['exe'])
         if game is None:
             self.capture.close()
@@ -295,6 +327,8 @@ class AutoScanner:
         if self.busy_fn() and not self.scanning():
             self._set('busy', game=game_info)
             return POLL_IDLE_S
+        if manual:
+            return self._manual_scan(game, game_info, now, release=not auto)
 
         t0 = time.perf_counter()
         res = self.capture.grab(game.monitor, game.region_on_monitor())
@@ -330,6 +364,26 @@ class AutoScanner:
             return POLL_ACTIVE_S
         self._idle_polls += 1
         return POLL_RAID_S if self._idle_polls >= RAID_BACKOFF and in_raid else POLL_IDLE_S
+
+    def _manual_scan(self, game, game_info, now, release: bool) -> float:
+        """The hotkey: capture the game once and scan that frame, inventory detector or not."""
+        region = game.region_on_monitor()
+        t0 = time.perf_counter()
+        res = self.capture.grab(game.monitor, region)
+        if res.frame is None and not res.error:   # "nothing new since the last grab": open afresh
+            self.capture.close()
+            res = self.capture.grab(game.monitor, region)
+        self._last_grab_ms = (time.perf_counter() - t0) * 1e3
+        if release:
+            self.capture.close()                  # auto-scan off: hold nothing between hotkey presses
+        if res.error or res.frame is None:
+            self._set('error', detail=res.error or 'no frame from the screen capture', game=game_info)
+            return POLL_NO_GAME_S
+        if res.blank:
+            self._set('blank', game=game_info)
+            return POLL_NO_GAME_S
+        self._scan(res.frame, thumbnail(res.frame), now, game_info)
+        return POLL_NO_GAME_S if release else POLL_ACTIVE_S
 
     def scanning(self) -> bool:
         """A progressive scan (first look published, certification pending) is running."""
@@ -373,6 +427,7 @@ class AutoScanner:
             self._cond.notify_all()
 
     def _work(self, frame, cancel, t0, game_info, prov=None):
+        _below_normal_priority()                  # the game wins every core it wants while we scan
         prov = prov if prov is not None else self._prov
         born_seq = self._seq
 

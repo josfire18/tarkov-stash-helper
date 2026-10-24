@@ -398,7 +398,10 @@ function paintEmpty(st) {
   const e = $('empty');
   let t = 'Open your stash or inventory', btn = '';
   if (!st) t = 'Waiting for the app';
-  else if (!st.enabled) { t = 'Auto-scan is off'; btn = '<button class="primary" id="turn-on">Turn on</button>'; }
+  else if (!st.enabled && st.state !== 'in_raid') {
+    t = `Open your stash and press ${esc(TSH.prettyHotkey(st.hotkey))} in the game to scan it`;
+    btn = '<button id="turn-on">Turn on auto-scan</button>';
+  }
   else if (st.state === 'no_game') t = 'Waiting for Tarkov';
   else if (st.state === 'minimized') t = 'Tarkov is minimized';
   else if (st.state === 'in_raid') t = 'In a raid · paused until you are back in the lobby';

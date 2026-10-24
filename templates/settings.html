@@ -334,10 +334,10 @@ const SECTIONS = [
 
   { id: 'scanning', title: 'Scanning', intro: null,
     rows: [
-      { key: 'auto_scan', type: 'switch', label: 'Auto-scan the stash',
-        help: 'Watch the game quietly and scan your stash by itself when you open it – no hotkey needed.' },
       { key: 'hotkey', type: 'hotkey', label: 'Scan hotkey',
-        help: 'Rescan from inside the game. Use Ctrl/Alt/Shift plus a key.' },
+        help: 'Press it in the game to scan what is on screen. Use Ctrl, Alt or Shift plus a key. Ctrl+F1 is the default.' },
+      { key: 'auto_scan', type: 'switch', label: 'Auto-scan the stash',
+        help: 'Off by default. When on, the app watches the game and scans your stash by itself each time the view stops moving. This can make Tarkov stutter when you switch screens, so leave it off if you see that.' },
       { key: 'debug_dumps', type: 'switch', label: 'Keep debug captures',
         help: 'Save the screenshots and results of the last few scans to the debug folder in the app’s data folder – handy for a bug report.' },
     ],
@@ -619,7 +619,7 @@ function buildProgressStatus(card) {
 }
 
 function buildScanStatus(card) {
-  const s = statusBlock('Auto-scan status');
+  const s = statusBlock('Scan status');
   ui.scan = s.body;
   s.body.append(chip('Checking…'));
   card.append(s.block);
@@ -700,6 +700,8 @@ async function pollScan() {
     out = [chip(d.message || d.state || 'Unknown', kind)];
     if (d.last_scan_age) out.push(chip('Last scan ' + fmtAge(d.last_scan_age / 60)));
     if (d.detail && kind === 'bad') out.push(chip(String(d.detail), 'bad'));
+    const h = (await http('GET', '/api/health')).data || {};
+    if (h.hotkey_error) out.push(chip('The scan hotkey is not working: ' + h.hotkey_error, 'bad'));
   } catch (_) {
     out = [chip('Status unavailable', 'warn')];
   }
@@ -872,9 +874,10 @@ function buildAbout(card) {
 // How to use + the few rules the app follows on its own (kept short on purpose)
 const GUIDE_STEPS = [
   'Start Tarkov. The helper opens with it (or start it yourself) and sits in the system tray.',
-  'Open your stash. It is scanned by itself once the view stops moving; the scan hotkey or Scan now on the Live page rescans.',
+  'Open your stash and press the scan hotkey (Ctrl+F1 unless you changed it under Scanning). The app scans what is on screen right then.',
   'The Live page outlines every item by what to do with it: sell on the flea, sell to a named trader, Keep (a quest, the hideout or Kappa still needs it) or Check (not sure what it is, look yourself).',
-  'Scroll or switch stash tabs and each new view is scanned. Needs lists what your quests, hideout and Kappa still require.',
+  'Scroll or switch stash tabs, then press the hotkey again to scan the new view. Needs lists what your quests, hideout and Kappa still require.',
+  'Prefer hands-free? Turn on Auto-scan under Scanning and each view is scanned by itself once it stops moving. It is off by default because it can make Tarkov stutter between screens.',
   'For the best results keep the stash uncovered (this window off the game screen) and fill in Your character above so flea fees are right.',
 ];
 const GUIDE_RULES = [

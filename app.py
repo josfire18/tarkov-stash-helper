@@ -27,6 +27,7 @@ from PIL import Image, ImageDraw
 import pytesseract
 from rapidfuzz import process as rfuzz
 from pynput import keyboard
+import winhotkey
 import cv2
 import numpy as np
 
@@ -887,9 +888,8 @@ def build_sell_context(settings, prices):
 # Default data
 # ---------------------------------------------------------------------------
 
-# F9 conflicts with EFT's own binds and popular overlay tools, so the default
-# is a modifier combo nothing else claims.
-DEFAULT_HOTKEY = '<ctrl>+<shift>+s'
+# Ctrl+F1: nothing in EFT uses it, and plain F-keys are EFT's own binds.
+DEFAULT_HOTKEY = '<ctrl>+<f1>'
 
 # Shared label for the kappa keep-list category — also stamped unconditionally
 # onto existing installs by merge_kappa_into_keep_list so they migrate on the
@@ -919,7 +919,8 @@ def default_settings():
         'hideout_management_level': 0,  # skill level 0-51; each level adds 0.3% flea fee discount (with Intel Center 3)
         'skip_traders': ['Ref'],   # Ref pays GP coins, not roubles
         'trader_levels': {},       # e.g. {'Ref': 4} - only Ref's pay rate changes with loyalty level
-        'auto_scan': True,  # watch the game passively and scan the stash when it settles (autoscan/)
+        'auto_scan': False,  # on: watch the game and scan the stash when it settles (autoscan/); off: scan on the hotkey only
+        'scan_hotkey_migrated': True,  # migrate_scan_settings already applied (new installs start migrated)
         'ignore_task_items': False,     # never hold items back for tasks / Kappa: flea vs trader only
         'ignore_hideout_items': False,  # never hold items back for hideout upgrades
         # Open and close with the game (lifecycle.py); changes take effect when settings are saved
@@ -2269,78 +2270,110 @@ def run_keep_scan(from_calibration=False):
         _scan_state.update({'running': False, 'phase': None, 'ts': time.time()})
 
 
-def do_scan():
-    """Hotkey-triggered scan: same pipeline as the Scan button, results (or the
-    error) parked in _last_scan for the frontend poller."""
-    try:
-        result = run_keep_scan()
-        with _scan_lock:
-            _last_scan.update(result, error=None, ts=time.time())
-    except Exception as e:
-        import traceback
-        print(f"[hotkey scan] ERROR:\n{traceback.format_exc()}")
-        with _scan_lock:
-            _last_scan.update({'image': None, 'detections': [], 'warnings': [],
-                               'checklist_matches': [], 'grid_failed': False,
-                               'error': str(e), 'ts': time.time()})
-
-
 # ---------------------------------------------------------------------------
 # Global hotkey
 # ---------------------------------------------------------------------------
 
 class HotkeyManager:
-    """Owns the pynput GlobalHotKeys listener; supports live rebinding."""
+    """Owns the scan hotkey; supports live rebinding.
+
+    Windows: ``RegisterHotKey`` (winhotkey.py), which works while Tarkov has the focus.  The
+    pynput listener is only the fallback when that API is not there (not Windows)."""
     def __init__(self):
         self._listener = None
         self._lock = threading.Lock()
         self.current = None
+        self.backend = None
+        self.error = None
 
     @staticmethod
     def validate(hotkey_str):
-        """Raises ValueError if pynput can't parse the combo."""
-        keyboard.HotKey.parse(hotkey_str)
+        """Raises ValueError if the combo can't be parsed."""
+        if sys.platform == 'win32':
+            winhotkey.parse(hotkey_str)
+        else:
+            keyboard.HotKey.parse(hotkey_str)
 
     def _on_activate(self):
-        print(f"Hotkey {self.current} triggered — scanning...")
-        if autoscanner.enabled():
-            rescan_now()
-        else:
-            threading.Thread(target=do_scan, daemon=True).start()
+        print(f"Hotkey {self.current} triggered - scanning what is on screen")
+        autoscanner.request_scan()
+
+    def _stop_listener(self):
+        if self._listener is not None:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+            self._listener = None
 
     def register(self, hotkey_str):
         self.validate(hotkey_str)
         with self._lock:
-            if self._listener is not None:
+            if sys.platform == 'win32':
+                listener = winhotkey.Win32Hotkey(hotkey_str, self._on_activate)
+                # start the new one before dropping the old: a refused combo keeps the old hotkey
+                old, self._listener = self._listener, None
+                if old is not None and getattr(old, 'combo', None) == hotkey_str:
+                    old.stop()          # the same combo again: release it first or Windows says "taken"
+                    old = None
                 try:
-                    self._listener.stop()
+                    listener.start()
                 except Exception:
-                    pass
-                self._listener = None
-            listener = keyboard.GlobalHotKeys({hotkey_str: self._on_activate})
-            listener.daemon = True
-            listener.start()
+                    self._listener = old
+                    raise
+                if old is not None:
+                    old.stop()
+                self.backend = 'win32'
+            else:
+                self._stop_listener()
+                listener = keyboard.GlobalHotKeys({hotkey_str: self._on_activate})
+                listener.daemon = True
+                listener.start()
+                self.backend = 'pynput'
             self._listener = listener
             self.current = hotkey_str
-        print(f"Hotkey listener active — press {hotkey_str} in-game to scan")
+            self.error = None
+        print(f"Hotkey active ({self.backend}): press {hotkey_str} in the game to scan")
 
 
 hotkey_manager = HotkeyManager()
 
 
+def hotkey_problem(e, combo):
+    """A short message for a hotkey that could not be registered (built from the combo, not from
+    the exception text, so nothing internal reaches the page)."""
+    if isinstance(e, winhotkey.HotkeyTaken):
+        return f'{winhotkey.pretty(combo)} is already used by another program. Pick another key.'
+    if isinstance(e, ValueError):
+        return f'{winhotkey.pretty(combo)} is not a key combination the app can use.'
+    return 'Windows refused the hotkey. Try another key.'
+
+OLD_DEFAULT_HOTKEY = '<ctrl>+<shift>+s'
+
+
+def migrate_scan_settings(settings):
+    """One time (settings saved before scanning moved to the hotkey): auto-scan off, and the old
+    default hotkey becomes Ctrl+F1.  Auto-scan stays available in Settings.  Returns True when
+    something changed (the caller saves)."""
+    if settings.get('scan_hotkey_migrated'):
+        return False
+    settings['scan_hotkey_migrated'] = True
+    settings['auto_scan'] = False
+    if settings.get('hotkey') in (None, '', OLD_DEFAULT_HOTKEY, '<f9>'):
+        settings['hotkey'] = DEFAULT_HOTKEY
+    return True
+
+
 def start_hotkey_listener():
     settings = _load_settings()
-    hotkey_str = settings.get('hotkey', DEFAULT_HOTKEY)
-    # Migrate the old F9 default: EFT and common overlays grab function keys,
-    # so plain F9 frequently never reaches this app.
-    if hotkey_str == '<f9>':
-        hotkey_str = DEFAULT_HOTKEY
-        settings['hotkey'] = hotkey_str
+    if migrate_scan_settings(settings):
         _save_settings(settings)
-        print(f"Hotkey migrated F9 → {hotkey_str} (F9 conflicts with EFT itself)")
+        print(f"Settings migrated: auto-scan off, scan hotkey {settings['hotkey']}")
+    hotkey_str = settings.get('hotkey', DEFAULT_HOTKEY)
     try:
         hotkey_manager.register(hotkey_str)
     except Exception as e:
+        hotkey_manager.error = hotkey_problem(e, hotkey_str)
         print(f"Hotkey listener failed: {e}")
 
 
@@ -2396,6 +2429,7 @@ def health():
         'catalog_error':  _index_build_state.get('error'),
         'prices_cached':  os.path.exists(PRICES_PATH),
         'hotkey':         hotkey_manager.current,
+        'hotkey_error':   hotkey_manager.error,
         'app_version':    APP_VERSION,
     })
 
@@ -2405,7 +2439,7 @@ def set_hotkey():
     try:
         hotkey_manager.register(hotkey_str)
     except Exception as e:
-        return jsonify({'ok': False, 'error': f'Invalid hotkey: {e}'}), 400
+        return jsonify({'ok': False, 'error': hotkey_problem(e, hotkey_str)}), 400
     settings = _load_settings()
     settings['hotkey'] = hotkey_str
     _save_settings(settings)
@@ -2684,8 +2718,8 @@ def save_settings():
         try:
             hotkey_manager.register(new['hotkey'])      # a changed hotkey takes effect at once
         except Exception as e:
-            return jsonify({'ok': False, 'error': f'Invalid hotkey: {e}',
-                            'errors': {'hotkey': str(e)}}), 400
+            msg = hotkey_problem(e, new['hotkey'])
+            return jsonify({'ok': False, 'error': msg, 'errors': {'hotkey': msg}}), 400
     _save_settings(new, mode=old_profile)
     if new.get('game_mode') != old.get('game_mode'):
         _mode_cache['val'] = None                       # the next call re-resolves the effective mode
@@ -3802,6 +3836,7 @@ def _run_app():
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=_startup_maintenance, daemon=True).start()
     start_refresher()
+    autoscan.service.below_normal_process()   # scans must never take CPU time Tarkov wants
     start_hotkey_listener()
     autoscanner.start()
 

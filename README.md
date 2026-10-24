@@ -115,15 +115,21 @@ branch.)
 Other pieces: the UI (`templates/`) is served locally and hosted in a native window via `pywebview`, with a
 `pystray` tray icon.
 
-## Auto-scan
+## Scanning: the hotkey, and auto-scan
 
-Hands-free mode (default on): the app finds `EscapeFromTarkov.exe`, watches its screen, and when you open an
-inventory screen (stash, container window, trader / flea sell screen) and leave it alone for about a second it runs
-the normal sell scan on the **whole frame** - no capture region, no hotkey, no screenshots to send. The Live page
-refreshes the picture and action list by itself when a new result arrives, and the status pill in the header says
-what the watcher is doing ("Tarkov not running" / "Watching" / "Scanning..." / "Updated 12 s ago"). **Scan now**
-(or the scan hotkey) rescans the view on screen.
-Turn it off in Settings (`auto_scan_exe` in the settings file overrides the process name).
+**The hotkey (default).** Open your stash and press **Ctrl+F1** (Settings > Scanning > Scan hotkey). The app grabs the
+game window once and runs the normal sell scan on the whole frame; the Live page shows the result. When auto-scan is
+off nothing is captured between presses: the screen duplication is opened for the one grab and released again. The
+hotkey is registered with Win32 `RegisterHotKey` (`winhotkey.py`), not a keyboard hook. pynput's low-level hook does
+not receive keys while a window running as administrator has the focus (UIPI), which is why the old hotkey did nothing
+in game; `RegisterHotKey` is matched by Windows itself, whatever has the focus, and the app sees no other key.
+
+**Auto-scan (optional, off by default).** Turn it on in Settings > Scanning: the app finds `EscapeFromTarkov.exe`,
+watches its screen, and when you open an inventory screen (stash, container window, trader / flea sell screen) and
+leave it alone for about a second it runs the same scan by itself. It is off by default because the scans it starts
+as you move between screens compete with Tarkov for CPU and can make the game hitch. The helper process runs at
+below-normal priority (and the scan threads too), so the game gets any core it asks for first, but the hotkey costs
+nothing at all until pressed. `auto_scan_exe` in the settings file overrides the process name.
 
 **Live view.** The page subscribes to `GET /api/autoscan/stream` (Server-Sent Events: `{"seq", "state", "scene"}`
 on every new result / state change; the 1.5 s status poll stays as the fallback), fetches the lean result
