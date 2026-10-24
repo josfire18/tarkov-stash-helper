@@ -46,6 +46,7 @@
 .tile.own { --acc: var(--blue); border-width: 1px; background: none; cursor: default; }
 .tile.lootg { --acc: #e8873d; border-width: 1px; background: none; cursor: default; }
 .tile.dim { opacity: .2; }
+.tile.fade:not(.dim):not(.hl) { opacity: .35; }
 .tile.hl { background: color-mix(in srgb, var(--acc) 38%, transparent); box-shadow: 0 0 0 2px #fff, 0 0 10px 3px var(--acc); z-index: 2; }
 
 .empty { text-align: center; color: var(--dim); display: flex; flex-direction: column; align-items: center; gap: var(--s3); }
@@ -60,6 +61,11 @@
 }
 .group-h:first-child { border-top: 0; }
 .group-h .n { color: var(--dim); font-weight: 400; letter-spacing: 0; }
+.group-h.pick { cursor: pointer; }
+.group-h.pick:hover { background: var(--raise); }
+.group-h.on { background: color-mix(in srgb, var(--acc) 22%, var(--panel)); box-shadow: inset 3px 0 0 var(--acc); }
+.group-h .pinned { display: none; color: var(--text); font-weight: 600; letter-spacing: 0; text-transform: none; font-size: var(--fs-xs); }
+.group-h.on .pinned { display: inline; }
 .group-h .tot { margin-left: auto; color: var(--text); font-weight: 600; letter-spacing: 0; text-transform: none; font-size: var(--fs-s); }
 .row {
   display: grid; grid-template-columns: 1fr auto; gap: 1px var(--s3); padding: 7px var(--s3) 7px 11px;
@@ -122,6 +128,8 @@ let seq = 0;
 let filterText = '';
 let fetching = false;
 let rowsByTile = new Map(); // "px,py" -> [row elements]
+let pinnedGroup = null;     // the list group whose items stay highlighted in the picture until its header is clicked again
+let pinnedKeys = new Set(); // tile keys of that group's rows, as the list shows them now
 const $ = id => document.getElementById(id);
 
 // ---- data -> groups ------------------------------------------------------------------------
@@ -227,7 +235,17 @@ function groupEl(list, label, rows, kind, acc, total) {
   const h = document.createElement('div');
   h.className = 'group-h'; h.style.setProperty('--acc', acc);
   h.innerHTML = `<span>${esc(label)}</span><span class="n">${kind === 'check' || kind === 'pending' ? shown.length : units(shown)}</span>`
+    + '<span class="pinned">Highlighted</span>'
     + (total ? `<span class="tot num">${rubShort(sum(shown))}</span>` : '');
+  if (kind !== 'own') {                                    // "On you" has no outlines of its own to light up
+    const id = kind + ':' + label, on = pinnedGroup === id;
+    h.classList.add('pick'); h.classList.toggle('on', on);
+    h.tabIndex = 0; h.setAttribute('role', 'button'); h.setAttribute('aria-pressed', on ? 'true' : 'false');
+    h.title = on ? 'Click to stop highlighting these items' : 'Click to highlight all of these items in the picture';
+    if (on) for (const r of shown) pinnedKeys.add(tileKey(r));
+    h.addEventListener('click', () => pinGroup(pinnedGroup === id ? null : id));
+    h.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); h.click(); } });
+  }
   list.append(h);
   for (const r of shown) list.append(rowEl(r, kind, acc));
 }
@@ -236,6 +254,7 @@ function renderList(g) {
   const list = $('list');
   const open = new Set([...list.querySelectorAll('.row.open .name')].map(n => n.textContent));
   rowsByTile = new Map();
+  pinnedKeys = new Set();
   list.innerHTML = '';
   groupEl(list, 'Sell on flea', g.flea, 'flea', 'var(--flea)', true);
   for (const [name, rows] of g.traders) groupEl(list, 'Sell to ' + name, rows, 'trader', TRADER_COLORS[name] || FALLBACK_TRADER, true);
@@ -301,9 +320,26 @@ function renderTiles(res) {
 }
 function applyFilterToTiles() {
   for (const t of $('tiles').children) t.classList.toggle('dim', !!filterText && t.dataset.m === 'x');
+  applyPinToTiles();
+}
+// A picked group keeps the hover highlight on every one of its items; the other items fade back.
+function applyPinToTiles() {
+  const any = pinnedKeys.size > 0;
+  for (const t of $('tiles').children) {
+    if (!t.dataset.k) continue;                           // outlines of regions, skipped and worn items
+    const p = pinnedKeys.has(t.dataset.k);
+    t.classList.toggle('hl', p); t.classList.toggle('fade', any && !p);
+  }
+}
+function pinGroup(id) {
+  pinnedGroup = id;
+  if (!scan) return;
+  const list = $('list'), top = list.scrollTop;
+  renderList(classify(scan.results || [], scan.on_you)); applyPinToTiles();
+  list.scrollTop = top;
 }
 function hl(k, on, fromTile) {
-  for (const t of $('tiles').children) if (t.dataset.k === k) t.classList.toggle('hl', on);
+  for (const t of $('tiles').children) if (t.dataset.k === k) t.classList.toggle('hl', on || pinnedKeys.has(k));
   if (fromTile) for (const r of rowsByTile.get(k) || []) r.classList.toggle('hl', on);
 }
 function flash(k) {
