@@ -1,4 +1,5 @@
 import os
+import math
 import sys
 
 if __name__ == '__main__' and '--watch' in sys.argv:
@@ -2387,7 +2388,12 @@ def sell_redirect():
 
 @app.route('/api/last-scan', methods=['GET'])
 def last_scan():
-    since = float(request.args.get('since', 0))
+    try:
+        since = float(request.args.get('since', 0))
+    except ValueError:
+        since = 0.0
+    if not math.isfinite(since):
+        since = 0.0
     with _scan_lock:
         if _last_scan['ts'] > since and (_last_scan['image'] or _last_scan.get('error')):
             return jsonify({'ready': True, **_last_scan})

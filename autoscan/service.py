@@ -16,6 +16,7 @@ Cost rules (Tarkov is main-thread bound; frame drops are the one thing this must
 """
 from __future__ import annotations
 
+import math
 import ctypes
 import json
 import os
@@ -470,6 +471,8 @@ def make_blueprint(scanner: AutoScanner, get_settings, save_settings):
         that many seconds (tests); a ``: ping`` comment every 15 s keeps idle connections open."""
         try:
             max_s = float(request.args.get('max_s', 0))
+            if not math.isfinite(max_s):
+                raise ValueError
         except ValueError:
             max_s = 0.0
 
