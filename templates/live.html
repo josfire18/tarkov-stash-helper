@@ -18,6 +18,9 @@
 .summary .more { color: var(--dim); font-size: var(--fs-s); }
 .summary .warn { color: var(--amber); font-size: var(--fs-xs); }
 .toolbar input { width: 200px; }
+#full-stash[aria-pressed="true"] { color: var(--strong); border-color: var(--gold); }
+.summary .rows { color: var(--gold); }
+.stage.tall { overflow-y: auto; align-items: flex-start; }
 
 .split { flex: 1; min-height: 0; display: flex; }
 .stage {
@@ -101,6 +104,8 @@
 <div class="toolbar">
   <div class="summary" id="summary"></div>
   <input type="search" id="filter" placeholder="Filter items" aria-label="Filter items">
+  <button id="full-stash" class="quiet" aria-pressed="false" title="Scan, scroll, scan again: every scan is added to one list of the whole stash">Full stash</button>
+  <button id="stash-restart" class="quiet" hidden title="Clear the full-stash capture and begin again">Start over</button>
   <button id="scan-now" class="quiet">Scan now</button>
 </div>
 
@@ -165,9 +170,17 @@ function renderSummary(g, res) {
   if (g.check.length) extra.push(`Check ${g.check.length}`);
   if (g.pending.length) extra.push(`Checking ${g.pending.length} more…`);
   if (extra.length) bits.push(`<span class="more">${extra.join(' · ')}</span>`);
+  if (res.stitch) bits.unshift(`<span class="rows">${esc(stitchText(res.stitch))}</span>`);
   const w = res.warnings && res.warnings[0];
   if (w) bits.push(`<span class="warn" title="${esc(res.warnings.join('\n'))}">${esc(w.length > 60 ? w.slice(0, 58) + '…' : w)}</span>`);
   el.innerHTML = bits.join('<span class="sep">|</span>');
+}
+
+function stitchText(st) {
+  const r = (st.ranges || []).map(([a, b]) => a === b ? `${a}` : `${a}–${b}`).join(', ');
+  if (!r) return 'Full stash: scan the top of your stash to start';
+  const of = st.anchored && st.total ? ` of about ${st.total}` : '';
+  return `Rows ${r}${of} captured`;
 }
 
 // ---- list -----------------------------------------------------------------------------------
@@ -351,7 +364,9 @@ function fit() {
   const frame = $('frame'), stage = $('stage');
   if (!picW) return;
   const cw = stage.clientWidth - 24, ch = stage.clientHeight - 24;
-  const s = Math.min(cw / picW, ch / picH);
+  const tall = !!(scan && scan.stitch);         // the stitched stash: fit the width, scroll down it
+  stage.classList.toggle('tall', tall);
+  const s = tall ? Math.min(cw / picW, 1.5) : Math.min(cw / picW, ch / picH);
   frame.style.width = Math.floor(picW * s) + 'px';
   frame.style.height = Math.floor(picH * s) + 'px';
 }
@@ -396,7 +411,7 @@ async function fetchResult() {
 function paintEmpty(st) {
   if (scan) return;
   const e = $('empty');
-  let t = 'Open your stash or inventory', btn = '';
+  let t = stashPassOn ? 'Scroll to the top of your stash and scan' : 'Open your stash or inventory', btn = '';
   if (!st) t = 'Waiting for the app';
   else if (!st.enabled && st.state !== 'in_raid') {
     t = `Open your stash and press ${esc(TSH.prettyHotkey(st.hotkey))} in the game to scan it`;
@@ -442,6 +457,28 @@ document.addEventListener('tsh:mode', () => { if (scan) api('POST', '/api/autosc
 $('filter').addEventListener('input', e => {
   filterText = e.target.value.trim().toLowerCase();
   if (scan) { const g = classify(scan.results || [], scan.on_you); renderList(g); applyFilterToTiles(); renderTiles(scan); }
+});
+
+// ---- full stash: every scan adds to one merged list -------------------------------------------
+let stashPassOn = false;
+function paintStashPass(st) {
+  const on = stashPassOn = !!(st && st.on);
+  $('full-stash').setAttribute('aria-pressed', on ? 'true' : 'false');
+  $('full-stash').textContent = on ? 'Full stash: on' : 'Full stash';
+  $('stash-restart').hidden = !on;
+}
+api('GET', '/api/stash-pass').then(paintStashPass).catch(() => {});
+$('full-stash').addEventListener('click', async () => {
+  const on = $('full-stash').getAttribute('aria-pressed') !== 'true';
+  const st = await api('POST', '/api/stash-pass', { on });
+  paintStashPass(st);
+  toast(on ? 'Full stash is on. Scan, scroll down, and scan again until you reach the bottom.' : 'Full stash is off.');
+  $('scan-now').click();
+});
+$('stash-restart').addEventListener('click', async () => {
+  paintStashPass(await api('POST', '/api/stash-pass', { reset: true }));
+  scan = null; $('frame').hidden = true; $('list').innerHTML = '';
+  $('empty').hidden = false; paintEmpty({ enabled: true });
 });
 
 $('scan-now').addEventListener('click', async () => {
