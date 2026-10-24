@@ -121,7 +121,7 @@ class Detection:
                 'source': 'v2', 'score': round(self.confidence * 100, 1), 'fir': self.fir,
                 'panel': self.panel, 'px': x, 'py': y, 'pw': w, 'ph': h,
                 'uncertain': self.uncertain, 'count': self.count, 'category': self.category,
-                **({'provisional': True} if self.provisional else {})}
+                'clipped': self.clipped, **({'provisional': True} if self.provisional else {})}
 
     def as_dict(self) -> dict:
         d = asdict(self)

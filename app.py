@@ -21,7 +21,7 @@ from io import BytesIO
 import re
 import requests as http_requests
 
-from flask import Flask, jsonify, request, render_template, redirect
+from flask import Flask, Response, jsonify, request, render_template, redirect
 import mss
 from PIL import Image, ImageDraw
 import pytesseract
@@ -749,7 +749,8 @@ def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None, on_p
         scene = analyze_scene(img_bgr, in_raid=in_raid)
         if scene_out is not None:
             scene_out.update({'scene': scene.scene, 'in_raid': scene.in_raid,
-                              'regions': [r.as_dict() for r in scene.regions]})
+                              'regions': [r.as_dict() for r in scene.regions],
+                              'stash_bbox': scene.stash_bbox, 'pitch': scene.pitch})
     except Exception as e:                # never lose the scan over the scene layer
         warnings.append(f'Scene analysis failed ({e}); every grid is treated as stash.')
     def adapt(res):
@@ -3535,14 +3536,107 @@ def _sell_scan_inner(from_calibration=False, frame_bgr=None, lean=False, publish
             payload['provisional'] = True
             publish(payload)
 
+        stitching = _stash_pass['on']
         raw_detections, panels, grid_failed = scan_with_v2(
             img_bgr, settings, warnings, scene_out=scene_info, in_raid=in_raid,
-            on_provisional=first_look if publish is not None else None, cancel=cancel)
+            on_provisional=first_look if publish is not None and not stitching else None, cancel=cancel)
+        if stitching and not grid_failed:
+            stitched = _stash_pass_add(img_bgr, raw_detections, scene_info, warnings, settings, lean)
+            if stitched is not None:
+                return jsonify(stitched)
         payload = _sell_payload(raw_detections, panels, grid_failed, warnings, scene_info, settings,
                                 img, img_bgr, lean)
         return jsonify(payload)
     finally:
         _scan_state.update({'running': False, 'phase': None, 'ts': time.time()})
+
+
+# ---------------------------------------------------------------------------
+# Full stash (identify/stitch.py): scans at several scroll positions merged into one list
+# ---------------------------------------------------------------------------
+
+from identify.stitch import StashStitcher  # noqa: E402
+
+# Off until the player turns it on (Live page).  While on, every scan of the stash (button, hotkey
+# or auto-scan) is added to the stitcher and the Live page shows the merged stash instead.
+_stash_pass = {'on': False, 'stitcher': StashStitcher(), 'version': 0, 'jpeg': None, 'last': None}
+_stash_pass_lock = threading.Lock()
+
+
+def _stash_pass_info():
+    st = _stash_pass['stitcher']
+    return {'on': _stash_pass['on'], **st.coverage(), 'last': _stash_pass['last']}
+
+
+def _stash_pass_add(img_bgr, raw_detections, scene_info, warnings, settings, lean):
+    """Add one scan to the full-stash capture and return the merged payload (None when the frame
+    shows no stash: the caller then returns the ordinary one)."""
+    box, pitch = scene_info.get('stash_bbox'), scene_info.get('pitch')
+    if not box or not pitch or scene_info.get('in_raid'):
+        return None
+    stash = [d for d in raw_detections if d.get('role') in (None, 'stash')]
+    with _stash_pass_lock:
+        st = _stash_pass['stitcher']
+        res = st.add(img_bgr, box, pitch, stash)
+        merged, canvas = st.items(), st.image()
+        _stash_pass['version'] += 1
+        _stash_pass['jpeg'] = None
+        version = _stash_pass['version']
+        _stash_pass['last'] = {'status': res.status, 'message': res.message, 'rows': list(res.rows)}
+        info = _stash_pass_info()
+    for d in merged:
+        d['role'] = 'stash'
+    h, w = canvas.shape[:2]
+    grid = {'cell_w': float(pitch), 'cell_h': float(pitch), 'origin_x': 0.0, 'origin_y': 0.0,
+            'x0': 0, 'y0': 0, 'x1': w, 'y1': h}
+    note = list(warnings)
+    if res.status in ('unplaced', 'restarted'):
+        note.insert(0, res.message)
+    pil = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+    payload = _sell_payload(merged, [grid], False, note, {**scene_info, 'regions': []}, settings,
+                            pil, canvas, lean, final=False)
+    payload['stitch'] = info
+    if lean:
+        payload['frame_url'] = f'/api/stash-pass/image?v={version}'
+    return payload
+
+
+@app.route('/api/stash-pass', methods=['GET', 'POST'])
+def api_stash_pass():
+    """GET: the full-stash capture state.  POST {"on": bool} turns it on or off, {"reset": true}
+    starts over.  Turning it on or off also starts over."""
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        with _stash_pass_lock:
+            if 'on' in data and bool(data['on']) != _stash_pass['on']:
+                _stash_pass['on'] = bool(data['on'])
+                data['reset'] = True
+            if data.get('reset'):
+                _stash_pass['stitcher'].reset()
+                _stash_pass.update(version=_stash_pass['version'] + 1, jpeg=None, last=None)
+    with _stash_pass_lock:
+        return jsonify(_stash_pass_info())
+
+
+@app.route('/api/stash-pass/image')
+def api_stash_pass_image():
+    """The stitched stash picture (JPEG), cached per version."""
+    with _stash_pass_lock:
+        cached, version = _stash_pass['jpeg'], _stash_pass['version']
+        canvas = None if cached and cached[0] == version else _stash_pass['stitcher'].image()
+    if cached and cached[0] == version:
+        data = cached[1]
+    else:
+        if canvas is None:
+            return Response(status=404)
+        ok, buf = cv2.imencode('.jpg', canvas, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            return Response(status=500)
+        data = buf.tobytes()
+        with _stash_pass_lock:
+            if _stash_pass['version'] == version:
+                _stash_pass['jpeg'] = (version, data)
+    return Response(data, mimetype='image/jpeg', headers={'Cache-Control': 'no-store'})
 
 
 # ---------------------------------------------------------------------------
