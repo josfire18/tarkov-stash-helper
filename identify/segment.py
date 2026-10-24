@@ -42,6 +42,7 @@ class Item:
     suspect: bool = False  # component was not a clean rectangle (line detection doubt)
     panel: int = 0
     dim: bool = False      # drawn dimmed (trader screen: an item the trader does not buy): never confidently named
+    pinned: bool = False   # pinned / locked by the player (striped cell background): never identified or listed
 
     @property
     def cells(self) -> int:

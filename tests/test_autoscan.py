@@ -216,9 +216,6 @@ def test_raid_gameplay_and_raid_inventory_never_scan():
     f = Feed()
     assert [f.step('raid', inventory=False) for _ in range(5)] == ['waiting'] * 5
     assert [f.step('A', chrome=False) for _ in range(5)] == ['raid_inventory'] * 5
-    g = Feed(allow_raid=True)
-    g.step('A', chrome=False)
-    assert g.step('A', chrome=False) == 'scan'
 
 
 def test_blank_frames_are_reported_not_scanned():
@@ -297,7 +294,7 @@ class FakeCapture:
 
 
 def make_scanner(frame, scan=None, settings=None, win32=None, busy=None):
-    settings = settings if settings is not None else {'auto_scan': True, 'live_in_raid': False}
+    settings = settings if settings is not None else {'auto_scan': True}
     clock, calls = {'t': 0.0}, []
 
     def scan_fn(f):

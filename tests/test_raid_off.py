@@ -1,6 +1,8 @@
-"""Raid-off: with "Work in raid" off (the default) NOTHING runs while the game log says raid - no capture, no
-detection, no scan, no frame collection; the lobby flows afterwards are scanned as usual."""
+"""Stash only: NOTHING runs while the game log says matching, loading or raid - no capture, no detection, no
+scan, no frame collection; the lobby flows afterwards are scanned as usual.  There is no setting to turn it on."""
 import threading
+
+import pytest
 
 import cv2
 import numpy as np
@@ -37,10 +39,9 @@ RAID = {'state': 'in_raid', 'since': None, 'source': 'logs'}
 LOBBY = {'state': 'lobby', 'since': None, 'source': 'logs'}
 
 
-def test_default_is_off():
-    assert tsh_app.default_settings()['live_in_raid'] is False
-    s = make(inventory_frame(), RAID, settings={})[0]
-    assert s._opts()['allow_raid'] is False
+def test_there_is_no_raid_setting():
+    d = tsh_app.default_settings()
+    assert not any(k in d for k in ('live_in_raid', 'auto_scan_in_raid', 'live_top_n', 'live_min_value_per_slot'))
 
 
 def test_a_raid_costs_nothing_no_grab_no_detect_no_scan_no_collect():
@@ -49,7 +50,6 @@ def test_a_raid_costs_nothing_no_grab_no_detect_no_scan_no_collect():
     assert cap.grabs == 0 and calls == [] and cap.closed >= 1          # screen duplication released too
     assert s.status()['state'] == 'in_raid' and 'paused' in s.status()['message']
     assert set(delays) == {svc.POLL_RAID_S}
-    assert s.status()['live_in_raid'] is False
 
 
 def test_back_in_the_lobby_the_stash_is_scanned_once():
@@ -82,10 +82,25 @@ def test_entering_a_raid_cancels_a_running_scan():
     assert seen.get('cancelled') and not s.scanning()
 
 
-def test_work_in_raid_on_keeps_the_old_behaviour():
+@pytest.mark.parametrize('state', ['matching', 'loading'])
+def test_matching_and_loading_cost_nothing_either(state):
+    s, calls, cap, _, _ = make(inventory_frame(), {'state': state, 'since': None, 'source': 'logs'})
+    delays = run(s, 6)
+    assert cap.grabs == 0 and calls == [] and set(delays) == {svc.POLL_RAID_S}
+
+
+def test_an_old_work_in_raid_setting_is_ignored():
     s, calls, cap, _, _ = make(inventory_frame(chrome=False), RAID, settings={'auto_scan': True, 'live_in_raid': True})
     run(s, 6)
-    assert cap.grabs > 0 and len(calls) == 1 and s.status()['live_in_raid'] is True
+    assert cap.grabs == 0 and calls == []
+
+
+def test_raid_inventory_seen_without_the_log_is_polled_slowly_and_not_kept():
+    s, calls, cap, _, _ = make(inventory_frame(chrome=False), None)
+    s.collector = type('C', (), {'observe': lambda self, *a, **k: seen.append(1)})()
+    seen = []
+    delays = run(s, 6)
+    assert calls == [] and seen == [] and delays[-1] == svc.POLL_RAID_S
 
 
 def test_a_raid_line_that_never_ended_stops_being_trusted():
@@ -101,11 +116,9 @@ def test_the_log_being_unreadable_falls_back_to_the_frame():
     assert cap.grabs > 0 and len(calls) == 1
 
 
-def test_scan_payload_has_no_raid_advice_when_off(monkeypatch):
-    import liveadvice
-    hit = []
-    monkeypatch.setattr(liveadvice, 'compute_advice', lambda *a, **k: hit.append(1) or {'grab': [], 'drop': []})
-    # _sell_payload is exercised through its raid gate only: raid scene + live_in_raid off -> not computed
-    src = open(tsh_app.__file__, encoding='utf-8').read()
-    assert "if raid and (settings.get('live_in_raid') or settings.get('auto_scan_in_raid')):" in src
-    assert hit == []
+def test_a_manual_scan_in_a_raid_is_refused(monkeypatch):
+    monkeypatch.setattr(tsh_app.raid_state, 'in_raid', lambda: True)
+    with tsh_app.app.test_request_context():
+        r = tsh_app._sell_scan_inner()
+    body = r.get_json()
+    assert body['results'] == [] and 'raid' in body['error']

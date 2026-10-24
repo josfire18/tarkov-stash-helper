@@ -20,7 +20,7 @@ Policy
   thrash on animated backdrops; the old 3 s gap made the live view lag behind the player
 * a failed scan (state ``failed``) is not retried until the view changes or ``retry_s`` has passed
 * inventory seen without the main-menu bar (the in-raid inventory) -> ``raid_inventory``: never
-  scanned unless ``allow_raid`` is set (Settings > Live > "Work in raid")
+  scanned
 """
 from __future__ import annotations
 
@@ -88,10 +88,9 @@ class Decision:
 
 
 class Trigger:
-    def __init__(self, min_gap_s: float = 0.5, retry_s: float = 30.0, allow_raid: bool = False):
+    def __init__(self, min_gap_s: float = 0.5, retry_s: float = 30.0):
         self.min_gap_s = min_gap_s
         self.retry_s = retry_s
-        self.allow_raid = allow_raid
         self._prev_thumb: np.ndarray | None = None
         self._last_hash: np.ndarray | None = None      # view of the last scan attempt
         self._last_thumb: np.ndarray | None = None
@@ -118,7 +117,7 @@ class Trigger:
             return Decision('blank')
         if not obs.inventory:
             return Decision('waiting')
-        if not obs.menu_chrome and not self.allow_raid:
+        if not obs.menu_chrome:
             return Decision('raid_inventory')
         if not is_stable(prev, obs.thumb):
             return Decision('settling')

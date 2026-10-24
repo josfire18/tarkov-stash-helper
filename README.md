@@ -2,7 +2,8 @@
 
 A local desktop tool for Escape from Tarkov that reads your stash from the screen (icon + OCR matching)
 and tells you whether to sell each item to a trader or on the flea market, what your quests and hideout still
-need, and what to grab in a raid.
+need. It only works in the stash: nothing runs while you are matching, loading or in a raid, and items you pinned
+or locked in the game are skipped.
 
 ## Download & install
 
@@ -130,14 +131,14 @@ on every new result / state change; the 1.5 s status poll stays as the fallback)
 request, cached by seq). A view is scanned ~0.5 s after it stops changing (4 Hz polling, two identical polls); only the
 tiles whose pixels changed are re-identified (`identify/tilecache.py`: key = tile pixel hash + pitch, LRU of 20 000
 results), so scrolling or moving one item re-reads one or two tiles. **In a raid nothing runs** (the game log says
-`in_raid`: no capture, no scan, no frame collection, the screen duplication is released; the pill says "In raid -
-paused"). Opt in with Settings > Live > Work in raid (`live_in_raid`, default **off**): then the inventory / loot you
-open is scanned too and the payload carries `advice`
-(`liveadvice.py`): **grab** = loot ranked by value per slot (best of trader and flea net, flea only when allowed;
-at most `live_top_n`, at least `live_min_value_per_slot`; items an open quest / the hideout needs come first,
-flagged); **drop** = only when the best grab does not fit into the free cells of rig / pockets / backpack: the
-cheapest-per-slot items on you (never the secure container, special slots, quest items, guns or unsure
-identifications) whose removal makes room, and only when the grab is worth more.
+`matching`, `loading` or `in_raid`: no capture, no scan, no frame collection, the screen duplication is released; the
+pill says "In a raid - paused"). There is no setting for it: this is a stash helper, and an in-raid inventory seen
+without the log is polled slowly and never scanned. (`liveadvice.py`, the old grab / drop advice, is no longer wired
+into the app.)
+
+**Pinned and locked items** (`identify/pinned.py`) are skipped before identification: the game draws faint 45-degree
+stripes over their cell background, found with a per-cell matched filter at the stripe period (~0.16 of the cell
+pitch) against the mirrored direction as the control. They are never identified, listed or priced.
 
 **How it works** (`autoscan/`):
 

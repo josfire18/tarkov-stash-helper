@@ -762,8 +762,6 @@ def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None, on_p
             if d.uncertain:
                 rec['alternatives'] = [a['name'] for a in (d.evidence.get('alternatives') or ())][:3]
             records.append(rec)
-        if scene_out is not None and res.regions:
-            scene_out['grids'] = _region_grids(res)
         return records, panels
 
     cb = None
@@ -784,17 +782,6 @@ def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None, on_p
     print(f"[v2] {len(res.detections)} items in {res.timings.get('total', 0):.2f}s "
           f"({', '.join(f'{k} {v:.2f}' for k, v in res.timings.items() if k != 'total')})")
     return records, panels, False
-
-
-def _region_grids(res):
-    """Per scanned panel: its role and every footprint in it (col, row, w, h, empty) - what the
-    raid advice needs to find free room on the player."""
-    out = []
-    for pi, (panel, reg) in enumerate(zip(res.grid.panels, res.regions)):
-        cells = [(it.col, it.row, it.w, it.h, bool(it.empty)) for it in res.items if it.panel == pi]
-        out.append({'panel': pi, 'role': reg.role, 'cols': panel.n_cols, 'rows': panel.n_rows,
-                    'clip_bottom': bool(panel.clip_bottom), 'cells': cells})
-    return out
 
 
 def _game_language(settings=None):
@@ -939,12 +926,8 @@ def default_settings():
         'start_with_windows': True,  # register the tiny watcher at sign-in + keep it running (False: unregister, stop it)
         'follow_tarkov': True,       # open when Tarkov starts, close ~15 s after it exits (False: the watcher opens the app once at sign-in and it stays)
         'show_window_on_game_start': True,  # False: when Tarkov starts the app opens straight to the tray, no window
-        'auto_scan_in_raid': False,  # also scan the in-raid inventory (off: only the lobby stash)
         # Live page (identify inventory grids on the fly; the live viewer owns what these do)
         'live_viewer': True,               # identify inventory grids on the fly and show them on the Live page
-        'live_in_raid': False,             # OFF by default: nothing is captured/scanned while the game log says raid. On: also grab/drop advice in a raid
-        'live_top_n': 5,                   # how many 'worth grabbing' items to highlight (1-20)
-        'live_min_value_per_slot': 10000,  # roubles: ignore loot worth less than this per slot
     }
 
 def default_keep_list():
@@ -2643,13 +2626,12 @@ _SETTING_RULES = {
     'flea_overflow': _s_enum(('queue', 'trader')), 'flea_min_gain': _s_int(0, 10 ** 9),
     'intel_center_level': _s_int(0, 3, nullable=True), 'hideout_management_level': _s_int(0, 51),
     'skip_traders': _s_name_list, 'trader_levels': _s_trader_levels,
-    'auto_scan': _s_bool, 'auto_scan_in_raid': _s_bool, 'auto_scan_exe': _s_text,
+    'auto_scan': _s_bool, 'auto_scan_exe': _s_text,
     'auto_task_progress': _s_bool, 'eft_install_dir': _s_text, 'game_language': _s_text,
     'game_mode': _s_enum(('auto', 'pvp', 'pve', 'season')), 'faction': _s_enum(('auto', 'BEAR', 'USEC')),
     'start_with_windows': _s_bool, 'follow_tarkov': _s_bool, 'show_window_on_game_start': _s_bool,
     'ignore_task_items': _s_bool, 'ignore_hideout_items': _s_bool,
-    'live_viewer': _s_bool, 'live_in_raid': _s_bool, 'live_top_n': _s_int(1, 20),
-    'live_min_value_per_slot': _s_int(0, 10 ** 9),
+    'live_viewer': _s_bool,
 }
 
 # Modules that must react when a setting changes (lifecycle: the Windows start-up entry, ...)
@@ -3421,18 +3403,6 @@ def _sell_payload(raw_detections, panels, grid_failed, warnings, scene_info, set
     # backpack / pouch), loot, the trader's goods and unclear grids are listed apart ("On you").
     on_you = []
     raid = bool(scene_info.get('in_raid')) or str(scene_info.get('scene') or '').startswith('raid')
-    live_advice = None
-    if raid and (settings.get('live_in_raid') or settings.get('auto_scan_in_raid')):
-        # grab / drop advice from the raw detections; nothing is sold from a raid view.  Off by default:
-        # a scan that still reaches here with raid off (hotkey / "Scan now") shows the view without advice.
-        try:
-            import liveadvice
-            live_advice = liveadvice.compute_advice(
-                raw_detections, scene_info.get('grids') or [], id_to_item, protected, any_of,
-                settings, build_sell_context(settings, prices), scene_info.get('scene'), True)
-        except Exception as e:
-            print(f'[live] raid advice failed: {e}')
-            warnings.append(f'Raid advice failed ({e})')
     if any(d.get('role') for d in raw_detections):
         advice = []
         for d in raw_detections:
@@ -3489,13 +3459,15 @@ def _sell_payload(raw_detections, panels, grid_failed, warnings, scene_info, set
         'scene':       scene_info.get('scene'),
         'regions':     scene_info.get('regions') or [],
         'on_you':      on_you,
-        'advice':      live_advice,
     }
 
 
 def _sell_scan_inner(from_calibration=False, frame_bgr=None, lean=False, publish=None, cancel=None):
     settings = _load_settings()
 
+    if raid_state.in_raid():               # stash helper only: nothing is captured or scanned in a raid
+        return jsonify({'image': None, 'results': [], 'grid': None, 'grid_failed': False,
+                        'error': 'You are in a raid. Scanning waits until you are back in the lobby.'})
     _scan_state.update({'running': True, 'phase': 'capture',
                         'done': 0, 'total': 0, 'ts': time.time()})
     try:
