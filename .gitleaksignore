@@ -1,0 +1,2 @@
+# Reviewed false positives (gitleaks fingerprints)
+tests/fixtures/tarkovdev/traders_en.json:generic-api-key:4

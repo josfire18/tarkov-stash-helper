@@ -1,0 +1,90 @@
+# Daily + on-change security checks. A failed run = something needs attention;
+# GitHub emails you about failed scheduled runs.
+name: Security scan
+
+on:
+  schedule:
+    - cron: "17 9 * * *"   # daily, ~5:17 AM Eastern
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: Leaked secrets (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar xz gitleaks
+      - name: Scan files for secrets
+        # Known false positives are listed by fingerprint in .gitleaksignore
+        run: ./gitleaks dir . --no-banner --redact --verbose
+
+  dependencies:
+    name: Vulnerable dependencies (npm audit / pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Audit every lockfile and requirements file
+        shell: bash
+        run: |
+          set -u; fail=0; found=0
+          pip install -q pip-audit
+          while IFS= read -r lock; do
+            found=1; dir=$(dirname "$lock"); echo "::group::npm audit $dir"
+            (cd "$dir" && npm audit --omit=dev) || fail=1
+            echo "::endgroup::"
+          done < <(find . -name package-lock.json -not -path '*/node_modules/*')
+          while IFS= read -r req; do
+            found=1; echo "::group::pip-audit $req"
+            pip-audit -r "$req" --progress-spinner off || fail=1
+            echo "::endgroup::"
+          done < <(find . -name 'requirements*.txt' -not -path '*/node_modules/*')
+          while IFS= read -r pp; do
+            dir=$(dirname "$pp"); ls "$dir"/requirements*.txt >/dev/null 2>&1 && continue
+            found=1; echo "::group::pip-audit $dir (pyproject)"
+            (cd "$dir" && pip-audit --progress-spinner off .) || fail=1
+            echo "::endgroup::"
+          done < <(find . -name pyproject.toml -not -path '*/node_modules/*')
+          [ $found = 0 ] && echo "No dependency manifests in this repo."
+          exit $fail
+
+  code:
+    name: Risky code patterns (semgrep)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Semgrep (fails only on high-severity findings)
+        run: |
+          pip install -q semgrep
+          semgrep scan --config p/default --config p/secrets --severity ERROR --error --metrics off --quiet
+
+  powershell:
+    name: PowerShell security rules (PSScriptAnalyzer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analyze .ps1/.psm1 files (fails on Error-severity findings)
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Recurse -Include *.ps1,*.psm1 -File | Where-Object FullName -notmatch '[\\/](node_modules|\.git)[\\/]'
+          if (-not $files) { "No PowerShell files."; exit 0 }
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          $r = $files | ForEach-Object { Invoke-ScriptAnalyzer -Path $_.FullName -Severity Error,Warning }
+          $r | Sort-Object Severity, ScriptName | Format-Table Severity, RuleName, ScriptName, Line, Message -AutoSize -Wrap | Out-String -Width 220
+          $err = @($r | Where-Object Severity -eq 'Error')
+          "Errors: $($err.Count)  Warnings: $(@($r | Where-Object Severity -eq 'Warning').Count)"
+          if ($err.Count) { exit 1 }

@@ -1,0 +1,45 @@
+# Auto-merges Dependabot PRs (security fixes, patch and minor updates) once the
+# repo's own tests pass. Major-version bumps are left open for you to review.
+name: Dependabot auto-merge
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@v2
+      - uses: actions/checkout@v4
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+      - uses: actions/setup-node@v4
+        if: steps.meta.outputs.update-type != 'version-update:semver-major' && hashFiles('package.json') != ''
+        with: { node-version: 22 }
+      - uses: actions/setup-python@v5
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        with: { python-version: "3.12" }
+      - name: Run the repo's tests (if it has any)
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        shell: bash
+        run: |
+          set -e
+          if [ -f package.json ] && node -e "process.exit(require('./package.json').scripts?.test ? 0 : 1)"; then
+            npm ci && npm test
+          fi
+          if [ -d tests ] && ls tests/*.py >/dev/null 2>&1; then
+            if [ -f pyproject.toml ]; then pip install -q -e ".[test]" 2>/dev/null || pip install -q -e .; fi
+            for r in requirements*.txt; do [ -f "$r" ] && pip install -q -r "$r"; done
+            pip install -q pytest pytest-asyncio
+            pytest -q
+          fi
+      - name: Merge
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge "$PR" --squash --delete-branch
