@@ -8,9 +8,9 @@ Cost rules (Tarkov is main-thread bound; frame drops are the one thing this must
     one process lookup every 3 s while the game is not running;
   * detection runs on decimated data (autoscan.detect), a few ms per poll;
   * the identify pipeline runs only on a settled, menu-context inventory frame, never in a raid;
-  * while the game log says RAID (and Settings > Live > "Work in raid" is off, the default) NOTHING runs:
-    no capture, detection, scan or frame collection, the screen duplication is released, the loop only
-    re-reads the log tail every POLL_RAID_S;
+  * while the game log says the player is matching, loading or in a raid NOTHING runs: no capture,
+    detection, scan or frame collection, the screen duplication is released, the loop only re-reads
+    the log tail every POLL_RAID_S.  This is a stash helper; a raid never pays for it;
   * the thread runs at THREAD_PRIORITY_BELOW_NORMAL; the duplication is released when the game
     is gone, the feature is switched off or the app quits.
 """
@@ -38,6 +38,7 @@ POLL_NO_GAME_S = 3.0
 RAID_BACKOFF = 30
 RELOCATE_S = 5.0
 RAID_MAX_S = 2 * 3600.0      # a log that has said "in raid" for longer than this lost its exit line: stop trusting it
+PAUSE_STATES = ('matching', 'loading', 'in_raid')   # game log states in which nothing at all runs
 PROV_WAIT_S = 60.0          # a new view waits at most this long for the running scan's first look before cancelling it
 
 MESSAGES = {
@@ -48,8 +49,8 @@ MESSAGES = {
     'covered': 'Helper window is covering the game',
     'blank': 'Capture returned black frames',
     'waiting': 'Waiting for stash',
-    'raid_inventory': 'Raid inventory open - live view in raid is off (Settings > Live)',
-    'in_raid': 'In a raid - Live is paused until you are back in the lobby',
+    'raid_inventory': 'Raid inventory open - only the stash is scanned',
+    'in_raid': 'In a raid - paused until you are back in the lobby',
     'settling': 'Inventory found - waiting for it to settle',
     'scanning': 'Scanning...',
     'verifying': 'First look ready - verifying items...',
@@ -119,9 +120,7 @@ class AutoScanner:
 
     def _opts(self) -> dict:
         s = self.get_settings() or {}
-        # Settings > Live "work in raid" (default OFF: nothing is captured or scanned while the game log says raid); the older auto_scan_in_raid still counts
-        return {'exe': s.get('auto_scan_exe') or GAME_EXE,
-                'allow_raid': bool(s.get('live_in_raid', False) or s.get('auto_scan_in_raid', False))}
+        return {'exe': s.get('auto_scan_exe') or GAME_EXE}
 
     # -- public ------------------------------------------------------------------------------
     def start(self):
@@ -155,7 +154,6 @@ class AutoScanner:
                   backend=self.capture.backend_name, detect_ms=round(self._last_detect_ms, 1),
                   grab_ms=round(self._last_grab_ms, 1))
         st['mode'] = self._mode_info()
-        st['live_in_raid'] = self._opts()['allow_raid']          # the Live page hides its raid wording / groups when off
         return st
 
     def _mode_info(self):
@@ -242,10 +240,10 @@ class AutoScanner:
         return st
 
     def _in_raid_by_log(self) -> bool:
-        """The game's own log says a raid is running (False when the log is unreadable or the 'raid' is
-        older than RAID_MAX_S, i.e. the exit line was never logged)."""
+        """The game's own log says the player is matching, loading or in a raid (False when the log is
+        unreadable or that state is older than RAID_MAX_S, i.e. the exit line was never logged)."""
         st = self._log_raid_state()
-        if not st or st.get('state') != 'in_raid':
+        if not st or st.get('state') not in PAUSE_STATES:
             return False
         since = st.get('since')
         return not (since and self.wall() - since > RAID_MAX_S)
@@ -274,14 +272,13 @@ class AutoScanner:
             self._set('disabled')
             return POLL_NO_GAME_S
         opts = self._opts()
-        self.trigger.allow_raid = opts['allow_raid']
         game = self._locate(now, opts['exe'])
         if game is None:
             self.capture.close()
             self._set('no_game')
             return POLL_NO_GAME_S
         game_info = {'pid': game.pid, 'size': game.size, 'monitor': game.monitor.device}
-        if not opts['allow_raid'] and self._in_raid_by_log():
+        if self._in_raid_by_log():
             # Raid: no capture, no detection, no scan, no frame collection - nothing runs next to the
             # game (raids are won by frame time; views change every few seconds, so a scan would never
             # finish anyway).  Only the log tail (a stat() every POLL_RAID_S) is read, to notice the exit.
@@ -311,7 +308,7 @@ class AutoScanner:
         self._last_detect_ms = det.ms
         in_raid = resolve_in_raid(self._log_raid_state(), det.menu_chrome)
         thumb = thumbnail(res.frame) if det.is_inventory else None
-        if (thumb is not None and self.collector is not None
+        if (thumb is not None and not in_raid and self.collector is not None
                 and (self.get_settings() or {}).get('collect_scene_frames', True)):
             try:
                 self.collector.observe(res.frame, view_hash(thumb), in_raid=in_raid,
@@ -326,7 +323,9 @@ class AutoScanner:
             return POLL_ACTIVE_S                  # certification of the current view is still running
         extra = {'detail': self._last_error} if dec.state == 'failed' else {}
         self._set(dec.state, game=game_info, score=round(det.score, 2), **extra)
-        if dec.state in ('settling', 'scanned', 'failed', 'raid_inventory'):
+        if dec.state == 'raid_inventory':          # the log could not tell; the missing menu bar did
+            return POLL_RAID_S
+        if dec.state in ('settling', 'scanned', 'failed'):
             self._idle_polls = 0
             return POLL_ACTIVE_S
         self._idle_polls += 1

@@ -272,13 +272,10 @@ def test_tiny_jitter_does_not_rescan():
     assert [f.step(b) for _ in range(3)] == ['scanned'] * 3
 
 
-def test_raid_inventory_waits_unless_allowed():
+def test_raid_inventory_is_never_scanned():
     a = _thumb(1)
-    f = Feed(allow_raid=False)
-    assert f.step(a, chrome=False) == 'raid_inventory'
-    f = Feed(allow_raid=True)
-    f.step(a, chrome=False)
-    assert f.step(a, chrome=False) == 'scan'
+    f = Feed()
+    assert [f.step(a, chrome=False) for _ in range(3)] == ['raid_inventory'] * 3
 
 
 # ---- SSE -------------------------------------------------------------------------------------
@@ -332,8 +329,8 @@ def test_stream_is_sse_and_result_is_lean_with_a_cached_frame():
     assert c.get('/api/autoscan/frame?seq=1').status_code == 404      # an old picture is gone
 
 
-def test_service_scans_the_raid_inventory_when_live_in_raid_is_on():
+def test_service_ignores_the_old_live_in_raid_setting():
     from tests.test_autoscan import make_scanner, inventory_frame, run as run_polls
     s, calls, _ = make_scanner(inventory_frame(chrome=False), settings={'auto_scan': True, 'live_in_raid': True})
     run_polls(s, 6)
-    assert len(calls) == 1 and s.status()['state'] == 'scanned'
+    assert calls == [] and s.status()['state'] == 'raid_inventory'

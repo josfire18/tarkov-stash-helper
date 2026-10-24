@@ -80,6 +80,11 @@ input[readonly] { cursor: pointer; }
   .note[hidden] { display: none; }
 
   /* statuses */
+  .guide { padding: 12px 14px; font-size: 12.5px; line-height: 1.5; }
+  .guide h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); margin: 0 0 6px; }
+  .guide h3:not(:first-child) { margin-top: 14px; }
+  .guide ol, .guide ul { margin: 0; padding-left: 20px; }
+  .guide li + li { margin-top: 3px; }
   .status-block { padding: 12px 14px; border-top: 1px solid #1a1d1e; }
   .status-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
   .status-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.2px; color: #6a6055; }
@@ -334,22 +339,9 @@ const SECTIONS = [
       { key: 'hotkey', type: 'hotkey', label: 'Scan hotkey',
         help: 'Rescan from inside the game. Use Ctrl/Alt/Shift plus a key.' },
       { key: 'debug_dumps', type: 'switch', label: 'Keep debug captures',
-        help: 'Save the screenshots and results of the last few scans to the debug folder in the app's data folder – handy for a bug report.' },
+        help: 'Save the screenshots and results of the last few scans to the debug folder in the app’s data folder – handy for a bug report.' },
     ],
     build: buildScanStatus },
-
-  { id: 'live', title: 'Live', intro: 'What the Live page does while you play.',
-    rows: [
-      { key: 'live_in_raid', type: 'switch', label: 'Work in raid',
-        dimWhen: s => !s.auto_scan,
-        help: 'Off (recommended): during a raid the app does nothing at all - no screen capture, no scanning, no cost to your frame rate - and wakes up again in the lobby. On: read your inventory and the loot you open in a raid (what is worth grabbing, what to drop); a first look takes a few seconds and every capture costs some frame time.' },
-      { key: 'live_top_n', type: 'number', label: 'Items to highlight', min: 1, max: 20,
-        dimWhen: s => !s.auto_scan || !s.live_in_raid,
-        help: 'How many “worth grabbing” items to show at most (items a quest or the hideout needs always come first).' },
-      { key: 'live_min_value_per_slot', type: 'number', label: 'Worth grabbing from', min: 0, max: 1000000000, step: 1000, unit: 'roubles per slot',
-        dimWhen: s => !s.auto_scan || !s.live_in_raid,
-        help: 'Loot worth less than this per slot is not suggested. Quest and hideout items are suggested whatever they are worth.' },
-    ] },
 
   { id: 'selling', title: 'Selling', intro: null,
     cards: [
@@ -389,6 +381,8 @@ const SECTIONS = [
         help: 'Download any missing item pictures and rebuild the catalog scans match against – takes a few minutes; only needed if scans keep missing new items.',
         run: rebuildCatalog },
     ] },
+
+  { id: 'guide', title: 'How to use', intro: null, rows: [], build: buildGuide },
 
   { id: 'about', title: 'About & updates', intro: null, rows: [], build: buildAbout },
 ];
@@ -873,6 +867,28 @@ function buildAbout(card) {
     tess);
   card.append(head, info);
   setTimeout(() => check(false), 600);
+}
+
+// How to use + the few rules the app follows on its own (kept short on purpose)
+const GUIDE_STEPS = [
+  'Start Tarkov. The helper opens with it (or start it yourself) and sits in the system tray.',
+  'Open your stash. It is scanned by itself once the view stops moving; the scan hotkey or Scan now on the Live page rescans.',
+  'The Live page outlines every item by what to do with it: sell on the flea, sell to a named trader, Keep (a quest, the hideout or Kappa still needs it) or Check (not sure what it is, look yourself).',
+  'Scroll or switch stash tabs and each new view is scanned. Needs lists what your quests, hideout and Kappa still require.',
+  'For the best results keep the stash uncovered (this window off the game screen) and fill in Your character above so flea fees are right.',
+];
+const GUIDE_RULES = [
+  'Pinned and locked items are skipped: never scanned, listed or suggested for sale.',
+  'Nothing runs while matching, loading or in a raid. Only the stash is scanned, back in the lobby.',
+  'Items a quest, the hideout or Kappa needs are kept unless you turn that off under Selling.',
+  'Check items and cash are never suggested for sale.',
+  'Nothing about your game or stash leaves your PC.',
+];
+
+function buildGuide(card) {
+  card.append(el('div', { class: 'guide' },
+    el('h3', { text: 'Getting started' }), el('ol', {}, GUIDE_STEPS.map(t => el('li', { text: t }))),
+    el('h3', { text: 'Rules it follows' }), el('ul', {}, GUIDE_RULES.map(t => el('li', { text: t })))));
 }
 
 async function loadAbout() {

@@ -50,6 +50,7 @@ from .grid import GridResult, detect_grid
 from .match import Cand, Tile, normalize_tile, stage1
 from .match import enable_torch as match_enable_torch, disable_torch as match_disable_torch
 from .segment import segment_panel
+from .pinned import is_pinned
 from . import anchors as anchors_mod
 from . import fontlabel as fontlabel_mod
 from . import tilecache
@@ -542,6 +543,9 @@ class Engine:
         cached = []
         for it, panel in items:
             if it.empty:
+                continue
+            if is_pinned(img_bgr, it.rect, it.w, it.h, panel.pitch_x, panel.pitch_y):
+                it.pinned = True                  # pinned / locked: the player keeps it, nothing to advise
                 continue
             key = tilecache.tile_key(img_bgr, it.rect, panel.pitch_x, panel.pitch_y,
                                      f'{it.w}x{it.h}|{int(it.clipped_top)}{int(it.clipped_bottom)}')

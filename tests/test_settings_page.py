@@ -25,11 +25,11 @@ def test_page_renders(client):
 
 def test_round_trip_and_unknown_keys_kept(client):
     r = client.post('/api/settings', json={'ignore_task_items': True, 'my_extra': {'a': 1},
-                                           'game_mode': 'Season', 'live_top_n': 99})
+                                           'game_mode': 'Season', 'monitor': 99})
     assert r.status_code == 200
     saved = json.loads(client.path.read_text())
     assert saved['ignore_task_items'] is True and saved['my_extra'] == {'a': 1}
-    assert saved['game_mode'] == 'season' and saved['live_top_n'] == 20      # canonical + clamped
+    assert saved['game_mode'] == 'season' and saved['monitor'] == 16          # canonical + clamped
     assert client.applied and client.applied[-1]['ignore_task_items'] is True
     full = client.get('/api/settings?full=1').get_json()
     assert full['settings']['ignore_task_items'] is True and 'defaults' in full

@@ -194,7 +194,7 @@ def replay(scan_fn, steps, settings=None, poll=0.05, tail=0.0, progressive=True,
     from . import AutoScanner
     tl = Timeline(steps)
     capture = TimelineCapture(tl, wall)
-    settings = {'auto_scan': True, 'live_in_raid': False, 'collect_scene_frames': False, **(settings or {})}
+    settings = {'auto_scan': True, 'collect_scene_frames': False, **(settings or {})}
     log = ReplayLog(total=tl.total + tail)
     label_of = {id(s.frame): s.label for s in steps}
     lock = threading.Lock()
