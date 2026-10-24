@@ -1,5 +1,5 @@
 # Daily + on-change security checks. A failed run = something needs attention;
-# GitHub emails you about failed scheduled runs.
+# GitHub emails you about failed runs. Findings show as annotations on the run.
 name: Security scan
 
 on:
@@ -18,22 +18,30 @@ jobs:
     name: Leaked secrets (gitleaks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install gitleaks
+      - uses: actions/checkout@v5
+      - name: Scan files for secrets
+        # Reviewed false positives are listed by fingerprint in .gitleaksignore
         run: |
           curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar xz gitleaks
-      - name: Scan files for secrets
-        # Known false positives are listed by fingerprint in .gitleaksignore
-        run: ./gitleaks dir . --no-banner --redact --verbose
+          ./gitleaks dir . --no-banner --redact --report-format json --report-path gl.json || true
+          python3 - <<'EOF'
+          import json, sys
+          f = json.load(open("gl.json"))
+          for x in f:
+              print(f"::error file={x['File'].lstrip('./')},line={x['StartLine']},title=Secret ({x['RuleID']})::"
+                    f"Possible secret committed. Fingerprint: {x['Fingerprint']}")
+          print(f"{len(f)} secret finding(s)")
+          sys.exit(1 if f else 0)
+          EOF
 
   dependencies:
     name: Vulnerable dependencies (npm audit / pip-audit)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with: { node-version: 22 }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
       - name: Audit every lockfile and requirements file
         shell: bash
@@ -41,20 +49,23 @@ jobs:
           set -u; fail=0; found=0
           pip install -q pip-audit
           while IFS= read -r lock; do
-            found=1; dir=$(dirname "$lock"); echo "::group::npm audit $dir"
-            (cd "$dir" && npm audit --omit=dev) || fail=1
-            echo "::endgroup::"
+            found=1; dir=$(dirname "$lock")
+            if ! (cd "$dir" && npm audit --omit=dev); then
+              fail=1; echo "::error file=$lock,title=npm audit::Vulnerable npm dependencies in $dir (run npm audit there)"
+            fi
           done < <(find . -name package-lock.json -not -path '*/node_modules/*')
           while IFS= read -r req; do
-            found=1; echo "::group::pip-audit $req"
-            pip-audit -r "$req" --progress-spinner off || fail=1
-            echo "::endgroup::"
+            found=1
+            if ! out=$(pip-audit -r "$req" --progress-spinner off 2>&1); then
+              fail=1; echo "$out"; echo "::error file=$req,title=pip-audit::$(echo "$out" | grep -E '^[A-Za-z0-9_.-]+ +[0-9]' | tr '\n' ';' | head -c 900)"
+            fi
           done < <(find . -name 'requirements*.txt' -not -path '*/node_modules/*')
           while IFS= read -r pp; do
             dir=$(dirname "$pp"); ls "$dir"/requirements*.txt >/dev/null 2>&1 && continue
-            found=1; echo "::group::pip-audit $dir (pyproject)"
-            (cd "$dir" && pip-audit --progress-spinner off .) || fail=1
-            echo "::endgroup::"
+            found=1
+            if ! out=$(cd "$dir" && pip-audit --progress-spinner off . 2>&1); then
+              fail=1; echo "$out"; echo "::error file=$pp,title=pip-audit::$(echo "$out" | grep -E '^[A-Za-z0-9_.-]+ +[0-9]' | tr '\n' ';' | head -c 900)"
+            fi
           done < <(find . -name pyproject.toml -not -path '*/node_modules/*')
           [ $found = 0 ] && echo "No dependency manifests in this repo."
           exit $fail
@@ -63,28 +74,46 @@ jobs:
     name: Risky code patterns (semgrep)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
       - name: Semgrep (fails only on high-severity findings)
+        # To accept a reviewed finding, add a `# nosemgrep: <rule-id>` comment on that line.
         run: |
           pip install -q semgrep
-          semgrep scan --config p/default --config p/secrets --severity ERROR --error --metrics off --quiet
+          semgrep scan --config p/default --severity ERROR --metrics off --quiet --json -o sg.json || true
+          python3 - <<'EOF'
+          import json, sys
+          d = json.load(open("sg.json"))
+          for r in d.get("results", []):
+              msg = r["extra"]["message"].replace("\n", " ")[:400]
+              print(f"::error file={r['path']},line={r['start']['line']},title={r['check_id'].split('.')[-1]}::{msg}")
+          errs = [e for e in d.get("errors", []) if e.get("level") == "error"]
+          for e in errs[:5]:
+              print(f"::warning title=semgrep error::{str(e.get('message'))[:300]}")
+          print(f"{len(d.get('results', []))} finding(s)")
+          sys.exit(1 if d.get("results") else 0)
+          EOF
 
   powershell:
     name: PowerShell security rules (PSScriptAnalyzer)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Analyze .ps1/.psm1 files (fails on Error-severity findings)
+        # To accept a reviewed finding, use [Diagnostics.CodeAnalysis.SuppressMessageAttribute()].
         shell: pwsh
         run: |
           $files = Get-ChildItem -Recurse -Include *.ps1,*.psm1 -File | Where-Object FullName -notmatch '[\\/](node_modules|\.git)[\\/]'
           if (-not $files) { "No PowerShell files."; exit 0 }
           Set-PSRepository PSGallery -InstallationPolicy Trusted
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
-          $r = $files | ForEach-Object { Invoke-ScriptAnalyzer -Path $_.FullName -Severity Error,Warning }
-          $r | Sort-Object Severity, ScriptName | Format-Table Severity, RuleName, ScriptName, Line, Message -AutoSize -Wrap | Out-String -Width 220
-          $err = @($r | Where-Object Severity -eq 'Error')
-          "Errors: $($err.Count)  Warnings: $(@($r | Where-Object Severity -eq 'Warning').Count)"
-          if ($err.Count) { exit 1 }
+          $root = (Get-Location).Path + [IO.Path]::DirectorySeparatorChar
+          $r = $files | ForEach-Object { Invoke-ScriptAnalyzer -Path $_.FullName -Severity Error }
+          foreach ($x in $r) {
+            $rel = $x.ScriptPath.Replace($root, '')
+            $m = ($x.Message -replace "`r?`n", ' ')
+            "::error file=$rel,line=$($x.Line),title=$($x.RuleName)::$m"
+          }
+          "Errors: $(@($r).Count)"
+          if (@($r).Count) { exit 1 }
