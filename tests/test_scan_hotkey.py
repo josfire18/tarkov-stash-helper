@@ -106,3 +106,10 @@ def test_a_hotkey_the_user_picked_is_kept():
 def test_new_installs_start_migrated():
     s = tsh_app.default_settings()
     assert tsh_app.migrate_scan_settings(s) is False and s['auto_scan'] is False
+
+
+def test_hotkey_problems_are_plain_messages():
+    assert tsh_app.hotkey_problem(winhotkey.HotkeyTaken('x'), '<ctrl>+<f1>') == \
+        'Ctrl+F1 is already used by another program. Pick another key.'
+    assert 'not a key combination' in tsh_app.hotkey_problem(ValueError('x'), '<ctrl>+<nope>')
+    assert tsh_app.hotkey_problem(OSError('x'), '<ctrl>+<f1>') == 'Windows refused the hotkey. Try another key.'

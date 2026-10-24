@@ -2338,6 +2338,16 @@ class HotkeyManager:
 
 hotkey_manager = HotkeyManager()
 
+
+def hotkey_problem(e, combo):
+    """A short message for a hotkey that could not be registered (built from the combo, not from
+    the exception text, so nothing internal reaches the page)."""
+    if isinstance(e, winhotkey.HotkeyTaken):
+        return f'{winhotkey.pretty(combo)} is already used by another program. Pick another key.'
+    if isinstance(e, ValueError):
+        return f'{winhotkey.pretty(combo)} is not a key combination the app can use.'
+    return 'Windows refused the hotkey. Try another key.'
+
 OLD_DEFAULT_HOTKEY = '<ctrl>+<shift>+s'
 
 
@@ -2363,7 +2373,7 @@ def start_hotkey_listener():
     try:
         hotkey_manager.register(hotkey_str)
     except Exception as e:
-        hotkey_manager.error = str(e)
+        hotkey_manager.error = hotkey_problem(e, hotkey_str)
         print(f"Hotkey listener failed: {e}")
 
 
@@ -2429,7 +2439,7 @@ def set_hotkey():
     try:
         hotkey_manager.register(hotkey_str)
     except Exception as e:
-        return jsonify({'ok': False, 'error': f'That hotkey cannot be used: {e}'}), 400
+        return jsonify({'ok': False, 'error': hotkey_problem(e, hotkey_str)}), 400
     settings = _load_settings()
     settings['hotkey'] = hotkey_str
     _save_settings(settings)
@@ -2708,8 +2718,8 @@ def save_settings():
         try:
             hotkey_manager.register(new['hotkey'])      # a changed hotkey takes effect at once
         except Exception as e:
-            return jsonify({'ok': False, 'error': f'That hotkey cannot be used: {e}',
-                            'errors': {'hotkey': str(e)}}), 400
+            msg = hotkey_problem(e, new['hotkey'])
+            return jsonify({'ok': False, 'error': msg, 'errors': {'hotkey': msg}}), 400
     _save_settings(new, mode=old_profile)
     if new.get('game_mode') != old.get('game_mode'):
         _mode_cache['val'] = None                       # the next call re-resolves the effective mode
