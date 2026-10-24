@@ -2389,7 +2389,7 @@ def sell_redirect():
 @app.route('/api/last-scan', methods=['GET'])
 def last_scan():
     try:
-        since = float(request.args.get('since', 0))
+        since = float(request.args.get('since', 0))  # nosemgrep: nan-injection -- non-finite values rejected just below
     except ValueError:
         since = 0.0
     if not math.isfinite(since):

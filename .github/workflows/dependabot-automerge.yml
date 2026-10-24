@@ -1,5 +1,6 @@
 # Auto-merges Dependabot PRs (security fixes, patch and minor updates) once the
-# repo's own tests pass. Major-version bumps are left open for you to review.
+# repo's own tests pass. Major bumps of libraries are left open for review;
+# GitHub Actions version bumps (any size) merge automatically.
 name: Dependabot auto-merge
 
 on: pull_request
@@ -16,15 +17,15 @@ jobs:
       - id: meta
         uses: dependabot/fetch-metadata@v2
       - uses: actions/checkout@v5
-        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        if: (steps.meta.outputs.update-type != 'version-update:semver-major' || steps.meta.outputs.package-ecosystem == 'github_actions')
       - uses: actions/setup-node@v5
-        if: steps.meta.outputs.update-type != 'version-update:semver-major' && hashFiles('package.json') != ''
+        if: (steps.meta.outputs.update-type != 'version-update:semver-major' || steps.meta.outputs.package-ecosystem == 'github_actions') && hashFiles('package.json') != ''
         with: { node-version: 22 }
       - uses: actions/setup-python@v6
-        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        if: (steps.meta.outputs.update-type != 'version-update:semver-major' || steps.meta.outputs.package-ecosystem == 'github_actions')
         with: { python-version: "3.12" }
       - name: Run the repo's tests (if it has any)
-        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        if: (steps.meta.outputs.update-type != 'version-update:semver-major' || steps.meta.outputs.package-ecosystem == 'github_actions')
         shell: bash
         run: |
           set -e
@@ -38,7 +39,7 @@ jobs:
             pytest -q
           fi
       - name: Merge
-        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        if: (steps.meta.outputs.update-type != 'version-update:semver-major' || steps.meta.outputs.package-ecosystem == 'github_actions')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.html_url }}

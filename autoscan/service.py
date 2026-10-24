@@ -470,7 +470,7 @@ def make_blueprint(scanner: AutoScanner, get_settings, save_settings):
         /api/autoscan/result?since=N; polling stays the fallback.  ``max_s`` ends the stream after
         that many seconds (tests); a ``: ping`` comment every 15 s keeps idle connections open."""
         try:
-            max_s = float(request.args.get('max_s', 0))
+            max_s = float(request.args.get('max_s', 0))  # nosemgrep: nan-injection -- non-finite values rejected just below
             if not math.isfinite(max_s):
                 raise ValueError
         except ValueError:
