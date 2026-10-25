@@ -752,7 +752,9 @@ def scan_with_v2(img_bgr, settings, warnings, scene_out=None, in_raid=None, on_p
                               'regions': [r.as_dict() for r in scene.regions],
                               'stash_bbox': scene.stash_bbox, 'pitch': scene.pitch})
     except Exception as e:                # never lose the scan over the scene layer
-        warnings.append(f'Scene analysis failed ({e}); every grid is treated as stash.')
+        print(f'[scene] analysis failed: {e}')
+        warnings.append('Scene analysis failed, so every grid is treated as stash. '
+                        'Details are in data/app.log.')
     def adapt(res):
         panels = [{**p.as_grid_dict(), 'strength': p.strength} for p in res.grid.panels]
         records = []
@@ -2446,6 +2448,10 @@ def set_hotkey():
     _save_settings(settings)
     return jsonify({'ok': True, 'hotkey': hotkey_str})
 
+# What a crashed scan tells the page.  The exception itself goes to data/app.log only, never into a response.
+SCAN_FAILED = 'The scan failed unexpectedly. Details are in data/app.log.'
+
+
 @app.route('/api/screenshot', methods=['POST'])
 def take_screenshot():
     data = request.get_json(silent=True) or {}
@@ -2455,8 +2461,8 @@ def take_screenshot():
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        print(f"[screenshot] ERROR:\n{tb}")
-        return jsonify({'error': str(e), 'image': None, 'detections': [],
+        print(f"[screenshot] ERROR: {e}\n{tb}")
+        return jsonify({'error': SCAN_FAILED, 'image': None, 'detections': [],
                         'grid_failed': False,
                         'warnings': [], 'checklist_matches': []})
 
@@ -3398,8 +3404,8 @@ def sell_scan():
   except Exception as e:
     import traceback
     tb = traceback.format_exc()
-    print(f"[sell_scan] ERROR:\n{tb}")
-    return jsonify({'error': str(e), 'traceback': tb, 'image': None, 'results': [], 'grid': None})
+    print(f"[sell_scan] ERROR: {e}\n{tb}")
+    return jsonify({'error': SCAN_FAILED, 'image': None, 'results': [], 'grid': None})
 
 def _sell_payload(raw_detections, panels, grid_failed, warnings, scene_info, settings, img, img_bgr,
                   lean, final=True):
@@ -3415,8 +3421,8 @@ def _sell_payload(raw_detections, panels, grid_failed, warnings, scene_info, set
     prices     = get_prices()
     if prices.get('stale_error'):
         age_h = (time.time() - prices.get('timestamp', 0)) / 3600
-        warnings.append(f'Price refresh failed ({prices["stale_error"]}); '
-                        f'using prices from {age_h:.0f} h ago')
+        warnings.append(f'{plain_error(prices["stale_error"])} '
+                        f'Using prices from {age_h:.0f} h ago.')
     price_idx  = build_price_index(prices)
     id_to_item = {it['id']: it for it in prices.get('items', [])}
 
