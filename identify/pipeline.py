@@ -51,6 +51,7 @@ from .match import Cand, Tile, normalize_tile, stage1
 from .match import enable_torch as match_enable_torch, disable_torch as match_disable_torch
 from .segment import segment_panel
 from .pinned import is_pinned
+from . import seen as seen_mod
 from . import anchors as anchors_mod
 from . import fontlabel as fontlabel_mod
 from . import tilecache
@@ -195,6 +196,7 @@ class Engine:
         self._row_key: dict = {}
         self._apply_learned()
         self.tile_cache = tilecache.TileCache()
+        self.seen = seen_mod.SeenItems()     # pictures of items named on a normal view (trader screens reuse them)
         self.anchor_idx = None
         self.labeler = None
         self._fp_rows: dict = {}
@@ -236,6 +238,7 @@ class Engine:
     def reset_anchors(self) -> None:
         """Forget certain bindings made in memory and the tile cache (eval: clean state)."""
         self.tile_cache.clear()
+        self.seen.clear()
         if self.anchor_idx is not None:
             self.anchor_idx.reset_bindings()
 
@@ -673,6 +676,7 @@ class Engine:
                 d.uncertain = True
                 d.confidence = min(d.confidence, 0.5)
                 d.evidence['note'] = 'drawn dimmed (trader screen): not named confidently'
+            self._seen_pass(img_bgr, w, d)
             self.tile_cache.put(w['key'], _to_cache(w['det']))
             w['certified'] = True
             done += 1
@@ -680,6 +684,33 @@ class Engine:
             if progress is not None and done < n_det and now - last >= PROGRESS_EVERY_S:
                 last = now
                 progress()
+
+    def _seen_pass(self, img_bgr, w, d) -> None:
+        """Remember a confidently named item of a normal view; on a dimming screen (trader sell tab,
+        flea offer) name an unsure item after the same picture seen on a normal view (identify/seen.py)."""
+        it, panel = w['it'], w['panel']
+        if it.clipped_top or it.clipped_bottom or getattr(w['tile'], 'clip', ''):
+            return
+        sig = seen_mod.signature(img_bgr, it.rect, it.w, it.h, panel.pitch_x, panel.pitch_y)
+        if sig is None:
+            return
+        if not panel.dim:
+            if not d.uncertain and not d.provisional and d.item_id:
+                self.seen.add(sig, it.w, it.h, {k: getattr(d, k) for k in
+                                                ('item_id', 'name', 'confidence', 'category', 'short', 'rotated')})
+            return
+        if not d.uncertain:
+            return
+        hit = self.seen.lookup(sig, it.w, it.h)
+        if hit is None:
+            return
+        p, score = hit
+        d.item_id, d.name, d.category, d.short, d.rotated = p['item_id'], p['name'], p['category'], p['short'], p['rotated']
+        d.confidence = min(p['confidence'], score)
+        d.uncertain = False
+        d.evidence['seen_score'] = round(score, 3)
+        d.evidence['note'] = 'same picture as an item named on the stash screen'
+        d.evidence.pop('alternatives', None)
 
     # ------------------------------------------------------------------
     def _dino_pass(self, img_bgr, work) -> None:

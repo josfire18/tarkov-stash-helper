@@ -73,8 +73,9 @@ Raids are won on frame time and views change every few seconds, so the app works
    see first looks (the picture dims as "not the current screen yet"); stop for ~10 s and you get the final.
 3. **Open a container / the item-search window / the backpack in the stash screen** - same flow; the window's grid is
    advised like the stash (items you own), your rig / pockets / backpack are listed under *On you* only.
-4. **Trader screen (sell tab)** - the stash is dimmed for items the trader will not buy; dimmed tiles are never named
-   confidently (they show as Check), everything the trader buys is final like in the stash.
+4. **Trader screen (sell tab)** - the stash is dimmed for items the trader will not buy, and the items it buys carry a
+   price tag over the name. An item already named on a normal stash view this session is recognised by its picture
+   and keeps that name (identify/seen.py); any other dimmed or price-tagged tile shows as Check.
 5. **Flea market: offer creation** - the item picker on the left is scanned like a stash (dimmed = not listable).
 6. **After a raid: scav loot transfer ("Receive all")** - the incoming window is read at the true cell pitch
    (scroll bar and cut row do not stretch the lattice) so every incoming item gets a final result next to your stash.
