@@ -36,7 +36,7 @@ jobs:
       # pins the installer version and SHA-256).
       - name: Cache Tesseract bundle
         id: tess-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: vendor
           key: tesseract-bundle-${{ hashFiles('scripts/vendor_tesseract.py') }}
