@@ -21,7 +21,7 @@ jobs:
       - uses: actions/setup-node@v5
         if: (steps.meta.outputs.update-type != 'version-update:semver-major' || steps.meta.outputs.package-ecosystem == 'github_actions') && hashFiles('package.json') != ''
         with: { node-version: 22 }
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: (steps.meta.outputs.update-type != 'version-update:semver-major' || steps.meta.outputs.package-ecosystem == 'github_actions')
         with: { python-version: "3.12" }
       - name: Run the repo's tests (if it has any)
