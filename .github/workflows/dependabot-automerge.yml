@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - id: meta
-        uses: dependabot/fetch-metadata@v2
+        uses: dependabot/fetch-metadata@v3
       - uses: actions/checkout@v5
         if: (steps.meta.outputs.update-type != 'version-update:semver-major' || steps.meta.outputs.package-ecosystem == 'github_actions')
       - uses: actions/setup-node@v5
