@@ -18,7 +18,7 @@ jobs:
     name: Leaked secrets (gitleaks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Scan files for secrets
         # Reviewed false positives are listed by fingerprint in .gitleaksignore
         run: |
@@ -38,7 +38,7 @@ jobs:
     name: Vulnerable dependencies (npm audit / pip-audit)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with: { node-version: 22 }
       - uses: actions/setup-python@v7
@@ -74,7 +74,7 @@ jobs:
     name: Risky code patterns (semgrep)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - name: Semgrep (fails only on high-severity findings)
@@ -99,7 +99,7 @@ jobs:
     name: PowerShell security rules (PSScriptAnalyzer)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Analyze .ps1/.psm1 files (fails on Error-severity findings)
         # To accept a reviewed finding, use [Diagnostics.CodeAnalysis.SuppressMessageAttribute()].
         shell: pwsh
