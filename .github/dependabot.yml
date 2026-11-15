@@ -1,13 +1,38 @@
-# Daily dependency + security update checks. Security fixes arrive as PRs.
+# Dependency updates.
+# - Security fixes arrive as PRs as soon as an advisory is published. That is
+#   "Dependabot security updates" in the repo settings; it follows neither the weekly
+#   schedule nor the cooldown below.
+# - Routine version bumps are checked WEEKLY and batched: one PR per ecosystem for all
+#   minor + patch updates (auto-merged once tests pass), and a separate PR per major
+#   update (left open for review). GitHub Actions bumps of any size share one PR.
+# - cooldown: a new release is only proposed once it has been out for 7 days, so a
+#   bad or compromised release is usually pulled before it ever reaches a PR here.
 version: 2
 updates:
-  - package-ecosystem: "pip"
-    directory: "/"
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 5
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 5
+- package-ecosystem: pip
+  directory: /
+  schedule:
+    interval: weekly
+    day: monday
+  cooldown:
+    default-days: 7
+  groups:
+    pip-minor-and-patch:
+      patterns:
+      - '*'
+      update-types:
+      - minor
+      - patch
+  open-pull-requests-limit: 5
+- package-ecosystem: github-actions
+  directory: /
+  schedule:
+    interval: weekly
+    day: monday
+  cooldown:
+    default-days: 7
+  groups:
+    github-actions-all:
+      patterns:
+      - '*'
+  open-pull-requests-limit: 2

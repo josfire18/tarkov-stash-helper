@@ -1,31 +1,56 @@
 # Auto-merges Dependabot PRs (security fixes, patch and minor updates) once the
 # repo's own tests pass. Major bumps of libraries are left open for review;
 # GitHub Actions version bumps (any size) merge automatically.
+#
+# Two jobs on purpose, so a freshly published package never runs next to a token
+# that can push:
+#   test       read-only token, and checkout leaves no credentials in .git/config.
+#              This is the only place the bumped dependencies are installed and run.
+#   automerge  holds the write token; checks nothing out and runs no third-party code.
+#              (Keep this job id: Jarvis's GitHub upkeep ignores a failing "automerge"
+#              check, which is expected on PRs that edit workflow files.)
 name: Dependabot auto-merge
 
 on: pull_request
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 jobs:
-  automerge:
+  test:
     if: github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      merge: ${{ steps.decide.outputs.merge }}
     steps:
       - id: meta
-        uses: dependabot/fetch-metadata@v3
-      - uses: actions/checkout@v7
-        if: (steps.meta.outputs.update-type != 'version-update:semver-major' || steps.meta.outputs.package-ecosystem == 'github_actions')
-      - uses: actions/setup-node@v7
-        if: (steps.meta.outputs.update-type != 'version-update:semver-major' || steps.meta.outputs.package-ecosystem == 'github_actions') && hashFiles('package.json') != ''
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+      - name: Decide whether this update may merge by itself
+        id: decide
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
+        run: |
+          if [ "$UPDATE_TYPE" != "version-update:semver-major" ] || [ "$ECOSYSTEM" = "github_actions" ]; then
+            echo "merge=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "merge=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Major library update: left open for review."
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.decide.outputs.merge == 'true'
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.decide.outputs.merge == 'true' && hashFiles('package.json') != ''
         with: { node-version: 22 }
-      - uses: actions/setup-python@v7
-        if: (steps.meta.outputs.update-type != 'version-update:semver-major' || steps.meta.outputs.package-ecosystem == 'github_actions')
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: steps.decide.outputs.merge == 'true' && hashFiles('tests/*.py') != ''
         with: { python-version: "3.12" }
       - name: Run the repo's tests (if it has any)
-        if: (steps.meta.outputs.update-type != 'version-update:semver-major' || steps.meta.outputs.package-ecosystem == 'github_actions')
+        if: steps.decide.outputs.merge == 'true'
         shell: bash
         run: |
           set -e
@@ -38,9 +63,18 @@ jobs:
             pip install -q pytest pytest-asyncio
             pytest -q
           fi
+
+  automerge:
+    needs: test
+    if: needs.test.outputs.merge == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
       - name: Merge
-        if: (steps.meta.outputs.update-type != 'version-update:semver-major' || steps.meta.outputs.package-ecosystem == 'github_actions')
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.html_url }}
-        run: gh pr merge "$PR" --squash --delete-branch
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash --delete-branch

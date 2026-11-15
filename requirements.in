@@ -1,0 +1,16 @@
+# Loose direct dependencies (core, lean release). requirements.txt is compiled from this file
+# with uv for Windows and Linux markers. Regenerate: uv pip compile --universal --python-version 3.12 requirements.in -o requirements.txt
+flask
+waitress
+mss
+pillow
+pytesseract
+rapidfuzz
+requests
+pynput
+pystray
+pywebview
+opencv-python
+numpy
+dxcam
+UnityPy
