@@ -40,63 +40,76 @@ jobs:
             echo "merge=false" >> "$GITHUB_OUTPUT"
             echo "::notice::Major library update: left open for review."
           fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.decide.outputs.merge == 'true'
-        with: { persist-credentials: false }
-      # OSV gate: fail only on vulnerabilities this PR adds (compare head scan with base scan).
-      # Head results are set aside in RUNNER_TEMP while the base is checked out, so the
-      # base scan does not see head files. Read-only: no write token is used here.
-      - name: OSV-Scanner, scan PR head
-        id: osv-head
-        if: steps.decide.outputs.merge == 'true'
-        uses: google/osv-scanner-action/osv-scanner-action@32d3cd482bdadfb38b186c0ad1b031902d55d932 # v2.7.1
-        continue-on-error: true
-        with:
-          scan-args: |-
-            --format=json
-            --output=osv-new.json
-            -r
-            ./
-      - name: Set head results aside
-        if: steps.decide.outputs.merge == 'true'
-        run: mv -f osv-new.json "$RUNNER_TEMP/osv-new.json" 2>/dev/null || true
-      - name: Check out PR base for comparison
+      # OSV gate: the update may merge only if it adds no known vulnerability. The base
+      # branch is scanned first and the PR second, so the tests below run on the PR's
+      # code. osv-scanner exits 1 when it finds vulnerabilities, 128 when it finds no
+      # lockfile, and other codes on errors; it can write a results file even when it
+      # errors, so the exit code decides, and any scan error fails the job.
+      - name: Check out the base branch for the OSV comparison
         if: steps.decide.outputs.merge == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha }}
-          fetch-depth: 1
           persist-credentials: false
-      - name: OSV-Scanner, scan PR base
-        id: osv-base
+      - name: Install OSV-Scanner (release binary, checksum-pinned)
         if: steps.decide.outputs.merge == 'true'
-        uses: google/osv-scanner-action/osv-scanner-action@32d3cd482bdadfb38b186c0ad1b031902d55d932 # v2.7.1
-        continue-on-error: true
-        with:
-          scan-args: |-
-            --format=json
-            --output=osv-old.json
-            -r
-            ./
-      - name: Restore head results and check both scans completed
+        shell: bash
+        env:
+          OSV_SCANNER_VERSION: v2.7.1
+          OSV_SCANNER_SHA256: fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  $RUNNER_TEMP/osv-scanner" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+      - name: OSV-Scanner, scan the base branch
+        id: osv-base
         if: steps.decide.outputs.merge == 'true'
         shell: bash
         run: |
-          mv -f "$RUNNER_TEMP/osv-new.json" osv-new.json 2>/dev/null || true
-          if [ ! -s osv-old.json ] || [ ! -s osv-new.json ]; then
-            echo "::error::OSV-Scanner did not write both result files (base: ${{ steps.osv-base.outcome }}, head: ${{ steps.osv-head.outcome }}). Failing rather than reporting no new vulnerabilities."
+          set +e
+          "$RUNNER_TEMP/osv-scanner" scan source --no-resolve --format=json --output-file="$RUNNER_TEMP/osv-old.json" -r ./
+          rc=$?
+          set -e
+          case "$rc" in
+            0|1) echo "packages=true" >> "$GITHUB_OUTPUT" ;;
+            128) echo "packages=false" >> "$GITHUB_OUTPUT"; echo '{"results":[]}' > "$RUNNER_TEMP/osv-old.json" ;;
+            *) echo "::error::OSV-Scanner failed on the base branch (exit $rc)."; exit 1 ;;
+          esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.decide.outputs.merge == 'true'
+        with: { persist-credentials: false }
+      - name: OSV-Scanner, fail only on vulnerabilities this PR introduces
+        if: steps.decide.outputs.merge == 'true'
+        shell: bash
+        env:
+          BASE_HAS_PACKAGES: ${{ steps.osv-base.outputs.packages }}
+        run: |
+          set +e
+          "$RUNNER_TEMP/osv-scanner" scan source --no-resolve --format=json --output-file="$RUNNER_TEMP/osv-new.json" -r ./
+          rc=$?
+          set -e
+          case "$rc" in
+            0|1) ;;
+            128)
+              if [ "$BASE_HAS_PACKAGES" = "true" ]; then
+                echo "::error::OSV-Scanner found no lockfile on this PR but did on the base branch (lockfile removed or unreadable)."
+                exit 1
+              fi
+              echo '{"results":[]}' > "$RUNNER_TEMP/osv-new.json" ;;
+            *) echo "::error::OSV-Scanner failed on this PR (exit $rc)."; exit 1 ;;
+          esac
+          vulns() {
+            jq -r '.results[]?.packages[]? | .package as $p | .vulnerabilities[]? | "\($p.ecosystem) \($p.name): \(.id)"' "$1" | LC_ALL=C sort -u
+          }
+          vulns "$RUNNER_TEMP/osv-old.json" > "$RUNNER_TEMP/osv-old.txt"
+          vulns "$RUNNER_TEMP/osv-new.json" > "$RUNNER_TEMP/osv-new.txt"
+          added=$(LC_ALL=C comm -13 "$RUNNER_TEMP/osv-old.txt" "$RUNNER_TEMP/osv-new.txt")
+          if [ -n "$added" ]; then
+            while IFS= read -r v; do echo "::error::Known vulnerability introduced by this PR: $v"; done <<< "$added"
             exit 1
           fi
-      - name: Fail only on vulnerabilities this PR introduces
-        if: steps.decide.outputs.merge == 'true'
-        uses: google/osv-scanner-action/osv-reporter-action@32d3cd482bdadfb38b186c0ad1b031902d55d932 # v2.7.1
-        with:
-          scan-args: |-
-            --output=osv-results.sarif
-            --old=osv-old.json
-            --new=osv-new.json
-            --gh-annotations=true
-            --fail-on-vuln=true
+          echo "No new known vulnerabilities ($(wc -l < "$RUNNER_TEMP/osv-old.txt") already on the base branch)."
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: steps.decide.outputs.merge == 'true' && hashFiles('package.json') != ''
         with: { node-version: 22 }
